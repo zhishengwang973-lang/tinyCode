@@ -6,6 +6,7 @@ import signal
 import shlex
 from pathlib import Path
 
+from tinyCode.conversation.truncator import DEFAULT_PER_RESULT_THRESHOLD
 from tinyCode.security.blacklist import check_blacklist
 from tinyCode.security.sensitive_paths import command_references_sensitive_path
 from tinyCode.tools.base import BaseTool, ToolParameter, ToolResult
@@ -24,7 +25,10 @@ _INTERACTIVE_COMMANDS = {
     "less", "more", "man",
 }
 
-OUTPUT_LIMIT = 10_000  # max chars of stdout/stderr to return
+# This must remain above the conversation truncator threshold. Otherwise a
+# command can discard its large output before the session layer has a chance
+# to persist it and expose tool_result_search/tool_result_read.
+OUTPUT_LIMIT = DEFAULT_PER_RESULT_THRESHOLD * 2
 COMMAND_TIMEOUT = 25.0
 _SENSITIVE_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 
@@ -102,7 +106,8 @@ class RunCommandTool(BaseTool):
     def description(self) -> str:
         return (
             "在工作目录中执行一条 shell 命令。"
-            "输出有长度限制，超出会截断。"
+            f"stdout/stderr 各最多保留 {OUTPUT_LIMIT} 字符，超出会截断；"
+            "超过会话阈值的结果将保存到项目缓存供分段读取。"
             "禁止交互式命令和危险命令（rm/sudo/chmod 等）。"
         )
 

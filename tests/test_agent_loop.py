@@ -686,6 +686,43 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool_result_read", second_names)
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
 
+    async def test_existing_cache_keeps_helpers_visible_without_new_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp)
+            truncator = ToolResultTruncator(TruncateConfig(
+                per_result_threshold=10,
+                total_round_threshold=1_000,
+                preview_length=5,
+                storage_dir=storage_dir,
+            ))
+            _, infos = truncator.process_round([
+                {"role": "tool", "name": "read_file", "content": "x" * 20},
+            ])
+            self.assertTrue(infos)
+
+            provider = ToolCaptureProvider()
+            registry = ToolRegistry()
+            registry.register(ToolResultSearchTool(storage_dir))
+            registry.register(ToolResultReadTool(storage_dir))
+            loop = AgentLoop(
+                provider=provider,
+                tool_registry=registry,
+                tool_executor=ToolExecutor(),
+                prompt_builder=PromptBuilder(),
+                prompt_injector=PromptInjector(),
+                truncator=truncator,
+                max_rounds=1,
+            )
+            history = ConversationHistory()
+            history.add_user_message("继续检查当前项目")
+
+            events = [event async for event in loop.run(history)]
+
+        names = self._openai_tool_names(provider.received_tools[0])
+        self.assertIn("tool_result_search", names)
+        self.assertIn("tool_result_read", names)
+        self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
+
     async def test_hidden_tool_result_helper_cannot_be_called_prematurely(self):
         registry = ToolRegistry()
         registry.register(ToolResultReadTool())

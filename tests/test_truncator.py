@@ -107,6 +107,38 @@ class ToolResultTruncatorTests(unittest.TestCase):
             self.assertEqual(first_infos[0]["file_path"], second_infos[0]["file_path"])
             self.assertEqual(1, len(list(Path(tmp).glob("*.txt"))))
 
+    def test_cached_result_remains_available_without_new_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TruncateConfig(
+                per_result_threshold=10,
+                total_round_threshold=100,
+                preview_length=5,
+                storage_dir=Path(tmp),
+            )
+            truncator = ToolResultTruncator(config)
+            _, first_infos = truncator.process_round([
+                {"role": "tool", "name": "grep", "content": "x" * 20},
+            ])
+
+            _, later_infos = truncator.process_round([
+                {"role": "user", "content": "continue"},
+            ])
+
+            self.assertEqual([], later_infos)
+            self.assertTrue(truncator.has_available_results)
+
+            reopened = ToolResultTruncator(TruncateConfig(
+                per_result_threshold=10,
+                total_round_threshold=100,
+                preview_length=5,
+                storage_dir=Path(tmp),
+            ))
+            self.assertTrue(reopened.has_available_results)
+
+            Path(first_infos[0]["file_path"]).unlink()
+            self.assertFalse(truncator.has_available_results)
+            self.assertFalse(reopened.has_available_results)
+
     def test_total_budget_uses_preview_size_when_selecting_results(self):
         with tempfile.TemporaryDirectory() as tmp:
             messages = [

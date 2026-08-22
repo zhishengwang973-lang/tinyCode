@@ -305,8 +305,12 @@ class AgentLoop:
             tool_result_files_available = False
             if self._truncator is not None:
                 messages, trunc_infos = self._truncator.process_round(messages)
-                tool_result_files_available = any(
-                    bool(info.get("file_path")) for info in trunc_infos
+                # ``trunc_infos`` only describes work performed in this
+                # round. Cached files remain readable after history
+                # compression or a process restart, so tool visibility must
+                # come from the active project's on-disk cache directory.
+                tool_result_files_available = (
+                    self._truncator.has_available_results
                 )
                 for info in trunc_infos:
                     from tinyCode.agent.events import TruncationEvent

@@ -13,6 +13,7 @@ from pathlib import Path
 from tinyCode.providers.base import Message
 
 TOOL_RESULT_STORAGE_SUBDIR = Path(".tinyCode") / "tool_results"
+DEFAULT_PER_RESULT_THRESHOLD = 50_000
 
 
 def default_storage_dir(project_root: Path | None = None) -> Path:
@@ -29,7 +30,7 @@ DEFAULT_STORAGE_DIR = default_storage_dir()
 
 @dataclass
 class TruncateConfig:
-    per_result_threshold: int = 50_000       # chars — truncate single result above this
+    per_result_threshold: int = DEFAULT_PER_RESULT_THRESHOLD
     total_round_threshold: int = 200_000     # chars — total tool-result context budget
     preview_length: int = 2_000              # chars of preview kept in-conversation
     storage_dir: Path = field(default_factory=default_storage_dir)
@@ -49,6 +50,19 @@ class ToolResultTruncator:
     @property
     def storage_dir(self) -> Path:
         return self._cfg.storage_dir
+
+    @property
+    def has_available_results(self) -> bool:
+        """Whether the active project's cache contains a readable result file.
+
+        Disk is the source of truth here so persisted results remain available
+        after the process or session is reopened. ``_stored_results`` is only
+        an in-process index used to avoid rewriting identical content.
+        """
+        try:
+            return any(path.is_file() for path in self._cfg.storage_dir.glob("*.txt"))
+        except OSError:
+            return False
 
     def set_storage_dir(self, storage_dir: Path) -> None:
         """Switch cache roots, for example after entering another worktree."""
