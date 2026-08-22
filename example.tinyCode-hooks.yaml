@@ -1,0 +1,59 @@
+# TinyCode Hook 配置示例
+# 项目级: .tinyCode-hooks.yaml
+# 全局: ~/.tinyCode/hooks.yaml
+
+hooks:
+  # --- 工具拦截：阻止危险命令 ---
+  - name: block-dangerous-commands
+    event: tool_pre_exec
+    condition:
+      match: ALL
+      rules:
+        - field: tool_name
+          operator: exact
+          value: run_command
+        - field: params.command
+          operator: regex
+          value: "rm\\s+-rf"
+    actions:
+      - type: prompt_inject
+        text: "拦截原因: 命令 '{{params.command}}' 包含危险操作 rm -rf，已被 Hook 规则阻止。请使用更安全的替代方案。"
+    control:
+      once: false
+      async: false       # 拦截事件不允许异步
+
+  # --- 工具执行后：记录所有文件写入 ---
+  - name: log-file-writes
+    event: tool_post_exec
+    condition:
+      match: ANY
+      rules:
+        - field: tool_name
+          operator: exact
+          value: write_file
+        - field: tool_name
+          operator: exact
+          value: edit_file
+    actions:
+      - type: shell
+        command: "echo [{{_event}}] {{tool_name}} {{params.path}} >> ~/.tinyCode/file_changes.log"
+    control:
+      once: false
+      async: true
+      timeout: 5
+
+  # --- 收到回复后：检测并通知 ---
+  - name: notify-on-long-response
+    event: message_post_receive
+    condition:
+      match: ALL
+      rules:
+        - field: tool_calls_count
+          operator: exact
+          value: "0"
+    actions:
+      - type: shell
+        command: "echo Response received: {{tool_calls_count}} tool calls"
+    control:
+      once: false
+      async: true

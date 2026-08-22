@@ -1,0 +1,41 @@
+# TinyCode 配置文件示例
+# 使用方法：复制为 .tinyCode.yaml 放在当前目录，或 ~/.tinyCode/config.yaml
+
+providers:
+  - name: claude
+    protocol: anthropic
+    model: claude-sonnet-4-6
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    context_window: 200000
+
+  - name: gpt
+    protocol: openai
+    model: gpt-4o
+    base_url: https://api.openai.com
+    api_key_env: OPENAI_API_KEY
+    context_window: 128000
+
+  - name: deepseek
+    protocol: deepseek
+    model: deepseek-chat
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    context_window: 1000000
+
+  - name: deepseek-r1
+    protocol: deepseek
+    model: deepseek-reasoner
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    context_window: 1000000
+
+# 当前使用的 provider（必须是上面列表中的 name）
+active_provider: claude
+
+# 单次复杂任务允许的最大 Agent 轮数（1-100）
+max_rounds: 30
+
+# 默认安全等级：strict / normal / permissive
+# 可在单次启动时用 tinyCode --mode <等级> 覆盖
+security_level: normal

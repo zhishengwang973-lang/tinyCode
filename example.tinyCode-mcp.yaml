@@ -1,0 +1,22 @@
+# TinyCode MCP 服务器配置示例
+# 使用方法：复制为 .tinyCode-mcp.yaml 放在项目根目录
+# 全局配置：~/.tinyCode/mcp.yaml
+# 项目配置会覆盖全局同名 server
+
+servers:
+  # --- Stdio 传输：本地子进程 ---
+  - name: filesystem
+    transport: stdio
+    command: npx
+    args: [-y, "@anthropic/mcp-filesystem", /path/to/allowed/dir]
+    # env:                           # 可选：设置子进程环境变量
+    #   NODE_ENV: production
+    timeout: 30
+
+  # --- Streamable HTTP 传输：远程服务 ---
+  - name: my-remote-server
+    transport: http
+    url: http://localhost:8080
+    # headers:                        # 可选：认证头
+    #   Authorization: Bearer xxx
+    timeout: 30

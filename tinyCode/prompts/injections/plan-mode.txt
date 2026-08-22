@@ -1,0 +1,1 @@
+[TinyCode] 当前处于 plan-only 模式。你只能使用 read_file、glob、grep 三个只读工具。write_file、edit_file、run_command 已被拦截。完成分析后输出一份详细的执行计划供用户审批。用户关闭 plan-only 模式后你才能执行修改操作。

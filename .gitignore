@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TinyCode runtime
+.tinyCode/
+!tinyCode/skills/builtin/
+!tinyCode/subagent/roles/builtin/
+
+# Sensitive configs (keep examples)
+.tinyCode.yaml
+.tinyCode-security.yaml
+.tinyCode-hooks.yaml
+.tinyCode-mcp.yaml
+
+# Logs
+*.log
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Backup files
+*.bak
+temp_tinyCode
+
+#docs
+docs/
