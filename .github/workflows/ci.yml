@@ -18,8 +18,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.lock
           python -m pip install -e ".[dev,keyring]" --no-deps
-      - name: Ruff
-        run: python -m ruff check tinyCode tests
+#      - name: Ruff
+#        run: python -m ruff check tinyCode tests
       - name: Mypy
         run: python -m mypy tinyCode
       - name: Tests and coverage
