@@ -27,11 +27,18 @@ class ToolExecutor:
         if not isinstance(params, dict):
             return ToolResult(success=False, content="", error="工具参数必须是对象")
 
-        timeout = timeout if timeout is not None else self._default_timeout
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else None if tool.timeout_exempt
+            else self._default_timeout
+        )
         try:
-            result = await asyncio.wait_for(
-                tool.execute(**params),
-                timeout=timeout,
+            execution = tool.execute(**params)
+            result = (
+                await execution
+                if effective_timeout is None
+                else await asyncio.wait_for(execution, timeout=effective_timeout)
             )
             if not isinstance(result, ToolResult):
                 return ToolResult(
@@ -54,7 +61,7 @@ class ToolExecutor:
             return ToolResult(
                 success=False,
                 content="",
-                error=f"工具 '{tool.name}' 执行超时（{timeout}s）",
+                error=f"工具 '{tool.name}' 执行超时（{effective_timeout}s）",
             )
         except Exception as exc:
             return ToolResult(

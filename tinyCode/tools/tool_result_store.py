@@ -2,14 +2,14 @@
 
 from pathlib import Path
 
-from tinyCode.conversation.truncator import DEFAULT_STORAGE_DIR
+from tinyCode.conversation.truncator import default_storage_dir
 from tinyCode.tools.validation import require_string
 
 
 def resolve_tool_result_path(file_path: str, storage_dir: Path | None = None) -> Path:
     """Resolve a stored tool-result path without allowing storage escape."""
     file_path = require_string(file_path, "file_path")
-    root = (storage_dir or DEFAULT_STORAGE_DIR).resolve()
+    root = (storage_dir or default_storage_dir()).resolve()
     path = Path(file_path)
     candidate = path if path.is_absolute() else root / path
     try:

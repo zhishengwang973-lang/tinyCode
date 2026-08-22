@@ -18,6 +18,13 @@ class ToolResultSearchTool(BaseTool):
         self._storage_dir = storage_dir
 
     @property
+    def storage_dir(self) -> Path | None:
+        return self._storage_dir
+
+    def set_storage_dir(self, storage_dir: Path) -> None:
+        self._storage_dir = storage_dir.resolve()
+
+    @property
     def name(self) -> str:
         return "tool_result_search"
 

@@ -45,6 +45,7 @@ class ToolRegistry:
             param_type = getattr(parameter, "type", None)
             description = getattr(parameter, "description", None)
             required = getattr(parameter, "required", None)
+            item_type = getattr(parameter, "item_type", None)
             if not isinstance(name, str) or not name:
                 raise ValueError(f"工具参数名必须是非空字符串: {tool.name}")
             if name in seen_names:
@@ -61,6 +62,16 @@ class ToolRegistry:
                 raise ValueError(f"工具参数 description 必须是字符串: {tool.name}.{name}")
             if not isinstance(required, bool):
                 raise ValueError(f"工具参数 required 必须是布尔值: {tool.name}.{name}")
+            if item_type is not None:
+                if param_type != "array":
+                    raise ValueError(
+                        f"只有 array 参数可以声明 item_type: {tool.name}.{name}"
+                    )
+                if item_type not in _JSON_SCHEMA_TYPES:
+                    raise ValueError(
+                        f"工具参数 item_type 不是有效 JSON Schema 类型: "
+                        f"{tool.name}.{name}={item_type}"
+                    )
 
     def get(self, name: str) -> BaseTool | None:
         """Look up a tool by name."""

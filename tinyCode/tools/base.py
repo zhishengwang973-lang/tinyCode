@@ -42,6 +42,7 @@ class ToolParameter:
     description: str
     required: bool = True
     default: Any = None
+    item_type: str | None = None
 
 
 class BaseTool(ABC):
@@ -68,6 +69,15 @@ class BaseTool(ABC):
         return ToolCategory.WRITE
 
     @property
+    def timeout_exempt(self) -> bool:
+        """Whether ToolExecutor should wait without its ordinary deadline.
+
+        Only foreground human interaction should normally override the shared
+        tool deadline. Cancellation of the owning turn still propagates.
+        """
+        return False
+
+    @property
     @abstractmethod
     def parameters(self) -> list[ToolParameter]:
         """Parameter schema (name, type, description, required)."""
@@ -87,6 +97,10 @@ class BaseTool(ABC):
                 "type": p.type,
                 "description": p.description,
             }
+            if p.item_type is not None:
+                props[p.name]["items"] = {"type": p.item_type}
+            if not p.required and p.default is not None:
+                props[p.name]["default"] = p.default
             if p.required:
                 required.append(p.name)
         return {
@@ -111,6 +125,10 @@ class BaseTool(ABC):
                 "type": p.type,
                 "description": p.description,
             }
+            if p.item_type is not None:
+                props[p.name]["items"] = {"type": p.item_type}
+            if not p.required and p.default is not None:
+                props[p.name]["default"] = p.default
             if p.required:
                 required.append(p.name)
         return {

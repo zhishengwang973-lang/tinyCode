@@ -73,7 +73,9 @@ async def run_team(
         # bound to that member without mutating the main agent's registry.
         member_registry = ToolRegistry()
         for tool in tool_registry.list_tools():
-            if tool.name in {"sub_agent", "skill_loader"} or tool.name.startswith("team_"):
+            if tool.name in {
+                "sub_agent", "skill_loader", "request_user_input",
+            } or tool.name.startswith("team_"):
                 continue
             member_registry.register(tool)
         mailbox = Mailbox(team_dir, member.name)

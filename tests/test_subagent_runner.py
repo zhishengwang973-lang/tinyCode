@@ -82,6 +82,13 @@ class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["mcp_docs_resource", "read_file"], allowed)
 
+    def test_sub_agents_cannot_prompt_the_foreground_user(self):
+        allowed = ToolFilter(
+            SubAgentRole(name="worker", tools_allow=None),
+        ).filter(["read_file", "request_user_input", "web_search"])
+
+        self.assertEqual(["read_file", "web_search"], allowed)
+
     def test_background_result_is_context_not_orphan_tool_message(self):
         task_manager = BackgroundTaskManager()
         history = ConversationHistory()

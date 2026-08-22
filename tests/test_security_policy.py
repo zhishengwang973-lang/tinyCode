@@ -69,6 +69,17 @@ class SecurityPolicyTests(unittest.TestCase):
 
         self.assertEqual(RuleAction.ALLOW, policy.evaluate("read_file", path="app.py"))
         self.assertEqual(RuleAction.ASK, policy.evaluate("edit_file", path="app.py"))
+        self.assertEqual(RuleAction.ASK, policy.evaluate("apply_patch", path="app.py"))
+        self.assertEqual(RuleAction.ALLOW, policy.evaluate("web_search"))
+        self.assertEqual(RuleAction.ALLOW, policy.evaluate("web_fetch"))
+        self.assertEqual(RuleAction.ALLOW, policy.evaluate("request_user_input"))
+
+    def test_strict_mode_asks_before_transmitting_web_requests(self):
+        policy = self.make_policy(SecurityLevel.STRICT)
+
+        self.assertEqual(RuleAction.ASK, policy.evaluate("web_search"))
+        self.assertEqual(RuleAction.ASK, policy.evaluate("web_fetch"))
+        self.assertEqual(RuleAction.ALLOW, policy.evaluate("request_user_input"))
 
     def test_strict_mode_allows_default_whitelisted_paths_only(self):
         policy = self.make_policy(SecurityLevel.STRICT)

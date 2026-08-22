@@ -188,6 +188,38 @@ class TinyCodeTUI(UIControl):
     def show_system_message(self, text: str) -> None:
         self._print_info(text)
 
+    async def request_tool_input(
+        self, question: str, options: list[str],
+    ) -> str | None:
+        """Collect one model-requested answer without creating a new turn."""
+        self._stop_progress()
+        self._console.print()
+        self._console.print(f"需要你确认：{question}", style="bold cyan", highlight=False)
+        for index, option in enumerate(options, start=1):
+            self._console.print(f"  {index}. {option}", highlight=False)
+        prompt = "请输入选项序号或答案 › " if options else "请回答 › "
+        while True:
+            try:
+                answer = (
+                    await self._prompt_session.prompt_async(
+                        [("class:prompt", prompt)]
+                    )
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if not answer:
+                self._print_warning("回答不能为空")
+                continue
+            if options and answer.isascii() and answer.isdigit():
+                selected = int(answer)
+                if 1 <= selected <= len(options):
+                    answer = options[selected - 1]
+                else:
+                    self._print_warning(f"请输入 1–{len(options)} 的序号，或直接输入答案")
+                    continue
+            self._start_progress("已收到回答 · 继续执行")
+            return answer
+
     def send_to_conversation(self, text: str) -> None:
         """Inject a prompt-command result into the foreground conversation."""
         self._start_user_input(text, display_user=False)

@@ -243,6 +243,24 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("system prompt:base", output.getvalue())
         self.assertEqual([], tui._history.user_messages)
 
+    async def test_request_tool_input_accepts_option_number(self):
+        tui, output = self._make_tui(answers=["2"])
+
+        answer = await tui.request_tool_input(
+            "选择数据库", ["PostgreSQL", "SQLite"],
+        )
+
+        self.assertEqual("SQLite", answer)
+        self.assertIn("需要你确认：选择数据库", output.getvalue())
+        self.assertIn("2. SQLite", output.getvalue())
+
+    async def test_request_tool_input_can_be_cancelled(self):
+        tui, _ = self._make_tui(answers=[EOFError()])
+
+        answer = await tui.request_tool_input("需要值", [])
+
+        self.assertIsNone(answer)
+
     async def test_repeated_prompt_command_prints_every_snapshot_in_terminal(self):
         tui, _ = self._make_tui(
             answers=["/prompt base", "/prompt base", "/exit"]

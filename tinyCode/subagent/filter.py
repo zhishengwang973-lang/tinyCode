@@ -3,11 +3,12 @@
 from tinyCode.subagent.models import SubAgentRole
 
 # Always blocked in sub-agents (prevents A→B→C chains)
-GLOBAL_BLOCKED = {"sub_agent", "skill_loader"}
+GLOBAL_BLOCKED = {"sub_agent", "skill_loader", "request_user_input"}
 
 # Fallback for direct/library callers that do not provide registry categories.
 BACKGROUND_WHITELIST = {
     "read_file", "glob", "grep", "tool_result_search", "tool_result_read",
+    "web_search", "web_fetch",
 }
 
 

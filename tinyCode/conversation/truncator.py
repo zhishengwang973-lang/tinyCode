@@ -6,13 +6,25 @@ all tool results in a single conversation round.
 
 import re
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from tinyCode.providers.base import Message
 
-DEFAULT_STORAGE_DIR = Path.home() / ".tinyCode" / "tool_results"
+TOOL_RESULT_STORAGE_SUBDIR = Path(".tinyCode") / "tool_results"
+
+
+def default_storage_dir(project_root: Path | None = None) -> Path:
+    """Return the project-local cache directory for oversized tool results."""
+    root = project_root or Path.cwd()
+    return (root / TOOL_RESULT_STORAGE_SUBDIR).resolve()
+
+
+# Backward-compatible import for callers that treated this module constant as
+# the startup project's default. Internal callers use ``default_storage_dir``
+# so the path is resolved when their instance is created.
+DEFAULT_STORAGE_DIR = default_storage_dir()
 
 
 @dataclass
@@ -20,7 +32,7 @@ class TruncateConfig:
     per_result_threshold: int = 50_000       # chars — truncate single result above this
     total_round_threshold: int = 200_000     # chars — total tool-result context budget
     preview_length: int = 2_000              # chars of preview kept in-conversation
-    storage_dir: Path = DEFAULT_STORAGE_DIR
+    storage_dir: Path = field(default_factory=default_storage_dir)
 
 
 class ToolResultTruncator:
@@ -29,13 +41,28 @@ class ToolResultTruncator:
 
     def __init__(self, config: TruncateConfig | None = None) -> None:
         self._cfg = config or TruncateConfig()
+        self._sequence = 0
+        self._stored_results: dict[str, Path] = {}
+        self.storage_error = ""
+        self.set_storage_dir(self._cfg.storage_dir)
+
+    @property
+    def storage_dir(self) -> Path:
+        return self._cfg.storage_dir
+
+    def set_storage_dir(self, storage_dir: Path) -> None:
+        """Switch cache roots, for example after entering another worktree."""
+        self._cfg.storage_dir = storage_dir.resolve()
+        self._sequence = 0
+        self._stored_results.clear()
         self.storage_error = ""
         try:
             self._cfg.storage_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.storage_error = f"{type(exc).__name__}: {exc}"
-        self._sequence = 0
-        self._stored_results: dict[str, Path] = {}
+
+    def set_project_root(self, project_root: Path) -> None:
+        self.set_storage_dir(default_storage_dir(project_root))
 
     # -- public API -----------------------------------------------------------
 
@@ -122,7 +149,8 @@ class ToolResultTruncator:
             file_path = ""
         preview = content[:self._cfg.preview_length]
         storage_note = (
-            f"完整内容已保存到磁盘\n文件: {file_path}"
+            f"完整内容已保存到磁盘\n文件: {file_path}\n"
+            "可使用 tool_result_search 搜索，或用 tool_result_read 分段读取"
             if file_path
             else f"缓存目录不可写，完整内容未保存（{self.storage_error}）"
         )

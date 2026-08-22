@@ -112,27 +112,52 @@ class SecurityPolicy:
         path: str | None, command: str | None,
     ) -> SecurityRule | None:
         """Convert a HITL decision into a new security rule (if permanent)."""
-        if decision == HITLDecision.ALLOW_PERMANENT:
-            rule = SecurityRule(
+        rules = self.hitl_to_rules(
+            decision, tool_name, paths=[path], command=command,
+        )
+        return rules[0] if rules else None
+
+    def hitl_to_rules(
+        self,
+        decision: HITLDecision,
+        tool_name: str,
+        *,
+        paths: list[str | None],
+        command: str | None,
+    ) -> list[SecurityRule]:
+        """Persist a multi-path approval as one atomic policy update."""
+        if decision not in {
+            HITLDecision.ALLOW_PERMANENT, HITLDecision.ALLOW_SESSION,
+        }:
+            return []
+        scope = (
+            RuleScope.PROJECT
+            if decision == HITLDecision.ALLOW_PERMANENT
+            else RuleScope.SESSION
+        )
+        rules = [
+            SecurityRule(
                 tool=tool_name,
                 action=RuleAction.ALLOW,
                 path_pattern=path,
                 command_pattern=command,
-                scope=RuleScope.PROJECT,
+                scope=scope,
             )
-            self.add_permanent_rule(rule)
-            return rule
-        elif decision == HITLDecision.ALLOW_SESSION:
-            rule = SecurityRule(
-                tool=tool_name,
-                action=RuleAction.ALLOW,
-                path_pattern=path,
-                command_pattern=command,
-                scope=RuleScope.SESSION,
-            )
-            self.add_session_rule(rule)
-            return rule
-        return None
+            for path in paths
+        ]
+        target = self._project_rules if scope == RuleScope.PROJECT else self._session_rules
+        target[0:0] = rules
+        if scope == RuleScope.PROJECT:
+            try:
+                self._save_project_rules()
+            except BaseException:
+                for rule in rules:
+                    try:
+                        target.remove(rule)
+                    except ValueError:
+                        pass
+                raise
+        return rules
 
     # -- internals -----------------------------------------------------------
 
@@ -142,6 +167,19 @@ class SecurityPolicy:
         path: str | None,
         command: str | None,
     ) -> RuleAction:
+        # Asking the foreground user is not a side effect and must not itself
+        # trigger the separate security-approval prompt.
+        if tool_name == "request_user_input":
+            return RuleAction.ALLOW
+        # Public web reads are allowed in normal mode; strict mode explicitly
+        # asks because the query/URL is transmitted to an external service.
+        if tool_name in {"web_search", "web_fetch"}:
+            return (
+                RuleAction.ASK
+                if self.level == SecurityLevel.STRICT
+                else RuleAction.ALLOW
+            )
+
         # Determine if tool is read-only
         is_read = self._is_read_tool(tool_name, command)
 
@@ -169,7 +207,10 @@ class SecurityPolicy:
         return RuleAction.ASK
 
     def _is_read_tool(self, tool_name: str, command: str | None) -> bool:
-        if tool_name in {"read_file", "glob", "grep"}:
+        if tool_name in {
+            "read_file", "glob", "grep", "web_search", "web_fetch",
+            "request_user_input",
+        }:
             return True
         return tool_name == "run_command" and is_read_only_command(command or "")
 

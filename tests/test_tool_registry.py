@@ -4,6 +4,10 @@ import tinyCode.tools as tools_package
 from tinyCode.main import _create_tool_registry
 from tinyCode.tools.base import BaseTool, ToolCategory, ToolParameter, ToolResult
 from tinyCode.tools.delete_file import DeleteFileTool
+from tinyCode.tools.apply_patch import ApplyPatchTool
+from tinyCode.tools.request_user_input import RequestUserInputTool
+from tinyCode.tools.web_fetch import WebFetchTool
+from tinyCode.tools.web_search import WebSearchTool
 from tinyCode.tools.registry import ToolRegistry
 
 
@@ -40,6 +44,23 @@ class ToolRegistryTests(unittest.TestCase):
         registry = _create_tool_registry()
 
         self.assertIsInstance(registry.get("delete_file"), DeleteFileTool)
+
+    def test_main_registry_exposes_new_builtin_tools(self):
+        registry = _create_tool_registry()
+
+        self.assertIsInstance(registry.get("apply_patch"), ApplyPatchTool)
+        self.assertIsInstance(registry.get("request_user_input"), RequestUserInputTool)
+        self.assertIsInstance(registry.get("web_search"), WebSearchTool)
+        self.assertIsInstance(registry.get("web_fetch"), WebFetchTool)
+
+    def test_array_parameter_schema_includes_item_type_and_default(self):
+        registry = _create_tool_registry()
+
+        schema = registry.get("request_user_input").to_openai_schema()
+        options = schema["function"]["parameters"]["properties"]["options"]
+
+        self.assertEqual({"type": "string"}, options["items"])
+        self.assertEqual([], options["default"])
 
     def test_duplicate_tool_name_is_rejected(self):
         registry = ToolRegistry()

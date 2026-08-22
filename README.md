@@ -6,7 +6,7 @@
 
 - **多 Provider 支持**：Anthropic Claude / OpenAI / DeepSeek，通过 YAML 配置切换
 - **流式 TUI**：Rich 连续输出 + Prompt Toolkit 输入补全；进度瞬时刷新，不混入回答正文
-- **内置工具体系**：读/写/编辑/删除文件、执行命令、Glob/Grep 搜索，并在运行时接入 Skill 和子 Agent 工具
+- **内置工具体系**：读/写/编辑/删除文件、多文件 `apply_patch`、执行命令、Glob/Grep、用户输入以及受限的公网搜索/读取，并在运行时接入 Skill 和子 Agent 工具
 - **16 个内置斜杠命令模块**：`/help` `/clear` `/compress` `/mode` `/status` `/config` `/prompt` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
 - **纵深安全防御**：黑名单拦截、路径沙箱、人在回路确认、三档权限模式
 - **MCP 协议**：支持 Stdio 和 HTTP 传输，连接外部工具服务器
@@ -31,6 +31,7 @@ tinyCode
 `-e` 是可编辑安装：源码修改会立即生效，通常无需重复安装。若要在任意新目录启动，
 将 Provider 配置放到 `~/.tinyCode/config.yaml`，进入目标目录后直接执行 `tinyCode`。
 普通新目录无需是 Git 仓库；只有 Worktree 和 Team 多工作树功能依赖 Git。
+超长工具结果缓存在当前项目的 `.tinyCode/tool_results/`，该运行时目录默认应被 Git 忽略。
 
 ## 开发验证
 

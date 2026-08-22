@@ -1,11 +1,14 @@
 import asyncio
+import tempfile
 import unittest
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from tinyCode.agent.events import ContextCompressionEvent, ErrorEvent, RoundStartEvent, ToolBlockedEvent, ToolCallEvent, ToolResultEvent
 from tinyCode.agent.loop import AgentLoop
 from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
+from tinyCode.conversation.truncator import ToolResultTruncator, TruncateConfig
 from tinyCode.config.models import ProviderConfig
 from tinyCode.hooks.models import HookEvent
 from tinyCode.providers.base import BaseProvider, Message, ProviderHTTPError, ToolCall
@@ -14,6 +17,8 @@ from tinyCode.prompts.injector import PromptInjector
 from tinyCode.tools.base import BaseTool, ToolCategory, ToolParameter, ToolResult
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tools.tool_result_read import ToolResultReadTool
+from tinyCode.tools.tool_result_search import ToolResultSearchTool
 
 
 class UnknownToolProvider(BaseProvider):
@@ -220,6 +225,34 @@ class ToolCaptureProvider(UnknownToolProvider):
         yield "direct answer"
 
 
+class LargeToolResultProvider(UnknownToolProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.received_tools: list[list[dict] | None] = []
+
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.calls += 1
+        self.received_tools.append(tools)
+        if self.calls == 1:
+            yield ToolCall(
+                id="tool-large-result",
+                name="read_fixture",
+                input={"path": "large.txt"},
+            )
+        else:
+            yield "done"
+
+
+class PrematureToolResultProvider(UnknownToolProvider):
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        yield ToolCall(
+            id="tool-result-too-early",
+            name="tool_result_read",
+            input={"file_path": "missing.txt"},
+        )
+
+
 class MultiRoundUsageProvider(UnknownToolProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -281,6 +314,12 @@ class ReadFixtureTool(BaseTool):
     async def execute(self, **kwargs) -> ToolResult:
         self.executed = True
         return ToolResult(success=True, content="read ok")
+
+
+class LargeReadFixtureTool(ReadFixtureTool):
+    async def execute(self, **kwargs) -> ToolResult:
+        self.executed = True
+        return ToolResult(success=True, content="x" * 100)
 
 
 class WriteFixtureTool(ReadFixtureTool):
@@ -610,6 +649,115 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(provider.received_tools))
         self.assertTrue(provider.received_tools[0])
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
+
+    async def test_tool_result_helpers_are_exposed_only_after_result_is_stored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp)
+            provider = LargeToolResultProvider()
+            registry = ToolRegistry()
+            registry.register(LargeReadFixtureTool())
+            registry.register(ToolResultSearchTool(storage_dir))
+            registry.register(ToolResultReadTool(storage_dir))
+            truncator = ToolResultTruncator(TruncateConfig(
+                per_result_threshold=10,
+                total_round_threshold=1_000,
+                preview_length=5,
+                storage_dir=storage_dir,
+            ))
+            loop = AgentLoop(
+                provider=provider,
+                tool_registry=registry,
+                tool_executor=ToolExecutor(),
+                prompt_builder=PromptBuilder(),
+                prompt_injector=PromptInjector(),
+                truncator=truncator,
+                max_rounds=2,
+            )
+            history = ConversationHistory()
+            history.add_user_message("读取项目里的大文件")
+
+            events = [event async for event in loop.run(history)]
+
+        first_names = self._openai_tool_names(provider.received_tools[0])
+        second_names = self._openai_tool_names(provider.received_tools[1])
+        self.assertNotIn("tool_result_search", first_names)
+        self.assertNotIn("tool_result_read", first_names)
+        self.assertIn("tool_result_search", second_names)
+        self.assertIn("tool_result_read", second_names)
+        self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
+
+    async def test_hidden_tool_result_helper_cannot_be_called_prematurely(self):
+        registry = ToolRegistry()
+        registry.register(ToolResultReadTool())
+        loop = AgentLoop(
+            provider=PrematureToolResultProvider(),
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=1,
+        )
+        history = ConversationHistory()
+        history.add_user_message("检查当前项目")
+
+        events = [event async for event in loop.run(history)]
+
+        errors = [event for event in events if isinstance(event, ErrorEvent)]
+        self.assertEqual(1, len(errors))
+        self.assertEqual("unadvertised_tool_call", errors[0].code)
+        self.assertIn("当前不可用", errors[0].message)
+
+    def test_deferred_tool_filter_supports_anthropic_schemas(self):
+        registry = ToolRegistry()
+        registry.register(ToolResultReadTool())
+        loop = AgentLoop(
+            provider=AnthropicProviderStub(),
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+        )
+
+        hidden = loop._build_tool_defs(include_tool_result_tools=False)
+        visible = loop._build_tool_defs(include_tool_result_tools=True)
+
+        self.assertEqual(set(), loop._tool_definition_names(hidden))
+        self.assertEqual({"tool_result_read"}, loop._tool_definition_names(visible))
+
+    def test_workspace_switch_moves_tool_result_cache_root(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            initial_storage = Path(first) / ".tinyCode" / "tool_results"
+            truncator = ToolResultTruncator(TruncateConfig(
+                storage_dir=initial_storage,
+            ))
+            registry = ToolRegistry()
+            search_tool = ToolResultSearchTool(truncator.storage_dir)
+            read_tool = ToolResultReadTool(truncator.storage_dir)
+            registry.register(search_tool)
+            registry.register(read_tool)
+            loop = AgentLoop(
+                provider=UnknownToolProvider(),
+                tool_registry=registry,
+                tool_executor=ToolExecutor(),
+                prompt_builder=PromptBuilder(),
+                prompt_injector=PromptInjector(),
+                truncator=truncator,
+            )
+
+            loop.set_workspace(Path(second))
+
+            expected = Path(second).resolve() / ".tinyCode" / "tool_results"
+            self.assertEqual(expected, truncator.storage_dir)
+            self.assertEqual(expected, search_tool.storage_dir)
+            self.assertEqual(expected, read_tool.storage_dir)
+            self.assertTrue(expected.is_dir())
+
+    @staticmethod
+    def _openai_tool_names(definitions):
+        return {
+            definition["function"]["name"]
+            for definition in definitions or []
+        }
 
     async def test_read_tool_pre_exec_hook_can_intercept_execution(self):
         registry = ToolRegistry()

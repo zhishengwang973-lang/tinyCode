@@ -76,6 +76,14 @@ class ToolResultToolsTests(unittest.TestCase):
         self.assertIsNotNone(registry.get("tool_result_search"))
         self.assertIsNotNone(registry.get("tool_result_read"))
 
+    def test_registry_binds_both_helpers_to_truncator_storage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Path(tmp) / "project" / ".tinyCode" / "tool_results"
+            registry = _create_tool_registry(storage)
+
+            self.assertEqual(storage, registry.get("tool_result_search").storage_dir)
+            self.assertEqual(storage, registry.get("tool_result_read").storage_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,7 +51,8 @@ DEFAULT_IDLE_EVENT_TIMEOUT = 60.0
 DEFAULT_PROVIDER_RETRIES = 2
 DEFAULT_RETRY_DELAY = 0.5
 DEFAULT_MAX_RESPONSE_CHARS = 1_000_000
-_PLAN_MODE_ALLOWED = {"read_file", "glob", "grep"}
+_PLAN_MODE_ALLOWED = {"read_file", "glob", "grep", "request_user_input"}
+_DEFERRED_TOOL_RESULT_TOOLS = {"tool_result_search", "tool_result_read"}
 
 
 class AgentLoop:
@@ -247,7 +248,12 @@ class AgentLoop:
                 if tools_enabled:
                     full_tokens += StructuredSummarizer._estimate_tokens([{
                         "role": "system",
-                        "content": json.dumps(self._build_tool_defs(), ensure_ascii=False),
+                        "content": json.dumps(
+                            # Conservatively count deferred schemas even when
+                            # they will be hidden from this provider request.
+                            self._build_tool_defs(include_tool_result_tools=True),
+                            ensure_ascii=False,
+                        ),
                     }])
                 comp = await self._compressor.check_and_compress(
                     request_history,
@@ -296,8 +302,12 @@ class AgentLoop:
             messages = self._assemble_messages(request_history, round_num)
 
             # --- 1.5. Layer 1 截断 ---
+            tool_result_files_available = False
             if self._truncator is not None:
                 messages, trunc_infos = self._truncator.process_round(messages)
+                tool_result_files_available = any(
+                    bool(info.get("file_path")) for info in trunc_infos
+                )
                 for info in trunc_infos:
                     from tinyCode.agent.events import TruncationEvent
                     yield TruncationEvent(
@@ -327,10 +337,17 @@ class AgentLoop:
             tool_calls: list[ToolCall] = []
             tool_call_ids: set[str] = set()
             text_parts: list[str] = []
+            tool_defs = (
+                self._build_tool_defs(
+                    include_tool_result_tools=tool_result_files_available,
+                )
+                if tools_enabled else None
+            )
+            advertised_tool_names = self._tool_definition_names(tool_defs)
 
             async for raw in self._stream_provider(
                 messages=messages,
-                tools=self._build_tool_defs() if tools_enabled else None,
+                tools=tool_defs,
                 system_blocks=self._build_system_blocks(),
             ):
                 if self._cancel_event.is_set():
@@ -380,6 +397,23 @@ class AgentLoop:
                         )
                         self._active_round = 0
                         yield ErrorEvent(message=identity_error)
+                        return
+                    if (
+                        raw.name in _DEFERRED_TOOL_RESULT_TOOLS
+                        and raw.name not in advertised_tool_names
+                    ):
+                        message = (
+                            f"工具 '{raw.name}' 当前不可用："
+                            "本轮没有已落盘的超长工具结果"
+                        )
+                        await self._fire_error(
+                            message, "unadvertised_tool_call", round_num,
+                        )
+                        self._active_round = 0
+                        yield ErrorEvent(
+                            message=message,
+                            code="unadvertised_tool_call",
+                        )
                         return
                     if raw.id in tool_call_ids:
                         message = f"模型返回了重复的工具调用 ID: {raw.id}"
@@ -708,8 +742,32 @@ class AgentLoop:
         except (RuntimeError, asyncio.CancelledError):
             pass
 
-    def _build_tool_defs(self) -> list[dict]:
-        return self._context_assembler.tool_definitions(self._tool_registry)
+    def _build_tool_defs(
+        self, *, include_tool_result_tools: bool = False,
+    ) -> list[dict]:
+        definitions = self._context_assembler.tool_definitions(self._tool_registry)
+        if include_tool_result_tools:
+            return definitions
+        return [
+            definition for definition in definitions
+            if self._tool_definition_name(definition) not in _DEFERRED_TOOL_RESULT_TOOLS
+        ]
+
+    @classmethod
+    def _tool_definition_names(cls, definitions: list[dict] | None) -> set[str]:
+        return {
+            cls._tool_definition_name(definition)
+            for definition in definitions or []
+        }
+
+    @staticmethod
+    def _tool_definition_name(definition: dict) -> str:
+        function = definition.get("function")
+        if isinstance(function, dict):
+            name = function.get("name", "")
+        else:
+            name = definition.get("name", "")
+        return name if isinstance(name, str) else ""
 
     def _partition_tools(
         self, tool_calls: list[ToolCall],
@@ -864,6 +922,13 @@ class AgentLoop:
     def set_workspace(self, workspace: Path) -> None:
         if self._security_guard:
             self._security_guard.set_project_root(workspace)
+        if self._truncator:
+            self._truncator.set_project_root(workspace)
+            for name in _DEFERRED_TOOL_RESULT_TOOLS:
+                tool = self._tool_registry.get(name)
+                set_storage_dir = getattr(tool, "set_storage_dir", None)
+                if callable(set_storage_dir):
+                    set_storage_dir(self._truncator.storage_dir)
 
     def _current_environment_text(self) -> str:
         return self._context_assembler.environment_text()

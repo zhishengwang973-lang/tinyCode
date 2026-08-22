@@ -29,12 +29,16 @@ from tinyCode.tools import (
     ReadFileTool,
     WriteFileTool,
     EditFileTool,
+    ApplyPatchTool,
     DeleteFileTool,
     RunCommandTool,
     GlobTool,
     GrepTool,
     ToolResultSearchTool,
     ToolResultReadTool,
+    RequestUserInputTool,
+    WebSearchTool,
+    WebFetchTool,
 )
 from tinyCode.tui.app import TinyCodeTUI
 
@@ -68,17 +72,23 @@ class _CleanupStack:
             raise cancellation
 
 
-def _create_tool_registry() -> ToolRegistry:
+def _create_tool_registry(
+    tool_result_storage_dir: Path | None = None,
+) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ReadFileTool())
     registry.register(WriteFileTool())
     registry.register(EditFileTool())
+    registry.register(ApplyPatchTool())
     registry.register(DeleteFileTool())
     registry.register(RunCommandTool())
     registry.register(GlobTool())
     registry.register(GrepTool())
-    registry.register(ToolResultSearchTool())
-    registry.register(ToolResultReadTool())
+    registry.register(ToolResultSearchTool(tool_result_storage_dir))
+    registry.register(ToolResultReadTool(tool_result_storage_dir))
+    registry.register(RequestUserInputTool())
+    registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
     return registry
 
 
@@ -184,7 +194,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         print(f"笔记初始化: {error}", file=sys.stderr)
 
     # 7. Tool registry (create early — needed by skills MCP subagent)
-    tool_registry = _create_tool_registry()
+    tool_registry = _create_tool_registry(truncator.storage_dir)
 
     # 7.5. Skills (needs tool_registry for whitelist validation)
     skill_loader = SkillLoader()
@@ -366,6 +376,9 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui
+    request_input_tool = tool_registry.get("request_user_input")
+    if isinstance(request_input_tool, RequestUserInputTool):
+        request_input_tool.set_handler(tui.request_tool_input)
     await hook_engine.fire(HookEvent.SYSTEM_STARTUP, {"cwd": str(Path.cwd())})
     lifecycle_started["system"] = True
     await hook_engine.fire(HookEvent.SESSION_START, {

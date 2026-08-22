@@ -3,7 +3,11 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from tinyCode.conversation.truncator import ToolResultTruncator, TruncateConfig
+from tinyCode.conversation.truncator import (
+    ToolResultTruncator,
+    TruncateConfig,
+    default_storage_dir,
+)
 
 
 class ToolResultTruncatorTests(unittest.TestCase):
@@ -13,6 +17,17 @@ class ToolResultTruncatorTests(unittest.TestCase):
         self.assertEqual(50_000, config.per_result_threshold)
         self.assertEqual(200_000, config.total_round_threshold)
         self.assertEqual(2_000, config.preview_length)
+
+    def test_default_storage_is_project_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+
+            storage = default_storage_dir(project)
+
+            self.assertEqual(
+                project.resolve() / ".tinyCode" / "tool_results",
+                storage,
+            )
 
     def test_anthropic_tool_result_blocks_are_truncated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -43,6 +58,8 @@ class ToolResultTruncatorTests(unittest.TestCase):
             block = new_messages[0]["content"][0]
             self.assertEqual("tool_result", block["type"])
             self.assertIn("完整内容已保存到磁盘", block["content"])
+            self.assertIn("tool_result_search", block["content"])
+            self.assertIn("tool_result_read", block["content"])
             self.assertIn("xxxxx", block["content"])
             self.assertEqual(1, len(infos))
             self.assertEqual("toolu_1", infos[0]["tool_name"])

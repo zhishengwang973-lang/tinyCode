@@ -92,6 +92,52 @@ class PathSandboxTests(unittest.TestCase):
             self.assertFalse(cmd_allowed)
             self.assertIn("字符串", cmd_reason)
 
+    def test_apply_patch_validates_every_declared_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "project"
+            project_root.mkdir()
+            guard = SecurityGuard(
+                policy=SecurityPolicy(
+                    level=SecurityLevel.PERMISSIVE,
+                    project_root=project_root,
+                ),
+                sandbox=PathSandbox(project_root),
+            )
+            patch = (
+                "*** Begin Patch\n"
+                "*** Add File: safe.txt\n"
+                "+ok\n"
+                "*** Add File: ../outside.txt\n"
+                "+bad\n"
+                "*** End Patch"
+            )
+
+            allowed, reason = guard.check("apply_patch", {"patch": patch})
+
+            self.assertFalse(allowed)
+            self.assertIn("路径", reason)
+
+    def test_apply_patch_session_approval_is_scoped_to_each_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "project"
+            project_root.mkdir()
+            policy = SecurityPolicy(level=SecurityLevel.NORMAL, project_root=project_root)
+            guard = SecurityGuard(policy=policy, sandbox=PathSandbox(project_root))
+            params = {
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Update File: a.py\n"
+                    "*** Update File: b.py\n"
+                    "*** End Patch"
+                )
+            }
+
+            guard.apply_hitl(HITLDecision.ALLOW_SESSION, "apply_patch", params)
+
+            self.assertEqual(RuleAction.ALLOW, policy.evaluate("apply_patch", path="a.py"))
+            self.assertEqual(RuleAction.ALLOW, policy.evaluate("apply_patch", path="b.py"))
+            self.assertEqual(RuleAction.ASK, policy.evaluate("apply_patch", path="c.py"))
+
     def test_security_guard_blocks_provider_config_from_model_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "project"
