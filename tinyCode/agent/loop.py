@@ -105,6 +105,7 @@ class AgentLoop:
             prompt_injector=prompt_injector,
             instructions_text=instructions_text,
             environment_text=environment_text,
+            notes_text=self._current_notes_text,
             skill_registry=skill_registry,
         )
 
@@ -154,6 +155,7 @@ class AgentLoop:
             "instructions": self._instructions_text,
             "skills": active_skills,
             "environment": self._current_environment_text(),
+            "notes": self._current_notes_text(),
             "injection": self._prompt_injector.preview_injection(1) or "",
         }
         labels = {
@@ -161,13 +163,14 @@ class AgentLoop:
             "instructions": "Instructions",
             "skills": "Activated Skills",
             "environment": "Environment",
+            "notes": "Notes",
             "injection": "Dynamic Injection（下一轮预览）",
         }
 
         normalized = section.strip().lower()
         if normalized != "all" and normalized not in sections:
             raise ValueError(
-                "可用部分: all, base, instructions, skills, environment, injection"
+                "可用部分: all, base, instructions, skills, environment, notes, injection"
             )
 
         selected = sections if normalized == "all" else {normalized: sections[normalized]}
@@ -936,6 +939,11 @@ class AgentLoop:
 
     def _current_environment_text(self) -> str:
         return self._context_assembler.environment_text()
+
+    def _current_notes_text(self) -> str:
+        if self._note_manager is None:
+            return ""
+        return self._note_manager.context_text()
 
     def _append_tool_result(
         self, history: ConversationHistory, tool_call: ToolCall, result: ToolResult,

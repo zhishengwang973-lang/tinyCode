@@ -531,6 +531,35 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("project instruction", snapshot)
         self.assertIn("cwd: /workspace", snapshot)
 
+    def test_notes_are_injected_and_visible_in_prompt_snapshot(self):
+        class NoteManager:
+            def context_text(self) -> str:
+                return "[项目知识]\n- 使用 Prompt Toolkit"
+
+        loop = AgentLoop(
+            provider=UnknownToolProvider(),
+            tool_registry=ToolRegistry(),
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            note_manager=NoteManager(),
+            max_rounds=1,
+        )
+        history = ConversationHistory()
+        history.add_user_message("继续开发")
+
+        messages = loop._assemble_messages(history, 1)
+        snapshot = loop.get_system_prompt("notes")
+
+        self.assertTrue(any(
+            message.get("role") == "system"
+            and "[Notes]" in str(message.get("content"))
+            and "使用 Prompt Toolkit" in str(message.get("content"))
+            for message in messages
+        ))
+        self.assertIn("--- Notes ---", snapshot)
+        self.assertIn("使用 Prompt Toolkit", snapshot)
+
     def test_prompt_snapshot_does_not_consume_pending_injection(self):
         injector = PromptInjector()
         injector.queue_injection("one shot")

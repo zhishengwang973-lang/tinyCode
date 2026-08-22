@@ -39,3 +39,7 @@ max_rounds: 30
 # 默认安全等级：strict / normal / permissive
 # 可在单次启动时用 tinyCode --mode <等级> 覆盖
 security_level: normal
+
+# 是否启用持久笔记（自动更新、读取及上下文注入）
+# 仅在全局 ~/.tinyCode/config.yaml 中生效，项目配置不能覆盖
+notes_enabled: true

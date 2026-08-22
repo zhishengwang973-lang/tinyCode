@@ -46,6 +46,42 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("https://api.openai.com", config.providers[0].base_url)
             self.assertEqual(30, config.max_rounds)
             self.assertEqual("normal", config.security_level)
+            self.assertTrue(config.notes_enabled)
+
+    def test_notes_enabled_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "notes_enabled: false\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertFalse(config.notes_enabled)
+
+    def test_notes_enabled_rejects_non_boolean_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "notes_enabled: disabled\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(
+                    ConfigError, "notes_enabled 必须是 true 或 false",
+                ):
+                    load_config()
 
     def test_security_level_is_configurable_and_case_insensitive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,6 +378,34 @@ class ConfigLoaderTests(unittest.TestCase):
                 config = load_config()
 
             self.assertEqual("strict", config.security_level)
+
+    def test_project_config_cannot_override_global_notes_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "project"
+            (home / ".tinyCode").mkdir(parents=True)
+            project.mkdir()
+            (home / ".tinyCode" / "config.yaml").write_text(
+                "providers:\n"
+                "  - name: global\n"
+                "    protocol: openai\n"
+                "    model: test\n"
+                "    api_key: key\n"
+                "notes_enabled: false\n",
+                encoding="utf-8",
+            )
+            (project / ".tinyCode.yaml").write_text(
+                "notes_enabled: true\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": ""}, clear=False), \
+                 patch("tinyCode.config.loader.Path.home", return_value=home), \
+                 patch("tinyCode.config.loader.Path.cwd", return_value=project):
+                config = load_config()
+
+            self.assertFalse(config.notes_enabled)
 
 
 if __name__ == "__main__":

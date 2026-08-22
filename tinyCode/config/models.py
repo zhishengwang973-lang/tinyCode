@@ -2,7 +2,11 @@
 
 from pydantic import BaseModel
 
-from tinyCode.config.constants import DEFAULT_MAX_ROUNDS, DEFAULT_SECURITY_LEVEL
+from tinyCode.config.constants import (
+    DEFAULT_MAX_ROUNDS,
+    DEFAULT_NOTES_ENABLED,
+    DEFAULT_SECURITY_LEVEL,
+)
 
 
 class ProviderConfig(BaseModel):
@@ -23,3 +27,4 @@ class AppConfig(BaseModel):
     active_provider: str  # name of the provider to use
     max_rounds: int = DEFAULT_MAX_ROUNDS
     security_level: str = DEFAULT_SECURITY_LEVEL
+    notes_enabled: bool = DEFAULT_NOTES_ENABLED

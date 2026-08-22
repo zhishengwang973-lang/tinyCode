@@ -10,6 +10,7 @@ import yaml
 from tinyCode.config.models import AppConfig, ProviderConfig
 from tinyCode.config.constants import (
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_NOTES_ENABLED,
     DEFAULT_SECURITY_LEVEL,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_SECURITY_LEVELS,
@@ -83,6 +84,13 @@ def _discover_raw_config() -> dict[str, Any]:
 
     merged = dict(global_raw)
     merged.update(project_raw)
+    # Notes may contain user-wide preferences and corrections. Enabling or
+    # disabling that persistent memory is a user-level decision, so a
+    # repository-owned config must not override it.
+    if "notes_enabled" in global_raw:
+        merged["notes_enabled"] = global_raw["notes_enabled"]
+    else:
+        merged.pop("notes_enabled", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -287,7 +295,12 @@ def load_config() -> AppConfig:
     if security_level not in SUPPORTED_SECURITY_LEVELS:
         raise ConfigError("security_level 必须是 strict、normal 或 permissive")
 
+    notes_enabled = raw.get("notes_enabled", DEFAULT_NOTES_ENABLED)
+    if not isinstance(notes_enabled, bool):
+        raise ConfigError("notes_enabled 必须是 true 或 false")
+
     return AppConfig(
         providers=providers, active_provider=active_provider,
         max_rounds=max_rounds, security_level=security_level,
+        notes_enabled=notes_enabled,
     )

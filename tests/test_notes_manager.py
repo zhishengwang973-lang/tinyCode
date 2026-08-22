@@ -5,7 +5,11 @@ from contextvars import ContextVar
 from pathlib import Path
 from unittest.mock import patch
 
-from tinyCode.notes.manager import AutoNoteManager, MAX_NOTE_OUTPUT_CHARS
+from tinyCode.notes.manager import (
+    AutoNoteManager,
+    MAX_NOTE_CONTEXT_CHARS,
+    MAX_NOTE_OUTPUT_CHARS,
+)
 
 
 class CapturingProvider:
@@ -64,6 +68,60 @@ class FailsOneCategoryOnceProvider(ConcurrentProvider):
 
 
 class AutoNoteManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_context_text_loads_user_and_current_project_notes(self):
+        provider = CapturingProvider()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_notes = root / "user-notes"
+            project_notes = root / "project-notes"
+            user_notes.mkdir()
+            project_notes.mkdir()
+            (user_notes / "user_preferences.md").write_text(
+                "## 用户偏好\n- 使用中文", encoding="utf-8",
+            )
+            (project_notes / "project_knowledge.md").write_text(
+                "## 项目知识\n- 使用 Prompt Toolkit", encoding="utf-8",
+            )
+            with (
+                patch("tinyCode.notes.manager.get_user_notes_dir", return_value=user_notes),
+                patch(
+                    "tinyCode.notes.manager.get_project_notes_dir",
+                    return_value=project_notes,
+                ),
+            ):
+                manager = AutoNoteManager(provider=provider, cwd=root)
+                context = manager.context_text()
+
+        self.assertIn("[用户偏好]", context)
+        self.assertIn("使用中文", context)
+        self.assertIn("[项目知识]", context)
+        self.assertIn("使用 Prompt Toolkit", context)
+        self.assertNotIn("[纠正反馈]", context)
+
+    async def test_context_text_caps_large_notes(self):
+        provider = CapturingProvider()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_notes = root / "user-notes"
+            project_notes = root / "project-notes"
+            user_notes.mkdir()
+            project_notes.mkdir()
+            (project_notes / "project_knowledge.md").write_text(
+                "x" * (MAX_NOTE_CONTEXT_CHARS + 100), encoding="utf-8",
+            )
+            with (
+                patch("tinyCode.notes.manager.get_user_notes_dir", return_value=user_notes),
+                patch(
+                    "tinyCode.notes.manager.get_project_notes_dir",
+                    return_value=project_notes,
+                ),
+            ):
+                manager = AutoNoteManager(provider=provider, cwd=root)
+                context = manager.context_text()
+
+        self.assertIn("字符未注入", context)
+        self.assertLess(len(context), MAX_NOTE_CONTEXT_CHARS + 200)
+
     async def test_update_all_runs_categories_concurrently_and_sums_usage(self):
         provider = ConcurrentProvider()
         with tempfile.TemporaryDirectory() as tmp:

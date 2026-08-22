@@ -18,6 +18,7 @@ class PromptContextAssembler:
         prompt_injector: PromptInjector,
         instructions_text: str = "",
         environment_text: str | Callable[[], str] = "",
+        notes_text: str | Callable[[], str] = "",
         skill_registry: Any = None,
     ) -> None:
         self._protocol = protocol
@@ -25,12 +26,18 @@ class PromptContextAssembler:
         self._prompt_injector = prompt_injector
         self._instructions_text = instructions_text
         self._environment_text = environment_text
+        self._notes_text = notes_text
         self._skill_registry = skill_registry
 
     def environment_text(self) -> str:
         if callable(self._environment_text):
             return self._environment_text()
         return self._environment_text
+
+    def notes_text(self) -> str:
+        if callable(self._notes_text):
+            return self._notes_text()
+        return self._notes_text
 
     def assemble(
         self, history: ConversationHistory, round_number: int,
@@ -52,13 +59,18 @@ class PromptContextAssembler:
                 self._skill_registry.get_active_instructions(),
                 is_anthropic,
             )
+
         self._append_pinned(
-            result, "Environment", self.environment_text(), is_anthropic,
+            result, "Notes", self.notes_text(), is_anthropic,
         )
 
         injection = self._prompt_injector.build_injection(round_number)
         if injection:
             result.append({"role": "user", "content": injection})
+
+        self._append_pinned(
+            result, "Environment", self.environment_text(), is_anthropic,
+        )
 
         conversation = history.get_messages()
         if is_anthropic:

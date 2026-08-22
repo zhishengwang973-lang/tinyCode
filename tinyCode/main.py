@@ -189,9 +189,11 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             f"工具结果缓存不可用，将仅保留截断预览: {truncator.storage_error}",
             file=sys.stderr,
         )
-    note_manager = AutoNoteManager(provider=provider, interval=5)
-    for error in note_manager.last_errors:
-        print(f"笔记初始化: {error}", file=sys.stderr)
+    note_manager: AutoNoteManager | None = None
+    if app_config.notes_enabled:
+        note_manager = AutoNoteManager(provider=provider, interval=5)
+        for error in note_manager.last_errors:
+            print(f"笔记初始化: {error}", file=sys.stderr)
 
     # 7. Tool registry (create early — needed by skills MCP subagent)
     tool_registry = _create_tool_registry(truncator.storage_dir)
@@ -303,7 +305,8 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             )
             if resumed:
                 security_guard.set_project_root(Path.cwd())
-                note_manager.set_cwd(Path.cwd())
+                if note_manager is not None:
+                    note_manager.set_cwd(Path.cwd())
             else:
                 print(f"恢复 Worktree 失败: {resume_error}", file=sys.stderr)
 

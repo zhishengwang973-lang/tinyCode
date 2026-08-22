@@ -151,6 +151,7 @@ providers:
 active_provider: claude   # ← 当前使用哪个
 max_rounds: 30            # 单个任务最大 Agent 轮数，范围 1-100
 security_level: normal    # strict / normal / permissive
+notes_enabled: true       # 持久笔记开关，仅在全局配置中生效
 ```
 
 密钥支持三种互斥写法：`api_key_env: ENV_NAME`、`api_key: ${ENV_NAME}`，或安装
@@ -166,7 +167,8 @@ security_level: normal    # strict / normal / permissive
 `~/.tinyCode/config.yaml`，再用当前目录 `.tinyCode.yaml` 覆盖。项目 Provider 列表
 整体替换全局 Provider 列表，避免项目提供的 `base_url` 偷用全局密钥。项目配置可以
 提高全局安全等级，但不能把显式的全局 `security_level` 降级；需要临时降级时必须由用户
-亲自传入 `--mode`。
+亲自传入 `--mode`。`notes_enabled` 只接受 `true` 或 `false`，并且只从全局
+`~/.tinyCode/config.yaml` 读取，项目 `.tinyCode.yaml` 不能启用或关闭用户的持久笔记。
 
 **Claude Extended Thinking**：在代码中通过 `provider.enable_thinking(budget_tokens=8192)` 开启。推理期间 TUI 使用临时进度提示，不把推理状态插入回答正文。
 

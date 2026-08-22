@@ -2,8 +2,8 @@
 
 from tinyCode.commands.types import CommandMeta, CommandType, ParamHint, UIControl
 
-_SECTIONS = {"all", "base", "instructions", "skills", "environment", "injection"}
-_USAGE = "/prompt [all|base|instructions|skills|environment|injection]"
+_SECTIONS = {"all", "base", "instructions", "skills", "environment", "notes", "injection"}
+_USAGE = "/prompt [all|base|instructions|skills|environment|notes|injection]"
 
 
 def create(ui: UIControl) -> CommandMeta:
