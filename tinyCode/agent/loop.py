@@ -19,6 +19,7 @@ from tinyCode.agent.events import (
     RoundLimitReachedEvent,
     RoundStartEvent,
     ProgressWarningEvent,
+    SteeringAppliedEvent,
     TaskStalledDecision,
     TaskStalledDecisionAction,
     TaskStalledEvent,
@@ -50,6 +51,7 @@ from tinyCode.skills.registry import SkillRegistry
 from tinyCode.providers.base import (
     BaseProvider,
     MAX_PARALLEL_TOOL_CALLS,
+    Message,
     ProviderError,
     TokenUsage,
     ToolCall,
@@ -629,7 +631,53 @@ class AgentLoop:
             # --- 4. 无工具调用 → 终止 ---
             if not tool_calls:
                 if text_parts:
-                    history.add_assistant_message("".join(text_parts))
+                    response_text = "".join(text_parts)
+                    history.add_assistant_message(response_text)
+                    if request_history is not history:
+                        request_history.add_assistant_message(response_text)
+                history_size_before_steering = len(history.get_messages())
+                deferred_count = history.flush_steering()
+                if deferred_count:
+                    if request_history is not history:
+                        # Copy only newly flushed input into the isolated current
+                        # turn, keeping unrelated previous answers out.
+                        for message in history.get_messages()[
+                            history_size_before_steering:
+                        ]:
+                            request_history.add_raw_message(message)
+                    can_continue = round_num < budget.hard_limit
+                    yield SteeringAppliedEvent(
+                        message_count=deferred_count,
+                        continued=can_continue,
+                    )
+                    if can_continue:
+                        previous_limit = budget.current_limit
+                        budget.current_limit = min(
+                            budget.hard_limit,
+                            max(
+                                budget.current_limit,
+                                round_num + budget.extension,
+                            ),
+                        )
+                        await self._fire_round_end(
+                            round_num, 0, "continued_by_user_steering",
+                        )
+                        self._active_round = 0
+                        if budget.current_limit > previous_limit:
+                            yield RoundLimitExtendedEvent(
+                                previous_limit=previous_limit,
+                                new_limit=budget.current_limit,
+                                hard_limit=budget.hard_limit,
+                                automatic=False,
+                            )
+                        round_num += 1
+                        continue
+                    await self._fire_round_end(
+                        round_num, 0, "hard_max_rounds",
+                    )
+                    self._active_round = 0
+                    yield AgentDoneEvent("hard_max_rounds")
+                    return
                 await self._fire_round_end(round_num, 0, "completed")
                 self._active_round = 0
                 yield AgentDoneEvent("no_tool_call")
@@ -743,8 +791,38 @@ class AgentLoop:
                 round_observations.append((tc, result))
                 yield ToolResultEvent(tool_name=tc.name, result=result)
 
+            deferred_count = history.flush_steering()
+            if deferred_count:
+                if request_history is not history:
+                    request_history = history
+                can_continue = round_num < budget.hard_limit
+                yield SteeringAppliedEvent(
+                    message_count=deferred_count,
+                    continued=can_continue,
+                )
+                if can_continue:
+                    previous_limit = budget.current_limit
+                    budget.current_limit = min(
+                        budget.hard_limit,
+                        max(
+                            budget.current_limit,
+                            round_num + budget.extension,
+                        ),
+                    )
+                    if budget.current_limit > previous_limit:
+                        yield RoundLimitExtendedEvent(
+                            previous_limit=previous_limit,
+                            new_limit=budget.current_limit,
+                            hard_limit=budget.hard_limit,
+                            automatic=False,
+                        )
+
             progress = progress_watchdog.observe(round_num, round_observations)
-            if progress.state == ProgressState.SLOW:
+            if deferred_count:
+                # A user steering message supersedes the strategy that produced
+                # this round. Give the new direction a fresh observation window.
+                progress_watchdog.reset_strategy()
+            elif progress.state == ProgressState.SLOW:
                 self._prompt_injector.queue_injection(progress.recovery_prompt)
                 yield ProgressWarningEvent(
                     state=progress.state.value,
@@ -753,7 +831,7 @@ class AgentLoop:
                 )
 
             if round_num >= budget.hard_limit:
-                if progress.requires_intervention:
+                if not deferred_count and progress.requires_intervention:
                     yield ProgressWarningEvent(
                         state=progress.state.value,
                         reasons=progress.reasons,
@@ -766,7 +844,7 @@ class AgentLoop:
                 yield AgentDoneEvent("hard_max_rounds")
                 return
 
-            if progress.requires_intervention:
+            if not deferred_count and progress.requires_intervention:
                 await self._fire_round_end(
                     round_num, len(tool_calls), "awaiting_progress_decision",
                 )
@@ -912,11 +990,17 @@ class AgentLoop:
         """
         if tools_enabled:
             return history
+        trailing_users: list[Message] = []
         for message in reversed(history.get_messages()):
-            if message.get("role") == "user" and isinstance(message.get("content"), str):
-                isolated = ConversationHistory()
-                isolated.add_user_message(message["content"])
-                return isolated
+            if message.get("role") != "user":
+                break
+            if isinstance(message.get("content"), str):
+                trailing_users.append(message)
+        if trailing_users:
+            isolated = ConversationHistory()
+            for message in reversed(trailing_users):
+                isolated.add_raw_message(message)
+            return isolated
         return history
 
     async def _fire_round_end(

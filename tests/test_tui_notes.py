@@ -32,13 +32,46 @@ from tinyCode.tui.app import TinyCodeTUI
 class FakeHistory:
     def __init__(self) -> None:
         self.user_messages: list[str] = []
+        self.deferred_messages: list[str] = []
+        self.steering_messages: list[str] = []
         self.estimated_tokens = 0
 
     def add_user_message(self, content: str) -> None:
         self.user_messages.append(content)
 
     def flush_deferred(self) -> int:
-        return 0
+        pending = self.deferred_messages + self.steering_messages
+        self.deferred_messages = []
+        self.steering_messages = []
+        self.user_messages.extend(pending)
+        return len(pending)
+
+    def defer_user_message(self, content: str) -> None:
+        if content:
+            self.deferred_messages.append(content)
+
+    def queue_steering_message(self, content: str) -> None:
+        if content:
+            self.steering_messages.append(content)
+
+    @property
+    def steering_count(self) -> int:
+        return len(self.steering_messages)
+
+    def discard_steering_messages(self) -> int:
+        count = len(self.steering_messages)
+        self.steering_messages = []
+        return count
+
+    def flush_steering(self) -> int:
+        pending = self.steering_messages
+        self.steering_messages = []
+        self.user_messages.extend(pending)
+        return len(pending)
+
+    @property
+    def deferred_count(self) -> int:
+        return len(self.deferred_messages)
 
     def estimated_token_count(self) -> int:
         return self.estimated_tokens
@@ -63,6 +96,8 @@ class FakePromptSession:
         self.prompts: list[object] = []
 
     async def prompt_async(self, message=None):
+        if callable(message):
+            message = message()
         self.prompts.append(message)
         if not self.answers:
             raise EOFError
@@ -216,6 +251,18 @@ class LineStreamingAgentLoop(FakeAgentLoop):
         yield AgentDoneEvent("no_tool_call")
 
 
+class AskingAgentLoop(FakeAgentLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_handler = None
+
+    async def run(self, history):
+        assert self.input_handler is not None
+        answer = await self.input_handler("选择实现语言", ["Python", "Rust"])
+        yield TextDeltaEvent(f"selected:{answer}")
+        yield AgentDoneEvent("no_tool_call")
+
+
 class ApprovalAgentLoop(FakeAgentLoop):
     def __init__(self) -> None:
         super().__init__()
@@ -342,6 +389,17 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         answer = await tui.request_tool_input("需要值", [])
 
         self.assertIsNone(answer)
+
+    async def test_foreground_tool_input_uses_single_input_loop(self):
+        loop = AskingAgentLoop()
+        tui, output = self._make_tui(loop, answers=["开始", "2"])
+        loop.input_handler = tui.request_tool_input
+
+        await tui.run_async()
+
+        self.assertIn("需要你确认：选择实现语言", output.getvalue())
+        self.assertIn("TinyCode: selected:Rust", output.getvalue())
+        self.assertEqual(["开始"], tui._history.user_messages)
 
     async def test_repeated_prompt_command_prints_every_snapshot_in_terminal(self):
         tui, _ = self._make_tui(
@@ -778,6 +836,36 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(rendered.index("quick-sort answer"), rendered.index("merge-sort answer"))
         self.assertEqual(2, rendered.count("✓ 本轮已正常完成"))
         self.assertEqual(["输出快速排序", "输出归并排序"], tui._history.user_messages)
+
+    async def test_active_turn_accepts_steering_and_cancel_command(self):
+        loop = PausingAgentLoop()
+        tui, output = self._make_tui(
+            loop,
+            answers=[
+                "开始长任务",
+                "不要修改测试，先检查根因",
+                "/cancel",
+                "/exit",
+            ],
+        )
+
+        await tui.run_async()
+
+        self.assertEqual([], tui._history.steering_messages)
+        rendered = output.getvalue()
+        self.assertIn("已排队追加指令", rendered)
+        self.assertIn("已丢弃 1 条尚未注入的追加指令", rendered)
+        self.assertIn("正在取消当前任务", rendered)
+        self.assertIn("Goodbye!", rendered)
+
+    def test_cancel_command_is_available_in_completion(self):
+        tui, _output = self._make_tui()
+
+        completions = list(
+            tui._completer.get_completions(Document("/can"), None)
+        )
+
+        self.assertEqual(["/cancel"], [item.text for item in completions])
 
     async def test_non_tty_uses_plain_input_without_duplicate_user_render(self):
         output = io.StringIO()

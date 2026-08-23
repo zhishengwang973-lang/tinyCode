@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import nullcontext
+from dataclasses import dataclass
 import re
 import sys
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from tinyCode.agent.events import (
     RoundLimitReachedEvent,
     RoundStartEvent,
     ProgressWarningEvent,
+    SteeringAppliedEvent,
     TaskStalledDecision,
     TaskStalledDecisionAction,
     TaskStalledEvent,
@@ -81,6 +83,12 @@ class _StreamTextNormalizer:
         return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
 
 
+@dataclass
+class _PendingControlInput:
+    prompt: list[tuple[str, str]]
+    future: asyncio.Future[str]
+
+
 class _CommandCompleter(Completer):
     """Tab completer for slash commands."""
 
@@ -104,6 +112,8 @@ class _PlainInputSession:
 
     async def prompt_async(self, message=None) -> str:
         prompt = self._message
+        if callable(message):
+            message = message()
         if isinstance(message, (list, tuple)):
             prompt = "".join(fragment[1] for fragment in message)
         elif isinstance(message, str):
@@ -187,6 +197,8 @@ class TinyCodeTUI(UIControl):
         self._foreground_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._command_active = False
+        self._pending_control_input: _PendingControlInput | None = None
+        self._input_loop_active = False
         self._security_level = security_level
         self._closed = False
         self._exit_requested = False
@@ -209,7 +221,7 @@ class TinyCodeTUI(UIControl):
         while True:
             try:
                 answer = (
-                    await self._prompt_session.prompt_async(
+                    await self._read_control_input(
                         [("class:prompt", prompt)]
                     )
                 ).strip()
@@ -343,6 +355,16 @@ class TinyCodeTUI(UIControl):
     def request_exit(self) -> None:
         self._exit_requested = True
 
+    def cancel_active_turn(self) -> bool:
+        cancelled = self._runtime.cancel()
+        if cancelled:
+            discarded = self._history.discard_steering_messages()
+            self._status_text = "正在取消当前任务"
+            if discarded:
+                self._print_info(f"已丢弃 {discarded} 条尚未注入的追加指令")
+            self._invalidate_input_prompt()
+        return cancelled
+
     def get_system_prompt(self, section: str = "all") -> str:
         return self._agent_loop.get_system_prompt(section)
 
@@ -468,11 +490,72 @@ class TinyCodeTUI(UIControl):
     def _finish_foreground(self, task: asyncio.Task) -> None:
         if self._foreground_task is task:
             self._foreground_task = None
+        self._invalidate_input_prompt()
 
     async def _wait_for_foreground(self) -> None:
         task = self._foreground_task
         if task is not None:
-            await task
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _input_prompt(self) -> list[tuple[str, str]]:
+        pending = self._pending_control_input
+        if pending is not None and not pending.future.done():
+            return pending.prompt
+        if self._runtime.active:
+            return [("class:warning", "↪ 追加指令（/cancel 取消）› ")]
+        return [("class:prompt", "› ")]
+
+    def _invalidate_input_prompt(self) -> None:
+        app = getattr(self._prompt_session, "app", None)
+        if app is not None and getattr(app, "is_running", False):
+            try:
+                app.invalidate()
+            except RuntimeError:
+                pass
+
+    async def _read_control_input(
+        self, prompt: list[tuple[str, str]],
+    ) -> str:
+        """Read a foreground decision through the single TUI input owner."""
+        if not self._runtime.active or not self._input_loop_active:
+            return await self._prompt_session.prompt_async(prompt)
+        if self._pending_control_input is not None:
+            raise RuntimeError("已有交互输入正在等待用户回答")
+        future = asyncio.get_running_loop().create_future()
+        request = _PendingControlInput(prompt=prompt, future=future)
+        self._pending_control_input = request
+        self._invalidate_input_prompt()
+        try:
+            return await future
+        finally:
+            if self._pending_control_input is request:
+                self._pending_control_input = None
+            if not future.done():
+                future.cancel()
+            self._invalidate_input_prompt()
+
+    @staticmethod
+    def _is_cancel_command(text: str) -> bool:
+        return text.strip().lower() == "/cancel"
+
+    async def _handle_active_input(self, text: str) -> None:
+        if self._cmd_dispatcher.is_command(text):
+            self._print_warning(
+                "任务执行中仅支持 /cancel；普通文字会作为追加指令排队"
+            )
+            return
+        self._history.queue_steering_message(text)
+        count = getattr(self._history, "steering_count", 1)
+        self._print_info(
+            f"↪ 已排队追加指令（当前等待 {count} 条），"
+            "将在本轮模型/工具步骤完成后注入"
+        )
+
+    async def _handle_cancel_input(self, text: str) -> None:
+        _was_command, result = await self._cmd_dispatcher.dispatch(text)
+        if result:
+            self._print_info(result)
+        await self._wait_for_foreground()
 
     async def _on_user_input(
         self,
@@ -613,6 +696,20 @@ class TinyCodeTUI(UIControl):
                     )
                     self._start_progress("已要求模型更换重复步骤")
 
+                elif isinstance(event, SteeringAppliedEvent):
+                    stream_line_open = self._close_stream_line(stream_line_open)
+                    self._save_checkpoint()
+                    if event.continued:
+                        self._print_info(
+                            f"↪ 已注入 {event.message_count} 条追加指令，继续当前任务"
+                        )
+                        self._start_progress("已接收追加指令 · 等待模型")
+                    else:
+                        self._print_warning(
+                            f"已保存 {event.message_count} 条追加指令，"
+                            "但任务已达到轮次硬上限"
+                        )
+
                 elif isinstance(event, TaskStalledEvent):
                     stream_line_open = self._close_stream_line(stream_line_open)
                     self._stop_progress()
@@ -717,9 +814,12 @@ class TinyCodeTUI(UIControl):
             "d": HITLDecision.DENY,
         }
         while True:
-            answer = await self._prompt_session.prompt_async(
-                [("class:warning", "确认 [A本次/S会话/P永久/D拒绝] › ")]
-            )
+            try:
+                answer = await self._read_control_input(
+                    [("class:warning", "确认 [A本次/S会话/P永久/D拒绝] › ")]
+                )
+            except (EOFError, KeyboardInterrupt):
+                return HITLDecision.DENY
             decision = choices.get(answer.strip().lower())
             if decision is not None:
                 return decision
@@ -735,7 +835,7 @@ class TinyCodeTUI(UIControl):
         while True:
             try:
                 answer = (
-                    await self._prompt_session.prompt_async(
+                    await self._read_control_input(
                         [("class:warning", prompt)]
                     )
                 ).strip().lower()
@@ -795,7 +895,7 @@ class TinyCodeTUI(UIControl):
         while True:
             try:
                 answer = (
-                    await self._prompt_session.prompt_async(
+                    await self._read_control_input(
                         [("class:warning", prompt)]
                     )
                 ).strip().lower()
@@ -1079,15 +1179,13 @@ class TinyCodeTUI(UIControl):
             highlight=False,
         )
         output_context = patch_stdout(raw=True) if self._uses_prompt_toolkit else nullcontext()
+        self._input_loop_active = True
         with output_context:
             while not self._exit_requested:
                 try:
-                    # PromptSession remembers an override passed by the HITL
-                    # prompt. Always restore the normal prompt explicitly so a
-                    # completed approval cannot leak into the next user turn.
                     text = (
                         await self._prompt_session.prompt_async(
-                            [("class:prompt", "› ")]
+                            self._input_prompt
                         )
                     ).strip()
                 except (EOFError, KeyboardInterrupt):
@@ -1095,13 +1193,30 @@ class TinyCodeTUI(UIControl):
                     break
                 if not text:
                     continue
-                if self._cmd_dispatcher.is_command(text):
+
+                if self._runtime.active and self._is_cancel_command(text):
+                    await self._handle_cancel_input(text)
+                elif (
+                    self._pending_control_input is not None
+                    and not self._pending_control_input.future.done()
+                ):
+                    self._pending_control_input.future.set_result(text)
+                elif self._runtime.active:
+                    await self._handle_active_input(text)
+                elif self._cmd_dispatcher.is_command(text):
                     await self._handle_command(text)
                 else:
                     # Both prompt_toolkit and plain input already echo submitted
                     # input. Do not print the same user message a second time.
                     self._start_user_input(text, display_user=False)
-                await self._wait_for_foreground()
+                # Let the foreground task publish approval/stall input requests
+                # before the next prompt is rendered. Real terminals naturally
+                # yield here; this also makes scripted input deterministic.
+                await asyncio.sleep(0)
+        self._input_loop_active = False
+        if self._runtime.active:
+            self._runtime.cancel()
+        await self._wait_for_foreground()
         self._stop_progress()
         try:
             self._do_save()

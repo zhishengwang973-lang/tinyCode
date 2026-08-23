@@ -7,6 +7,7 @@ from tinyCode.commands import register_builtins
 from tinyCode.commands.dispatcher import CommandDispatcher
 from tinyCode.commands.builtin import (
     config_cmd,
+    cancel_cmd,
     exit_cmd,
     prompt_cmd,
     memory_cmd,
@@ -200,6 +201,7 @@ class BuiltinCommandPackageTests(unittest.TestCase):
             "clear_cmd",
             "compress_cmd",
             "config_cmd",
+            "cancel_cmd",
             "exit_cmd",
             "prompt_cmd",
             "help_cmd",
@@ -226,6 +228,7 @@ class FakeUI(UIControl):
         self.hard_max_rounds = 100
         self.round_limit_action = "ask"
         self.exit_requested = False
+        self.cancelled = False
 
     def show_system_message(self, text: str) -> None:
         pass
@@ -290,6 +293,10 @@ class FakeUI(UIControl):
 
     def request_exit(self) -> None:
         self.exit_requested = True
+
+    def cancel_active_turn(self) -> bool:
+        self.cancelled = True
+        return True
 
     def get_system_prompt(self, section: str = "all") -> str:
         return f"prompt:{section}"
@@ -445,6 +452,29 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("用法: /exit", result)
         self.assertFalse(ui.exit_requested)
 
+    async def test_cancel_command_cancels_active_turn(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(cancel_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        was_command, result = await dispatcher.dispatch("/cancel")
+
+        self.assertTrue(was_command)
+        self.assertTrue(ui.cancelled)
+        self.assertIn("正在取消", result)
+
+    async def test_cancel_command_rejects_arguments(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(cancel_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, result = await dispatcher.dispatch("/cancel now")
+
+        self.assertEqual("用法: /cancel", result)
+        self.assertFalse(ui.cancelled)
+
     async def test_config_max_rounds_can_be_queried_and_changed_for_session(self):
         ui = FakeUI()
         registry = CommandRegistry()
@@ -510,6 +540,7 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(registry.lookup("config"))
         self.assertIs(registry.lookup("config"), registry.lookup("cfg"))
+        self.assertIsNotNone(registry.lookup("cancel"))
 
     async def test_dispatch_returns_false_for_non_command_input(self):
         dispatcher = CommandDispatcher(CommandRegistry(), ui=FakeUI())

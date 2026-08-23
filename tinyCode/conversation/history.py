@@ -37,6 +37,7 @@ class ConversationHistory:
     def __init__(self) -> None:
         self._messages: list[Message] = []
         self._deferred_user_messages: list[str] = []
+        self._steering_user_messages: list[str] = []
 
     # -- mutation ------------------------------------------------------------
 
@@ -50,9 +51,43 @@ class ConversationHistory:
         if content:
             self._deferred_user_messages.append(content)
 
+    @property
+    def deferred_count(self) -> int:
+        """Number of user/context messages waiting for a safe boundary."""
+        return len(self._deferred_user_messages) + len(self._steering_user_messages)
+
+    def queue_steering_message(self, content: str) -> None:
+        """Queue user steering separately so cancellation can discard it."""
+        if content:
+            self._steering_user_messages.append(content)
+
+    @property
+    def steering_count(self) -> int:
+        return len(self._steering_user_messages)
+
+    def discard_steering_messages(self) -> int:
+        count = len(self._steering_user_messages)
+        self._steering_user_messages.clear()
+        return count
+
+    def flush_steering(self) -> int:
+        """Append queued steering without consuming background context."""
+        pending = self._steering_user_messages
+        self._steering_user_messages = []
+        if len(pending) == 1:
+            self.add_user_message(pending[0])
+        elif pending:
+            combined = "\n\n".join(
+                f"[追加指令 {index}]\n{content}"
+                for index, content in enumerate(pending, start=1)
+            )
+            self.add_user_message(combined)
+        return len(pending)
+
     def flush_deferred(self) -> int:
-        pending = self._deferred_user_messages
+        pending = self._deferred_user_messages + self._steering_user_messages
         self._deferred_user_messages = []
+        self._steering_user_messages = []
         for content in pending:
             self.add_user_message(content)
         return len(pending)
@@ -80,6 +115,7 @@ class ConversationHistory:
     def clear(self) -> None:
         self._messages.clear()
         self._deferred_user_messages.clear()
+        self._steering_user_messages.clear()
 
     # -- access --------------------------------------------------------------
 

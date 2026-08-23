@@ -142,6 +142,14 @@ class TaskStalledEvent:
 
 
 @dataclass
+class SteeringAppliedEvent:
+    """Queued user input was inserted at a protocol-safe boundary."""
+
+    message_count: int
+    continued: bool
+
+
+@dataclass
 class PlanOnlyToggleEvent:
     """plan-only 模式切换通知。"""
     enabled: bool
@@ -189,6 +197,7 @@ AgentEvent = (
     | RoundLimitExtendedEvent
     | ProgressWarningEvent
     | TaskStalledEvent
+    | SteeringAppliedEvent
     | PlanOnlyToggleEvent
     | HITLRequestEvent
     | TruncationEvent

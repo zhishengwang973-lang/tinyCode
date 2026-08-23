@@ -130,6 +130,10 @@ class UIControl(ABC):
         """Ask the UI input loop to finish through its normal cleanup path."""
         raise NotImplementedError
 
+    def cancel_active_turn(self) -> bool:
+        """Cancel the active foreground turn, if one exists."""
+        return False
+
     def get_system_prompt(self, section: str = "all") -> str:
         """Return a read-only snapshot of the effective model prompt context."""
         raise NotImplementedError

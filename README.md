@@ -7,7 +7,7 @@
 - **多 Provider 支持**：Anthropic Claude / OpenAI / DeepSeek，通过 YAML 配置切换
 - **流式 TUI**：Rich 连续输出 + Prompt Toolkit 输入补全；进度瞬时刷新，不混入回答正文
 - **内置工具体系**：读/写/编辑/删除文件、多文件 `apply_patch`、执行命令、Glob/Grep、用户输入以及受限的公网搜索/读取，并在运行时接入 Skill 和子 Agent 工具
-- **16 个内置斜杠命令模块**：`/help` `/clear` `/compress` `/mode` `/status` `/config` `/prompt` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
+- **17 个内置斜杠命令模块**：`/help` `/clear` `/compress` `/mode` `/status` `/config` `/prompt` `/cancel` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
 - **纵深安全防御**：黑名单拦截、路径沙箱、人在回路确认、三档权限模式
 - **MCP 协议**：支持 Stdio 和 HTTP 传输，连接外部工具服务器
 - **YAML+MD Skill 系统**：可编程 SOP 指令，三级优先级覆盖
@@ -16,6 +16,7 @@
 - **Git Worktree 隔离**：子 Agent 在独立工作目录中操作，退出自动清理
 - **两层 Token 管理**：工具结果截断（层1）+ 结构化 LLM 摘要（层2）
 - **弹性轮次预算**：软预算分段续跑、多信号无进展检测、策略恢复和绝对硬上限
+- **任务中追加指令**：模型或工具执行期间继续接收 steering 输入，在协议安全边界注入；`/cancel` 可立即取消当前任务
 - **JSONL 会话持久化**：追加写 O(1)、崩溃恢复、损坏行跳过
 
 ## 快速开始

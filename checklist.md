@@ -58,6 +58,9 @@
 - [ ] 选择续跑 → 保持同一任务上下文、统计和工具结果继续执行
 - [ ] 达到 hard_max_rounds → AgentDoneEvent("hard_max_rounds")，明确显示未完成
 - [ ] 自动续跑连续 3 轮重复相同工具调用 → 暂停并请求用户决策
+- [ ] 模型输出期间输入追加要求 → 不启动并发任务，在本轮响应结束后注入并继续
+- [ ] 工具执行期间输入追加要求 → 等全部 tool_result 回填后注入，不破坏协议顺序
+- [ ] steering 触发软预算扩展，但不能突破 hard_max_rounds
 
 ## TUI 交互
 
@@ -73,6 +76,8 @@
 - [ ] Ctrl+Q → 手动压缩
 - [ ] Tab → 补全 `/` 命令
 - [ ] 等待模型/执行工具时显示单条可擦除进度
+- [ ] 任务运行时输入行显示 `↪ 追加指令（/cancel 取消）›`
+- [ ] `/cancel` → 取消当前任务，丢弃尚未注入的 steering，不回滚已完成修改
 
 ## 命令系统
 
@@ -80,6 +85,7 @@
 - [ ] `/help compress` → 显示压缩命令详情
 - [ ] `/clear` → 对话清空 + Skill 激活清空
 - [ ] `/compress` → 手动触发压缩并显示结果
+- [ ] `/cancel` → 有任务时取消，无任务时提示当前没有任务
 - [ ] `/mode plan` → 切换 plan-only
 - [ ] `/mode security strict` → 安全等级切换
 - [ ] `/status` → 显示工作目录/OS/Plan/Sec/token

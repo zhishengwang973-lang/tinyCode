@@ -34,6 +34,7 @@ def register_builtins(
     from tinyCode.commands.builtin.status_cmd import create as _status
     from tinyCode.commands.builtin.config_cmd import create as _config
     from tinyCode.commands.builtin.exit_cmd import create as _exit
+    from tinyCode.commands.builtin.cancel_cmd import create as _cancel
     from tinyCode.commands.builtin.prompt_cmd import create as _prompt
     from tinyCode.commands.builtin.review_cmd import create as _review
     from tinyCode.commands.builtin.skill_cmd import create as _skill
@@ -50,6 +51,7 @@ def register_builtins(
     registry.register(_status(ui))
     registry.register(_config(ui))
     registry.register(_exit(ui))
+    registry.register(_cancel(ui))
     registry.register(_prompt(ui))
     registry.register(_review())
     if skill_registry:

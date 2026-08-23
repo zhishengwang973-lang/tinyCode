@@ -17,6 +17,15 @@ class OutputPromptTests(unittest.TestCase):
         self.assertIn("不要主动追加第二种写法", prompt)
         self.assertIn("代码之外最多补充一句", prompt)
 
+    def test_blocking_user_question_must_use_interactive_tool(self):
+        prompt = PromptBuilder().build()
+
+        self.assertIn("等待用户回答的强制协议", prompt)
+        self.assertIn("本轮必须调用 request_user_input", prompt)
+        self.assertIn("禁止只在普通文本中输出问题", prompt)
+        self.assertIn("普通文本会被视为任务已经完成", prompt)
+        self.assertIn("安全权限确认由系统的 HITL 流程处理", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

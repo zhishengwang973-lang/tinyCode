@@ -13,6 +13,7 @@ from tinyCode.agent.events import (
     RoundLimitExtendedEvent,
     RoundLimitReachedEvent,
     RoundStartEvent,
+    SteeringAppliedEvent,
     TaskStalledDecision,
     TaskStalledDecisionAction,
     TaskStalledEvent,
@@ -297,6 +298,37 @@ class FinishesAfterFourCallsProvider(UnknownToolProvider):
             yield ToolCall(id=f"tool-{self.calls}", name="missing_tool", input={})
         else:
             yield "finished after strategy change"
+
+
+class SteeringProvider(UnknownToolProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.first_request_started = asyncio.Event()
+        self.release_first_request = asyncio.Event()
+        self.received_messages: list[list[Message]] = []
+
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.calls += 1
+        self.received_messages.append(messages)
+        if self.calls == 1:
+            self.first_request_started.set()
+            await self.release_first_request.wait()
+            yield "initial answer"
+        else:
+            yield "steered answer"
+
+
+class ToolSteeringProvider(SteeringProvider):
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.calls += 1
+        self.received_messages.append(messages)
+        if self.calls == 1:
+            self.first_request_started.set()
+            await self.release_first_request.wait()
+            yield ToolCall(id="tool-steering", name="missing_tool", input={})
+        else:
+            yield "steered after tool result"
 
 
 class ToolThenExplodeProvider(UnknownToolProvider):
@@ -1192,6 +1224,110 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(4, provider.calls)
         self.assertEqual(1, sum(
             isinstance(event, TaskStalledEvent) for event in events
+        ))
+        self.assertEqual("no_tool_call", events[-1].reason)
+
+    async def test_user_steering_continues_same_direct_answer_turn(self):
+        provider = SteeringProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=1,
+            round_extension=2,
+            hard_max_rounds=3,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("explain the algorithm")
+
+        async def collect():
+            return [event async for event in loop.run(history)]
+
+        task = asyncio.create_task(collect())
+        await provider.first_request_started.wait()
+        history.queue_steering_message("改成只给出 TypeScript 实现")
+        provider.release_first_request.set()
+        events = await task
+
+        self.assertEqual(2, provider.calls)
+        applied = [
+            event for event in events if isinstance(event, SteeringAppliedEvent)
+        ]
+        self.assertEqual([(1, True)], [
+            (event.message_count, event.continued) for event in applied
+        ])
+        self.assertTrue(any(
+            message.get("role") == "user"
+            and "TypeScript" in str(message.get("content"))
+            for message in provider.received_messages[1]
+        ))
+        self.assertEqual("no_tool_call", events[-1].reason)
+
+    async def test_user_steering_cannot_exceed_hard_round_limit(self):
+        provider = SteeringProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=1,
+            hard_max_rounds=1,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("explain the algorithm")
+
+        async def collect():
+            return [event async for event in loop.run(history)]
+
+        task = asyncio.create_task(collect())
+        await provider.first_request_started.wait()
+        history.queue_steering_message("add another example")
+        provider.release_first_request.set()
+        events = await task
+
+        applied = next(
+            event for event in events if isinstance(event, SteeringAppliedEvent)
+        )
+        self.assertFalse(applied.continued)
+        self.assertEqual(1, provider.calls)
+        self.assertEqual("hard_max_rounds", events[-1].reason)
+
+    async def test_user_steering_waits_until_all_tool_results_are_appended(self):
+        provider = ToolSteeringProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=1,
+            round_extension=1,
+            hard_max_rounds=3,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("inspect the project")
+
+        async def collect():
+            return [event async for event in loop.run(history)]
+
+        task = asyncio.create_task(collect())
+        await provider.first_request_started.wait()
+        history.queue_steering_message("先解释错误，再选择替代方案")
+        provider.release_first_request.set()
+        events = await task
+
+        second_request = provider.received_messages[1]
+        tool_call_index = next(
+            index for index, message in enumerate(second_request)
+            if message.get("role") == "assistant" and message.get("tool_calls")
+        )
+        tool_result_index = next(
+            index for index, message in enumerate(second_request)
+            if message.get("role") == "tool"
+        )
+        steering_index = next(
+            index for index, message in enumerate(second_request)
+            if message.get("role") == "user"
+            and "解释错误" in str(message.get("content"))
+        )
+        self.assertLess(tool_call_index, tool_result_index)
+        self.assertLess(tool_result_index, steering_index)
+        self.assertTrue(any(
+            isinstance(event, SteeringAppliedEvent) for event in events
         ))
         self.assertEqual("no_tool_call", events[-1].reason)
 

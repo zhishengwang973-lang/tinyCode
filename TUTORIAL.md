@@ -232,6 +232,7 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 | `/status` | `st info` | 显示综合状态 |
 | `/config [轮次选项] [值]` | `cfg` | 查看或修改当前会话轮次预算策略 |
 | `/prompt [部分]` | `system-prompt sp` | 查看当前实际生效的系统提示词 |
+| `/cancel` | — | 取消当前前台任务并丢弃尚未注入的追加指令 |
 | `/exit` | `quit q` | 保存会话并安全退出 |
 | `/session [list\|load\|new\|delete]` | `sess` | 管理会话 |
 | `/memory [show\|clear\|edit]` | `mem notes` | 管理自动笔记 |
@@ -244,6 +245,21 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 
 `/prompt` 只读取当前系统上下文，不会请求模型。可查看 `all`、`base`、
 `instructions`、`skills`、`environment`、`notes` 或 `injection`；可连续执行，不会消耗对话轮次。
+
+任务执行期间输入框仍然可用，并显示：
+
+```text
+↪ 追加指令（/cancel 取消）›
+```
+
+此时输入普通文字不会启动第二个并发任务，而是进入 steering 队列。TinyCode 会等待当前
+模型响应结束；如果响应包含工具调用，还会等待同一批工具结果全部回填，然后把追加指令
+作为新的用户消息注入同一个任务。多条追加指令会按输入顺序注入，并自动为当前任务扩展
+软轮次预算，但不会突破 `hard_max_rounds`。
+
+任务执行期间只有 `/cancel` 会作为斜杠命令立即生效，其他斜杠命令会被拒绝，避免与前台
+任务并发修改状态。`/cancel` 会取消当前模型流或工具等待，并丢弃尚未到达安全边界的追加
+指令；已经执行完成的文件修改和工具结果不会回滚。
 
 `/config` 可以查看当前轮次策略，也可以修改 `max-rounds`、`round-extension`、
 `hard-max-rounds` 和 `round-limit-action`。这些修改只影响当前启动会话，重启后恢复 YAML。
