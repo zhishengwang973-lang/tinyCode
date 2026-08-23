@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 import re
 import sys
 from typing import TYPE_CHECKING, Any
@@ -43,6 +44,7 @@ from tinyCode.providers.base import TokenUsage
 from tinyCode.security.models import HITLDecision, SecurityLevel
 from tinyCode.tui.render import STYLE
 from tinyCode.tui.metrics import TurnMetrics
+from tinyCode.tui.workspace_changes import WorkspaceChanges, WorkspaceSnapshot
 
 if TYPE_CHECKING:
     from tinyCode.agent.loop import AgentLoop
@@ -569,6 +571,7 @@ class TinyCodeTUI(UIControl):
         if not self._runtime.claim():
             return
         metrics = TurnMetrics()
+        workspace_snapshot: WorkspaceSnapshot | None = None
         response_started = False
         stream_line_open = False
         current_response = ""
@@ -608,6 +611,11 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(event.label)
 
                 elif isinstance(event, ToolCallEvent):
+                    if workspace_snapshot is None:
+                        workspace_snapshot = await asyncio.to_thread(
+                            WorkspaceSnapshot.capture,
+                            Path.cwd(),
+                        )
                     metrics.record_tool_call()
                     stream_line_open = self._close_stream_line(stream_line_open)
                     self._start_progress(f"执行工具 {event.tool_call.name}")
@@ -735,6 +743,7 @@ class TinyCodeTUI(UIControl):
                 elif isinstance(event, AgentDoneEvent):
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
+                    await self._print_workspace_changes(workspace_snapshot)
                     if event.reason in {"max_rounds", "round_budget_stopped"}:
                         self._status_text = "就绪 · 任务因轮次预算暂停"
                         self._print_warning(
@@ -778,6 +787,7 @@ class TinyCodeTUI(UIControl):
                 elif isinstance(event, ErrorEvent):
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
+                    await self._print_workspace_changes(workspace_snapshot)
                     self._status_text = "就绪 · 上一轮失败"
                     self._print_error(event.message)
                     self._print_turn_metrics(
@@ -792,11 +802,13 @@ class TinyCodeTUI(UIControl):
         except asyncio.CancelledError:
             self._stop_progress()
             self._status_text = "就绪 · 本轮已取消"
+            await self._print_workspace_changes(workspace_snapshot)
             raise
         except Exception as exc:
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
             stream_line_open = self._close_stream_line(stream_line_open)
+            await self._print_workspace_changes(workspace_snapshot)
             self._status_text = "就绪 · 上一轮失败"
             self._print_error(f"对话执行失败: {type(exc).__name__}: {exc}")
         finally:
@@ -991,6 +1003,45 @@ class TinyCodeTUI(UIControl):
             style="dim",
             highlight=False,
         )
+
+    async def _print_workspace_changes(
+        self,
+        snapshot: WorkspaceSnapshot | None,
+    ) -> None:
+        if snapshot is None:
+            return
+        changes = await asyncio.to_thread(snapshot.compare)
+        if not changes.any:
+            return
+        self._render_workspace_changes(changes)
+
+    def _render_workspace_changes(self, changes: WorkspaceChanges) -> None:
+        counts: list[str] = []
+        if changes.added:
+            counts.append(f"新增 {len(changes.added)}")
+        if changes.modified:
+            counts.append(f"修改 {len(changes.modified)}")
+        if changes.deleted:
+            counts.append(f"删除 {len(changes.deleted)}")
+        self._console.print()
+        self._console.print(
+            "文件变更 · " + " · ".join(counts),
+            style="dim",
+            highlight=False,
+        )
+        for paths, marker, style in (
+            (changes.added, "+", "green"),
+            (changes.modified, "~", "yellow"),
+            (changes.deleted, "-", "red"),
+        ):
+            for path in paths:
+                self._console.print(
+                    f"  {marker} {path}",
+                    style=style,
+                    markup=False,
+                    highlight=False,
+                )
+        self._console.print()
 
     def _print_context_snapshot(self) -> None:
         # The last provider request already includes system instructions, tool

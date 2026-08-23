@@ -1,6 +1,8 @@
 import asyncio
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -207,6 +209,24 @@ class MetricsAgentLoop(FakeAgentLoop):
                     error="failed" if not success else "",
                 ),
             )
+        yield TextDeltaEvent("done")
+        yield AgentDoneEvent("no_tool_call")
+
+
+class WorkspaceChangingAgentLoop(FakeAgentLoop):
+    def __init__(self, root: Path) -> None:
+        super().__init__("done")
+        self.root = root
+
+    async def run(self, history):
+        yield ToolCallEvent(ToolCall("call_1", "run_command", {"command": "generator"}))
+        (self.root / "created.py").write_text("created\n", encoding="utf-8")
+        (self.root / "changed.py").write_text("after\n", encoding="utf-8")
+        (self.root / "deleted.py").unlink()
+        yield ToolResultEvent(
+            tool_name="run_command",
+            result=ToolResult(success=True, content="ok"),
+        )
         yield TextDeltaEvent("done")
         yield AgentDoneEvent("no_tool_call")
 
@@ -545,6 +565,28 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("耗时: 2.35 秒", rendered)
         self.assertIn("工具调用: 3 次", rendered)
         self.assertIn("成功率: 66.7%", rendered)
+
+    async def test_completion_lists_all_workspace_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "changed.py").write_text("before\n", encoding="utf-8")
+            (root / "deleted.py").write_text("delete me\n", encoding="utf-8")
+            tui, output = self._make_tui(WorkspaceChangingAgentLoop(root))
+
+            with patch("tinyCode.tui.app.Path.cwd", return_value=root):
+                await tui._on_user_input("change workspace")
+
+        rendered = output.getvalue()
+        self.assertIn("文件变更 · 新增 1 · 修改 1 · 删除 1", rendered)
+        self.assertIn("+ created.py", rendered)
+        self.assertIn("~ changed.py", rendered)
+        self.assertIn("- deleted.py", rendered)
+        self.assertIn("\n\n文件变更", rendered)
+        self.assertIn("- deleted.py\n\n✓ 本轮已正常完成", rendered)
+        self.assertLess(rendered.index("TinyCode: done"), rendered.index("文件变更"))
+        self.assertLess(rendered.index("文件变更"), rendered.index("✓ 本轮已正常完成"))
+        self.assertLess(rendered.index("✓ 本轮已正常完成"), rendered.index("本轮统计"))
+        self.assertLess(rendered.index("本轮统计"), rendered.index("上下文   ·"))
 
     async def test_context_snapshot_is_shown_after_turn_metrics(self):
         tui, output = self._make_tui(FakeAgentLoop("done"))
