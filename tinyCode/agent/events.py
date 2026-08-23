@@ -107,6 +107,40 @@ class RoundLimitExtendedEvent:
     automatic: bool
 
 
+class TaskStalledDecisionAction(Enum):
+    STRATEGY = "strategy"
+    CONTINUE = "continue"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class TaskStalledDecision:
+    action: TaskStalledDecisionAction
+    continue_rounds: int | None = None
+
+
+@dataclass
+class ProgressWarningEvent:
+    """Early warning that the current strategy is beginning to repeat."""
+
+    state: str
+    reasons: tuple[str, ...]
+    recovery_prompt: str
+
+
+@dataclass
+class TaskStalledEvent:
+    """Objective evidence indicates that the task needs intervention."""
+
+    state: str
+    reasons: tuple[str, ...]
+    recovery_prompt: str
+    round_number: int
+    continue_rounds: int
+    hard_limit: int
+    future: object  # asyncio.Future[TaskStalledDecision]
+
+
 @dataclass
 class PlanOnlyToggleEvent:
     """plan-only 模式切换通知。"""
@@ -153,6 +187,8 @@ AgentEvent = (
     | RoundStartEvent
     | RoundLimitReachedEvent
     | RoundLimitExtendedEvent
+    | ProgressWarningEvent
+    | TaskStalledEvent
     | PlanOnlyToggleEvent
     | HITLRequestEvent
     | TruncationEvent

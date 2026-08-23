@@ -8,6 +8,9 @@ from tinyCode.agent.events import (
     RoundLimitDecision,
     RoundLimitDecisionAction,
     RoundLimitReachedEvent,
+    TaskStalledDecision,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
     TextDeltaEvent,
 )
 from tinyCode.agent.runtime import TurnRuntime, TurnState
@@ -69,6 +72,31 @@ class WaitingForRoundLimitLoop(FakeLoop):
         reason = (
             "round_budget_stopped"
             if decision.action == RoundLimitDecisionAction.STOP
+            else "no_tool_call"
+        )
+        yield AgentDoneEvent(reason)
+
+
+class WaitingForProgressLoop(FakeLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.future: asyncio.Future | None = None
+
+    async def run(self, history):
+        self.future = asyncio.get_running_loop().create_future()
+        yield TaskStalledEvent(
+            state="stalled",
+            reasons=("repeating",),
+            recovery_prompt="change strategy",
+            round_number=3,
+            continue_rounds=5,
+            hard_limit=100,
+            future=self.future,
+        )
+        decision = await self.future
+        reason = (
+            "stalled"
+            if decision.action == TaskStalledDecisionAction.STOP
             else "no_tool_call"
         )
         yield AgentDoneEvent(reason)
@@ -177,6 +205,51 @@ class TurnRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         runtime.resolve_round_limit(RoundLimitDecision(
             RoundLimitDecisionAction.STOP,
+        ))
+        await task
+
+        self.assertEqual(TurnState.PAUSED, runtime.snapshot().last_outcome)
+
+    async def test_progress_decision_is_owned_and_resolved_by_runtime(self):
+        loop = WaitingForProgressLoop()
+        runtime = TurnRuntime(loop)
+
+        async def consume():
+            runtime.reserve()
+            runtime.claim()
+            return [event async for event in runtime.run(object())]
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if runtime.waiting_for_progress:
+                break
+            await asyncio.sleep(0)
+
+        self.assertTrue(runtime.waiting_for_progress)
+        self.assertTrue(runtime.resolve_progress(TaskStalledDecision(
+            TaskStalledDecisionAction.STRATEGY,
+        )))
+        await task
+
+        self.assertFalse(runtime.waiting_for_progress)
+        self.assertEqual(TurnState.COMPLETED, runtime.snapshot().last_outcome)
+
+    async def test_stopping_stalled_task_is_paused(self):
+        loop = WaitingForProgressLoop()
+        runtime = TurnRuntime(loop)
+
+        async def consume():
+            runtime.reserve()
+            runtime.claim()
+            return [event async for event in runtime.run(object())]
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if runtime.waiting_for_progress:
+                break
+            await asyncio.sleep(0)
+        runtime.resolve_progress(TaskStalledDecision(
+            TaskStalledDecisionAction.STOP,
         ))
         await task
 

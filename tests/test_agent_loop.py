@@ -13,6 +13,9 @@ from tinyCode.agent.events import (
     RoundLimitExtendedEvent,
     RoundLimitReachedEvent,
     RoundStartEvent,
+    TaskStalledDecision,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
     ToolBlockedEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -281,6 +284,19 @@ class MultiRoundUsageProvider(UnknownToolProvider):
             yield ToolCall(id="tool-usage", name="missing_tool", input={})
         else:
             yield "done"
+
+
+class FinishesAfterFourCallsProvider(UnknownToolProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.calls += 1
+        if self.calls < 4:
+            yield ToolCall(id=f"tool-{self.calls}", name="missing_tool", input={})
+        else:
+            yield "finished after strategy change"
 
 
 class ToolThenExplodeProvider(UnknownToolProvider):
@@ -1108,13 +1124,13 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual("hard_max_rounds", events[-1].reason)
 
-    async def test_auto_extension_pauses_when_tool_calls_stall(self):
+    async def test_ask_mode_pauses_when_tool_calls_stall(self):
         loop = self._make_loop(
             UnknownToolProvider(),
             max_rounds=3,
             round_extension=1,
             hard_max_rounds=5,
-            round_limit_action="auto",
+            round_limit_action="ask",
         )
         history = ConversationHistory()
         history.add_user_message("keep calling the same tool")
@@ -1122,16 +1138,62 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
         async for event in loop.run(history):
             events.append(event)
-            if isinstance(event, RoundLimitReachedEvent):
-                self.assertTrue(event.stalled)
-                event.future.set_result(RoundLimitDecision(
-                    RoundLimitDecisionAction.STOP,
+            if isinstance(event, TaskStalledEvent):
+                self.assertEqual("hard_stuck", event.state)
+                event.future.set_result(TaskStalledDecision(
+                    TaskStalledDecisionAction.STOP,
                 ))
 
         self.assertEqual(3, sum(
             isinstance(event, RoundStartEvent) for event in events
         ))
-        self.assertEqual("round_budget_stopped", events[-1].reason)
+        self.assertEqual("stalled", events[-1].reason)
+
+    async def test_auto_mode_changes_strategy_without_waiting_for_user(self):
+        provider = FinishesAfterFourCallsProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=3,
+            round_extension=2,
+            hard_max_rounds=6,
+            round_limit_action="auto",
+        )
+        history = ConversationHistory()
+        history.add_user_message("finish without interactive prompts")
+
+        events = [event async for event in loop.run(history)]
+
+        self.assertEqual(4, provider.calls)
+        self.assertFalse(any(
+            isinstance(event, TaskStalledEvent) for event in events
+        ))
+        self.assertEqual("no_tool_call", events[-1].reason)
+
+    async def test_stalled_task_can_change_strategy_and_finish_in_same_turn(self):
+        provider = FinishesAfterFourCallsProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=3,
+            round_extension=2,
+            hard_max_rounds=6,
+            round_limit_action="ask",
+        )
+        history = ConversationHistory()
+        history.add_user_message("keep working until finished")
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if isinstance(event, TaskStalledEvent):
+                event.future.set_result(TaskStalledDecision(
+                    TaskStalledDecisionAction.STRATEGY,
+                ))
+
+        self.assertEqual(4, provider.calls)
+        self.assertEqual(1, sum(
+            isinstance(event, TaskStalledEvent) for event in events
+        ))
+        self.assertEqual("no_tool_call", events[-1].reason)
 
     async def test_runtime_max_rounds_change_updates_active_task_budget(self):
         loop = self._make_loop(
@@ -1153,7 +1215,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             [1, 2, 3],
             [event.round_number for event in events if isinstance(event, RoundStartEvent)],
         )
-        self.assertEqual("round_budget_stopped", events[-1].reason)
+        self.assertEqual("stalled", events[-1].reason)
 
     def test_runtime_max_rounds_rejects_invalid_values(self):
         loop = self._make_loop(UnknownToolProvider(), max_rounds=1)

@@ -23,6 +23,10 @@ from tinyCode.agent.events import (
     RoundLimitExtendedEvent,
     RoundLimitReachedEvent,
     RoundStartEvent,
+    ProgressWarningEvent,
+    TaskStalledDecision,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
     ThinkingEvent,
     TextDeltaEvent,
     ToolBlockedEvent,
@@ -596,6 +600,41 @@ class TinyCodeTUI(UIControl):
                         f"预算 {event.new_limit} 轮 · 继续执行"
                     )
 
+                elif isinstance(event, ProgressWarningEvent):
+                    reason = "；".join(event.reasons)
+                    labels = {
+                        "slow": "任务进展变慢",
+                        "stalled": "任务没有有效进展",
+                        "oscillating": "任务方案往返震荡",
+                        "hard_stuck": "任务重复错误或超时",
+                    }
+                    self._print_warning(
+                        f"{labels.get(event.state, '任务进展异常')}：{reason}"
+                    )
+                    self._start_progress("已要求模型更换重复步骤")
+
+                elif isinstance(event, TaskStalledEvent):
+                    stream_line_open = self._close_stream_line(stream_line_open)
+                    self._stop_progress()
+                    labels = {
+                        "stalled": "没有有效进展",
+                        "oscillating": "方案往返震荡",
+                        "hard_stuck": "重复错误或超时",
+                    }
+                    self._print_warning(
+                        f"检测到任务{labels.get(event.state, '进展异常')}"
+                    )
+                    for reason in event.reasons:
+                        self._print_info(f"  - {reason}")
+                    decision = await self._prompt_for_stalled_task(event)
+                    self._runtime.resolve_progress(decision)
+                    if decision.action == TaskStalledDecisionAction.STOP:
+                        self._start_progress("正在暂停任务")
+                    elif decision.action == TaskStalledDecisionAction.STRATEGY:
+                        self._start_progress("已要求更换策略 · 继续执行")
+                    else:
+                        self._start_progress("已确认继续观察")
+
                 elif isinstance(event, AgentDoneEvent):
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
@@ -609,6 +648,12 @@ class TinyCodeTUI(UIControl):
                         self._print_error(
                             "任务尚未完成，已达到轮次硬上限；"
                             "当前进度已保留，可调整配置后输入“继续”"
+                        )
+                    elif event.reason == "stalled":
+                        self._status_text = "就绪 · 任务因无进展暂停"
+                        self._print_warning(
+                            "任务因持续无进展已暂停，当前进度已保留；"
+                            "可补充信息或输入“继续”"
                         )
                     elif event.reason == "cancelled":
                         self._status_text = "就绪 · 本轮已取消"
@@ -738,6 +783,52 @@ class TinyCodeTUI(UIControl):
             return RoundLimitDecision(
                 RoundLimitDecisionAction.EXTEND,
                 target,
+            )
+
+    async def _prompt_for_stalled_task(
+        self, event: TaskStalledEvent,
+    ) -> TaskStalledDecision:
+        prompt = (
+            f"停滞 [R更换策略/C继续{event.continue_rounds}轮/S停止，"
+            "也可输入 +N] › "
+        )
+        while True:
+            try:
+                answer = (
+                    await self._prompt_session.prompt_async(
+                        [("class:warning", prompt)]
+                    )
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return TaskStalledDecision(TaskStalledDecisionAction.STOP)
+
+            if answer == "r":
+                return TaskStalledDecision(TaskStalledDecisionAction.STRATEGY)
+            if answer == "c":
+                return TaskStalledDecision(
+                    TaskStalledDecisionAction.CONTINUE,
+                    event.continue_rounds,
+                )
+            if answer == "s":
+                return TaskStalledDecision(TaskStalledDecisionAction.STOP)
+
+            value_text = answer
+            if value_text.startswith("/rounds "):
+                value_text = value_text[len("/rounds "):].strip()
+            if value_text.startswith("+"):
+                value_text = value_text[1:]
+            try:
+                rounds = int(value_text)
+            except ValueError:
+                self._print_warning("请输入 R、C、S 或 +N")
+                continue
+            remaining = event.hard_limit - event.round_number
+            if not 1 <= rounds <= remaining:
+                self._print_warning(f"继续轮数必须是 1 到 {remaining}")
+                continue
+            return TaskStalledDecision(
+                TaskStalledDecisionAction.CONTINUE,
+                rounds,
             )
 
     def _resolve_hitl(self, decision: HITLDecision) -> None:

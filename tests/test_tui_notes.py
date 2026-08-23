@@ -14,6 +14,8 @@ from tinyCode.agent.events import (
     RoundLimitExtendedEvent,
     RoundLimitReachedEvent,
     RoundStartEvent,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
     TextDeltaEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -268,6 +270,30 @@ class HardLimitAgentLoop(FakeAgentLoop):
     async def run(self, history):
         yield RoundStartEvent(100, 100)
         yield AgentDoneEvent("hard_max_rounds")
+
+
+class StalledAgentLoop(FakeAgentLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.future: asyncio.Future | None = None
+
+    async def run(self, history):
+        self.future = asyncio.get_running_loop().create_future()
+        yield TaskStalledEvent(
+            state="oscillating",
+            reasons=("最近 4 轮状态呈 A-B-A-B 往返震荡",),
+            recovery_prompt="try another strategy",
+            round_number=4,
+            continue_rounds=5,
+            hard_limit=20,
+            future=self.future,
+        )
+        decision = await self.future
+        if decision.action == TaskStalledDecisionAction.STOP:
+            yield AgentDoneEvent("stalled")
+            return
+        yield TextDeltaEvent("recovered")
+        yield AgentDoneEvent("no_tool_call")
 
 
 class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
@@ -632,6 +658,32 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已达到轮次硬上限", rendered)
         self.assertNotIn("✓ 本轮已正常完成", rendered)
         self.assertEqual("就绪 · 任务达到轮次硬上限", tui._status_text)
+
+    async def test_stalled_task_can_request_strategy_change(self):
+        loop = StalledAgentLoop()
+        tui, output = self._make_tui(loop, answers=["R"])
+
+        await tui._on_user_input("complex task")
+
+        self.assertEqual(
+            TaskStalledDecisionAction.STRATEGY,
+            loop.future.result().action,
+        )
+        rendered = output.getvalue()
+        self.assertIn("检测到任务方案往返震荡", rendered)
+        self.assertIn("A-B-A-B", rendered)
+        self.assertIn("TinyCode: recovered", rendered)
+        self.assertIn("✓ 本轮已正常完成", rendered)
+
+    async def test_stalled_task_stop_is_not_normal_completion(self):
+        tui, output = self._make_tui(StalledAgentLoop(), answers=["S"])
+
+        await tui._on_user_input("complex task")
+
+        rendered = output.getvalue()
+        self.assertIn("任务因持续无进展已暂停", rendered)
+        self.assertNotIn("✓ 本轮已正常完成", rendered)
+        self.assertEqual("就绪 · 任务因无进展暂停", tui._status_text)
 
     async def test_normal_prompt_is_restored_after_hitl_confirmation(self):
         loop = ApprovalAgentLoop()

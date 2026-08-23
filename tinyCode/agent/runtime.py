@@ -17,6 +17,9 @@ from tinyCode.agent.events import (
     RoundLimitDecision,
     RoundLimitDecisionAction,
     RoundLimitReachedEvent,
+    TaskStalledDecision,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
 )
 from tinyCode.security.models import HITLDecision
 
@@ -31,6 +34,7 @@ class TurnState(Enum):
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
     WAITING_ROUND_LIMIT = "waiting_round_limit"
+    WAITING_PROGRESS = "waiting_progress"
     COMPLETED = "completed"
     PAUSED = "paused"
     LIMIT_REACHED = "limit_reached"
@@ -56,6 +60,7 @@ class TurnRuntime:
         TurnState.RUNNING,
         TurnState.WAITING_APPROVAL,
         TurnState.WAITING_ROUND_LIMIT,
+        TurnState.WAITING_PROGRESS,
     }
 
     def __init__(self, agent_loop: "AgentLoop") -> None:
@@ -68,6 +73,7 @@ class TurnRuntime:
         self._owner_task: asyncio.Task | None = None
         self._approval_future: asyncio.Future | None = None
         self._round_limit_future: asyncio.Future | None = None
+        self._progress_future: asyncio.Future | None = None
 
     @property
     def state(self) -> TurnState:
@@ -98,6 +104,14 @@ class TurnRuntime:
             and not self._round_limit_future.done()
         )
 
+    @property
+    def waiting_for_progress(self) -> bool:
+        return (
+            self._state == TurnState.WAITING_PROGRESS
+            and self._progress_future is not None
+            and not self._progress_future.done()
+        )
+
     def snapshot(self) -> TurnSnapshot:
         return TurnSnapshot(
             turn_id=self._turn_id,
@@ -119,6 +133,7 @@ class TurnRuntime:
         self._owner_task = None
         self._approval_future = None
         self._round_limit_future = None
+        self._progress_future = None
         return True
 
     def claim(self) -> bool:
@@ -156,10 +171,15 @@ class TurnRuntime:
                         )
                     self._round_limit_future = event.future
                     self._state = TurnState.WAITING_ROUND_LIMIT
+                elif isinstance(event, TaskStalledEvent):
+                    if not isinstance(event.future, asyncio.Future):
+                        raise RuntimeError("TaskStalledEvent.future 必须是 asyncio.Future")
+                    self._progress_future = event.future
+                    self._state = TurnState.WAITING_PROGRESS
                 elif isinstance(event, AgentDoneEvent):
                     if event.reason == "cancelled":
                         outcome = TurnState.CANCELLED
-                    elif event.reason == "round_budget_stopped":
+                    elif event.reason in {"round_budget_stopped", "stalled"}:
                         outcome = TurnState.PAUSED
                     elif event.reason == "hard_max_rounds":
                         outcome = TurnState.LIMIT_REACHED
@@ -216,12 +236,22 @@ class TurnRuntime:
         self._state = TurnState.RUNNING
         return True
 
+    def resolve_progress(self, decision: TaskStalledDecision) -> bool:
+        future = self._progress_future
+        if not self.waiting_for_progress or future is None:
+            return False
+        future.set_result(decision)
+        self._progress_future = None
+        self._state = TurnState.RUNNING
+        return True
+
     def cancel(self, *, interrupt: bool = True) -> bool:
         if not self.active:
             return False
         self._agent_loop.cancel()
         self._deny_pending_approval()
         self._stop_pending_round_limit()
+        self._stop_pending_progress()
         self._state = TurnState.CANCELLED
         owner = self._owner_task
         if interrupt and owner is not None and owner is not asyncio.current_task():
@@ -254,9 +284,16 @@ class TurnRuntime:
             future.set_result(RoundLimitDecision(RoundLimitDecisionAction.STOP))
         self._round_limit_future = None
 
+    def _stop_pending_progress(self) -> None:
+        future = self._progress_future
+        if future is not None and not future.done():
+            future.set_result(TaskStalledDecision(TaskStalledDecisionAction.STOP))
+        self._progress_future = None
+
     def _finish(self, outcome: TurnState) -> None:
         self._deny_pending_approval()
         self._stop_pending_round_limit()
+        self._stop_pending_progress()
         self._last_outcome = outcome
         self._state = TurnState.IDLE
         self._started_at = None

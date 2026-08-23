@@ -18,6 +18,10 @@ from tinyCode.agent.events import (
     RoundLimitExtendedEvent,
     RoundLimitReachedEvent,
     RoundStartEvent,
+    ProgressWarningEvent,
+    TaskStalledDecision,
+    TaskStalledDecisionAction,
+    TaskStalledEvent,
     TextDeltaEvent,
     ThinkingEvent,
     ToolBlockedEvent,
@@ -26,6 +30,7 @@ from tinyCode.agent.events import (
     ContextCompressionEvent,
 )
 from tinyCode.agent.context import PromptContextAssembler
+from tinyCode.agent.progress import ProgressState, ProgressWatchdog
 from tinyCode.agent.tool_routing import should_enable_tools
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator
@@ -347,7 +352,7 @@ class AgentLoop:
             auto_extend=self._round_limit_action == "auto",
         )
         self._active_budget = budget
-        recent_tool_signatures: list[str] = []
+        progress_watchdog = ProgressWatchdog()
         round_num = 1
 
         while round_num <= budget.hard_limit:
@@ -637,6 +642,7 @@ class AgentLoop:
 
             # --- 6. 工具分批执行（含安全检查） ---
             reads, writes = self._partition_tools(tool_calls)
+            round_observations: list[tuple[ToolCall, ToolResult]] = []
 
             # 读类 — 并发（安全检查前置）
             valid_reads: list[ToolCall] = []
@@ -644,6 +650,7 @@ class AgentLoop:
                 invalid_result = self._validate_tool_call_input(tc)
                 if invalid_result is not None:
                     self._append_tool_result(history, tc, invalid_result)
+                    round_observations.append((tc, invalid_result))
                     yield ToolResultEvent(tool_name=tc.name, result=invalid_result)
                     continue
 
@@ -660,12 +667,14 @@ class AgentLoop:
                     if decision == HITLDecision.DENY:
                         blocked_result = ToolResult(success=False, content="", error="用户拒绝了该操作")
                         self._append_tool_result(history, tc, blocked_result)
+                        round_observations.append((tc, blocked_result))
                         yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
                         continue
                     guard.apply_hitl(decision, tc.name, tc.input)
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
+                    round_observations.append((tc, blocked_result))
                     yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
                     continue
                 valid_reads.append(tc)
@@ -674,6 +683,7 @@ class AgentLoop:
                 results = await self._execute_concurrent(valid_reads)
                 for tc, result in zip(valid_reads, results):
                     self._append_tool_result(history, tc, result)
+                    round_observations.append((tc, result))
                     yield ToolResultEvent(tool_name=tc.name, result=result)
 
             # 写类 — 串行（每个执行前检查）
@@ -689,6 +699,7 @@ class AgentLoop:
                 invalid_result = self._validate_tool_call_input(tc)
                 if invalid_result is not None:
                     self._append_tool_result(history, tc, invalid_result)
+                    round_observations.append((tc, invalid_result))
                     yield ToolResultEvent(tool_name=tc.name, result=invalid_result)
                     continue
 
@@ -698,6 +709,7 @@ class AgentLoop:
                         success=False, content="", error=blocked.reason,
                     )
                     self._append_tool_result(history, tc, blocked_result)
+                    round_observations.append((tc, blocked_result))
                     yield blocked
                     continue
 
@@ -714,34 +726,39 @@ class AgentLoop:
                     if decision == HITLDecision.DENY:
                         blocked_result = ToolResult(success=False, content="", error="用户拒绝了该操作")
                         self._append_tool_result(history, tc, blocked_result)
+                        round_observations.append((tc, blocked_result))
                         yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
                         continue
                     guard.apply_hitl(decision, tc.name, tc.input)
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
+                    round_observations.append((tc, blocked_result))
                     yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
                     continue
 
                 result = await self._execute_tool_with_hooks(tc)
 
                 self._append_tool_result(history, tc, result)
+                round_observations.append((tc, result))
                 yield ToolResultEvent(tool_name=tc.name, result=result)
 
-            signature = json.dumps(
-                [(call.name, call.input) for call in tool_calls],
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
-            recent_tool_signatures.append(signature)
-            recent_tool_signatures = recent_tool_signatures[-3:]
-            stalled = (
-                len(recent_tool_signatures) == 3
-                and len(set(recent_tool_signatures)) == 1
-            )
+            progress = progress_watchdog.observe(round_num, round_observations)
+            if progress.state == ProgressState.SLOW:
+                self._prompt_injector.queue_injection(progress.recovery_prompt)
+                yield ProgressWarningEvent(
+                    state=progress.state.value,
+                    reasons=progress.reasons,
+                    recovery_prompt=progress.recovery_prompt,
+                )
 
             if round_num >= budget.hard_limit:
+                if progress.requires_intervention:
+                    yield ProgressWarningEvent(
+                        state=progress.state.value,
+                        reasons=progress.reasons,
+                        recovery_prompt=progress.recovery_prompt,
+                    )
                 await self._fire_round_end(
                     round_num, len(tool_calls), "hard_max_rounds",
                 )
@@ -749,11 +766,83 @@ class AgentLoop:
                 yield AgentDoneEvent("hard_max_rounds")
                 return
 
+            if progress.requires_intervention:
+                await self._fire_round_end(
+                    round_num, len(tool_calls), "awaiting_progress_decision",
+                )
+                self._active_round = 0
+                default_continue = min(5, budget.hard_limit - round_num)
+                if budget.action == "stop":
+                    yield ProgressWarningEvent(
+                        state=progress.state.value,
+                        reasons=progress.reasons,
+                        recovery_prompt=progress.recovery_prompt,
+                    )
+                    yield AgentDoneEvent("stalled")
+                    return
+                if budget.auto_extend:
+                    yield ProgressWarningEvent(
+                        state=progress.state.value,
+                        reasons=progress.reasons,
+                        recovery_prompt=progress.recovery_prompt,
+                    )
+                    stall_decision = TaskStalledDecision(
+                        TaskStalledDecisionAction.STRATEGY,
+                        max(1, default_continue),
+                    )
+                else:
+                    future = asyncio.get_running_loop().create_future()
+                    yield TaskStalledEvent(
+                        state=progress.state.value,
+                        reasons=progress.reasons,
+                        recovery_prompt=progress.recovery_prompt,
+                        round_number=round_num,
+                        continue_rounds=max(1, default_continue),
+                        hard_limit=budget.hard_limit,
+                        future=future,
+                    )
+                    stall_decision = await future
+                if not isinstance(stall_decision, TaskStalledDecision):
+                    stall_decision = TaskStalledDecision(
+                        TaskStalledDecisionAction.STOP,
+                    )
+                if stall_decision.action == TaskStalledDecisionAction.STOP:
+                    yield AgentDoneEvent("stalled")
+                    return
+
+                if (
+                    isinstance(stall_decision.continue_rounds, int)
+                    and not isinstance(stall_decision.continue_rounds, bool)
+                    and stall_decision.continue_rounds > 0
+                ):
+                    requested_rounds = stall_decision.continue_rounds
+                elif stall_decision.action == TaskStalledDecisionAction.STRATEGY:
+                    requested_rounds = budget.extension
+                else:
+                    requested_rounds = max(1, default_continue)
+                previous_limit = budget.current_limit
+                budget.current_limit = min(
+                    budget.hard_limit,
+                    max(budget.current_limit, round_num + requested_rounds),
+                )
+                if stall_decision.action == TaskStalledDecisionAction.STRATEGY:
+                    self._prompt_injector.queue_injection(progress.recovery_prompt)
+                progress_watchdog.reset_strategy()
+                if budget.current_limit > previous_limit:
+                    yield RoundLimitExtendedEvent(
+                        previous_limit=previous_limit,
+                        new_limit=budget.current_limit,
+                        hard_limit=budget.hard_limit,
+                        automatic=budget.auto_extend,
+                    )
+                round_num += 1
+                continue
+
             if round_num >= budget.current_limit:
                 decision: RoundLimitDecision
                 if budget.action == "stop":
                     decision = RoundLimitDecision(RoundLimitDecisionAction.STOP)
-                elif budget.auto_extend and not stalled:
+                elif budget.auto_extend:
                     decision = RoundLimitDecision(RoundLimitDecisionAction.AUTO)
                 else:
                     await self._fire_round_end(
@@ -766,7 +855,7 @@ class AgentLoop:
                         current_limit=budget.current_limit,
                         extension=budget.extension,
                         hard_limit=budget.hard_limit,
-                        stalled=stalled,
+                        stalled=False,
                         future=future,
                     )
                     decision = await future
