@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,10 @@ from tinyCode.agent.events import (
     AgentEvent,
     ErrorEvent,
     HITLRequestEvent,
+    RoundLimitDecision,
+    RoundLimitDecisionAction,
+    RoundLimitExtendedEvent,
+    RoundLimitReachedEvent,
     RoundStartEvent,
     TextDeltaEvent,
     ThinkingEvent,
@@ -24,7 +29,13 @@ from tinyCode.agent.context import PromptContextAssembler
 from tinyCode.agent.tool_routing import should_enable_tools
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator
-from tinyCode.config.constants import DEFAULT_MAX_ROUNDS, MAX_ALLOWED_ROUNDS
+from tinyCode.config.constants import (
+    DEFAULT_HARD_MAX_ROUNDS,
+    DEFAULT_MAX_ROUNDS,
+    DEFAULT_ROUND_EXTENSION,
+    MAX_ALLOWED_ROUNDS,
+    SUPPORTED_ROUND_LIMIT_ACTIONS,
+)
 from tinyCode.conversation.compression import ContextCompressor
 from tinyCode.conversation.summarizer import StructuredSummarizer
 from tinyCode.notes.manager import AutoNoteManager
@@ -55,6 +66,16 @@ _PLAN_MODE_ALLOWED = {"read_file", "glob", "grep", "request_user_input"}
 _DEFERRED_TOOL_RESULT_TOOLS = {"tool_result_search", "tool_result_read"}
 
 
+@dataclass
+class _TurnRoundBudget:
+    current_limit: int
+    extension: int
+    hard_limit: int
+    action: str
+    auto_extend: bool
+    round_number: int = 0
+
+
 class AgentLoop:
     """ReAct 循环 + Prompt 拼装 + 缓存感知。"""
 
@@ -73,6 +94,11 @@ class AgentLoop:
         instructions_text: str = "",
         environment_text: str | Callable[[], str] = "",
         max_rounds: int = DEFAULT_MAX_ROUNDS,
+        round_extension: int = DEFAULT_ROUND_EXTENSION,
+        hard_max_rounds: int = DEFAULT_HARD_MAX_ROUNDS,
+        # Headless sub-agents have no UI capable of resolving an ``ask``
+        # event. The interactive main runtime passes its configured action.
+        round_limit_action: str = "stop",
         first_event_timeout: float = DEFAULT_FIRST_EVENT_TIMEOUT,
         idle_event_timeout: float = DEFAULT_IDLE_EVENT_TIMEOUT,
         provider_retries: int = DEFAULT_PROVIDER_RETRIES,
@@ -92,7 +118,18 @@ class AgentLoop:
         self._hook_engine = hook_engine
         self._instructions_text = instructions_text
         self._environment_text = environment_text
-        self._max_rounds = max_rounds
+        self._hard_max_rounds = self._validate_round_count(
+            hard_max_rounds, "hard_max_rounds",
+        )
+        self._max_rounds = self._validate_round_count(
+            max_rounds, "max_rounds", maximum=self._hard_max_rounds,
+        )
+        self._round_extension = self._validate_round_count(
+            round_extension, "round_extension",
+        )
+        self._round_limit_action = self._validate_round_limit_action(
+            round_limit_action,
+        )
         self._first_event_timeout = first_event_timeout
         self._idle_event_timeout = idle_event_timeout
         self._provider_retries = max(0, provider_retries)
@@ -115,6 +152,7 @@ class AgentLoop:
         self.turn_usage = TokenUsage()
         self.turn_model_requests = 0
         self._active_round = 0
+        self._active_budget: _TurnRoundBudget | None = None
 
     # -- public API -----------------------------------------------------------
 
@@ -132,17 +170,85 @@ class AgentLoop:
         return self._max_rounds
 
     def set_max_rounds(self, value: int) -> int:
-        """Update the maximum rounds for subsequent turns in this process."""
+        """Update the soft budget and an in-flight task's effective limit."""
+        self._max_rounds = self._validate_round_count(
+            value, "max_rounds", maximum=self._hard_max_rounds,
+        )
+        if self._active_budget is not None:
+            self._active_budget.current_limit = max(
+                self._active_budget.round_number,
+                min(self._max_rounds, self._active_budget.hard_limit),
+            )
+        return self._max_rounds
+
+    @property
+    def round_extension(self) -> int:
+        return self._round_extension
+
+    def set_round_extension(self, value: int) -> int:
+        self._round_extension = self._validate_round_count(
+            value, "round_extension",
+        )
+        if self._active_budget is not None:
+            self._active_budget.extension = self._round_extension
+        return self._round_extension
+
+    @property
+    def hard_max_rounds(self) -> int:
+        return self._hard_max_rounds
+
+    def set_hard_max_rounds(self, value: int) -> int:
+        validated = self._validate_round_count(value, "hard_max_rounds")
+        if validated < self._max_rounds:
+            raise ValueError(
+                f"hard_max_rounds 不能小于 max_rounds（{self._max_rounds}）"
+            )
+        active_round = (
+            self._active_budget.round_number if self._active_budget else 0
+        )
+        if active_round and validated < active_round:
+            raise ValueError(
+                f"hard_max_rounds 不能小于当前轮次（{active_round}）"
+            )
+        self._hard_max_rounds = validated
+        if self._active_budget is not None:
+            self._active_budget.hard_limit = validated
+            self._active_budget.current_limit = min(
+                self._active_budget.current_limit, validated,
+            )
+        return self._hard_max_rounds
+
+    @property
+    def round_limit_action(self) -> str:
+        return self._round_limit_action
+
+    def set_round_limit_action(self, value: str) -> str:
+        self._round_limit_action = self._validate_round_limit_action(value)
+        if self._active_budget is not None:
+            self._active_budget.action = self._round_limit_action
+            self._active_budget.auto_extend = self._round_limit_action == "auto"
+        return self._round_limit_action
+
+    @staticmethod
+    def _validate_round_count(
+        value: int, name: str, *, maximum: int = MAX_ALLOWED_ROUNDS,
+    ) -> int:
         if (
             isinstance(value, bool)
             or not isinstance(value, int)
-            or not 1 <= value <= MAX_ALLOWED_ROUNDS
+            or not 1 <= value <= maximum
         ):
-            raise ValueError(
-                f"max_rounds 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数"
-            )
-        self._max_rounds = value
-        return self._max_rounds
+            raise ValueError(f"{name} 必须是 1 到 {maximum} 之间的整数")
+        return value
+
+    @staticmethod
+    def _validate_round_limit_action(value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("round_limit_action 必须是 ask、auto 或 stop")
+        normalized = value.strip().lower()
+        if normalized not in SUPPORTED_ROUND_LIMIT_ACTIONS:
+            raise ValueError("round_limit_action 必须是 ask、auto 或 stop")
+        return normalized
 
     def get_system_prompt(self, section: str = "all") -> str:
         """Return a read-only snapshot of the prompt context sent to the model."""
@@ -222,6 +328,8 @@ class AgentLoop:
             yield ErrorEvent(
                 message=f"Agent 执行失败: {type(exc).__name__}: {exc}",
             )
+        finally:
+            self._active_budget = None
 
     async def _run_impl(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         self.reset_cancel()
@@ -231,11 +339,19 @@ class AgentLoop:
         response_chars = 0
         tools_enabled = should_enable_tools(history.get_messages())
         request_history = self._request_history(history, tools_enabled)
-        # Keep an in-flight turn internally consistent. Runtime configuration
-        # changes apply to the next turn instead of changing this loop midway.
-        max_rounds = self._max_rounds
+        budget = _TurnRoundBudget(
+            current_limit=self._max_rounds,
+            extension=self._round_extension,
+            hard_limit=self._hard_max_rounds,
+            action=self._round_limit_action,
+            auto_extend=self._round_limit_action == "auto",
+        )
+        self._active_budget = budget
+        recent_tool_signatures: list[str] = []
+        round_num = 1
 
-        for round_num in range(1, max_rounds + 1):
+        while round_num <= budget.hard_limit:
+            budget.round_number = round_num
             if self._cancel_event.is_set():
                 yield AgentDoneEvent("cancelled")
                 return
@@ -298,7 +414,7 @@ class AgentLoop:
 
             yield RoundStartEvent(
                 round_number=round_num,
-                max_rounds=max_rounds,
+                max_rounds=budget.current_limit,
             )
 
             # --- 1. 拼装本轮 messages ---
@@ -326,7 +442,8 @@ class AgentLoop:
             # --- Hook: ROUND_START ---
             if self._hook_engine:
                 await self._hook_engine.fire(HookEvent.ROUND_START, {
-                    "round_number": round_num, "max_rounds": max_rounds,
+                    "round_number": round_num,
+                    "max_rounds": budget.current_limit,
                 })
 
             # --- Hook: MESSAGE_PRE_SEND ---
@@ -611,11 +728,86 @@ class AgentLoop:
                 self._append_tool_result(history, tc, result)
                 yield ToolResultEvent(tool_name=tc.name, result=result)
 
-            outcome = "max_rounds" if round_num == max_rounds else "continued"
-            await self._fire_round_end(round_num, len(tool_calls), outcome)
-            self._active_round = 0
+            signature = json.dumps(
+                [(call.name, call.input) for call in tool_calls],
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            recent_tool_signatures.append(signature)
+            recent_tool_signatures = recent_tool_signatures[-3:]
+            stalled = (
+                len(recent_tool_signatures) == 3
+                and len(set(recent_tool_signatures)) == 1
+            )
 
-        yield AgentDoneEvent("max_rounds")
+            if round_num >= budget.hard_limit:
+                await self._fire_round_end(
+                    round_num, len(tool_calls), "hard_max_rounds",
+                )
+                self._active_round = 0
+                yield AgentDoneEvent("hard_max_rounds")
+                return
+
+            if round_num >= budget.current_limit:
+                decision: RoundLimitDecision
+                if budget.action == "stop":
+                    decision = RoundLimitDecision(RoundLimitDecisionAction.STOP)
+                elif budget.auto_extend and not stalled:
+                    decision = RoundLimitDecision(RoundLimitDecisionAction.AUTO)
+                else:
+                    await self._fire_round_end(
+                        round_num, len(tool_calls), "awaiting_round_extension",
+                    )
+                    self._active_round = 0
+                    future = asyncio.get_running_loop().create_future()
+                    yield RoundLimitReachedEvent(
+                        round_number=round_num,
+                        current_limit=budget.current_limit,
+                        extension=budget.extension,
+                        hard_limit=budget.hard_limit,
+                        stalled=stalled,
+                        future=future,
+                    )
+                    decision = await future
+
+                if decision.action == RoundLimitDecisionAction.STOP:
+                    if self._active_round:
+                        await self._fire_round_end(
+                            round_num, len(tool_calls), "round_budget_stopped",
+                        )
+                    self._active_round = 0
+                    yield AgentDoneEvent("round_budget_stopped")
+                    return
+
+                previous_limit = budget.current_limit
+                requested_limit = decision.requested_limit
+                if requested_limit is None:
+                    requested_limit = round_num + budget.extension
+                budget.current_limit = min(
+                    budget.hard_limit,
+                    max(previous_limit, round_num + 1, requested_limit),
+                )
+                if decision.action == RoundLimitDecisionAction.AUTO:
+                    budget.auto_extend = True
+                if self._active_round:
+                    await self._fire_round_end(
+                        round_num, len(tool_calls), "continued",
+                    )
+                self._active_round = 0
+                yield RoundLimitExtendedEvent(
+                    previous_limit=previous_limit,
+                    new_limit=budget.current_limit,
+                    hard_limit=budget.hard_limit,
+                    automatic=decision.action == RoundLimitDecisionAction.AUTO,
+                )
+            else:
+                await self._fire_round_end(
+                    round_num, len(tool_calls), "continued",
+                )
+                self._active_round = 0
+
+            round_num += 1
 
     @staticmethod
     def _request_history(

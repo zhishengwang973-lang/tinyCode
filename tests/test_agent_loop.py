@@ -4,7 +4,19 @@ import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from tinyCode.agent.events import ContextCompressionEvent, ErrorEvent, RoundStartEvent, ToolBlockedEvent, ToolCallEvent, ToolResultEvent
+from tinyCode.agent.events import (
+    AgentDoneEvent,
+    ContextCompressionEvent,
+    ErrorEvent,
+    RoundLimitDecision,
+    RoundLimitDecisionAction,
+    RoundLimitExtendedEvent,
+    RoundLimitReachedEvent,
+    RoundStartEvent,
+    ToolBlockedEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from tinyCode.agent.loop import AgentLoop
 from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
@@ -391,6 +403,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             prompt_builder=PromptBuilder(),
             prompt_injector=PromptInjector(),
             max_rounds=kwargs.pop("max_rounds", 1),
+            round_limit_action=kwargs.pop("round_limit_action", "stop"),
             **kwargs,
         )
 
@@ -402,6 +415,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             prompt_builder=PromptBuilder(),
             prompt_injector=PromptInjector(),
             max_rounds=1,
+            round_limit_action="stop",
         )
         history = ConversationHistory()
         history.add_user_message("call a missing tool")
@@ -1041,6 +1055,106 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1, 2, 3], [event.round_number for event in rounds])
         self.assertTrue(all(event.max_rounds == 3 for event in rounds))
 
+    async def test_soft_limit_can_extend_same_in_flight_task(self):
+        provider = MultiRoundUsageProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=1,
+            hard_max_rounds=3,
+            round_extension=1,
+            round_limit_action="ask",
+        )
+        history = ConversationHistory()
+        history.add_user_message("use a tool and finish")
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if isinstance(event, RoundLimitReachedEvent):
+                event.future.set_result(RoundLimitDecision(
+                    RoundLimitDecisionAction.EXTEND,
+                ))
+
+        self.assertEqual(2, provider.calls)
+        self.assertEqual(
+            [1, 2],
+            [event.round_number for event in events if isinstance(event, RoundStartEvent)],
+        )
+        self.assertTrue(any(
+            isinstance(event, RoundLimitExtendedEvent) for event in events
+        ))
+        self.assertEqual("no_tool_call", events[-1].reason)
+
+    async def test_auto_extension_stops_at_hard_limit(self):
+        loop = self._make_loop(
+            UnknownToolProvider(),
+            max_rounds=1,
+            round_extension=1,
+            hard_max_rounds=3,
+            round_limit_action="auto",
+        )
+        history = ConversationHistory()
+        history.add_user_message("keep calling the tool")
+
+        events = [event async for event in loop.run(history)]
+
+        rounds = [event for event in events if isinstance(event, RoundStartEvent)]
+        extensions = [
+            event for event in events if isinstance(event, RoundLimitExtendedEvent)
+        ]
+        self.assertEqual([1, 2, 3], [event.round_number for event in rounds])
+        self.assertEqual([(1, 2), (2, 3)], [
+            (event.previous_limit, event.new_limit) for event in extensions
+        ])
+        self.assertEqual("hard_max_rounds", events[-1].reason)
+
+    async def test_auto_extension_pauses_when_tool_calls_stall(self):
+        loop = self._make_loop(
+            UnknownToolProvider(),
+            max_rounds=3,
+            round_extension=1,
+            hard_max_rounds=5,
+            round_limit_action="auto",
+        )
+        history = ConversationHistory()
+        history.add_user_message("keep calling the same tool")
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if isinstance(event, RoundLimitReachedEvent):
+                self.assertTrue(event.stalled)
+                event.future.set_result(RoundLimitDecision(
+                    RoundLimitDecisionAction.STOP,
+                ))
+
+        self.assertEqual(3, sum(
+            isinstance(event, RoundStartEvent) for event in events
+        ))
+        self.assertEqual("round_budget_stopped", events[-1].reason)
+
+    async def test_runtime_max_rounds_change_updates_active_task_budget(self):
+        loop = self._make_loop(
+            UnknownToolProvider(),
+            max_rounds=1,
+            hard_max_rounds=4,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("call tools")
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if isinstance(event, RoundStartEvent) and event.round_number == 1:
+                self.assertEqual(3, loop.set_max_rounds(3))
+
+        self.assertEqual(
+            [1, 2, 3],
+            [event.round_number for event in events if isinstance(event, RoundStartEvent)],
+        )
+        self.assertEqual("round_budget_stopped", events[-1].reason)
+
     def test_runtime_max_rounds_rejects_invalid_values(self):
         loop = self._make_loop(UnknownToolProvider(), max_rounds=1)
 
@@ -1049,6 +1163,20 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     loop.set_max_rounds(value)
         self.assertEqual(1, loop.max_rounds)
+
+    def test_round_budget_configuration_rejects_invalid_relationships(self):
+        loop = self._make_loop(
+            UnknownToolProvider(), max_rounds=3, hard_max_rounds=5,
+        )
+
+        with self.assertRaisesRegex(ValueError, "不能小于 max_rounds"):
+            loop.set_hard_max_rounds(2)
+        with self.assertRaisesRegex(ValueError, "max_rounds"):
+            loop.set_max_rounds(6)
+        with self.assertRaisesRegex(ValueError, "round_extension"):
+            loop.set_round_extension(0)
+        with self.assertRaisesRegex(ValueError, "ask、auto 或 stop"):
+            loop.set_round_limit_action("forever")
 
     async def test_first_event_timeout_retries_then_recovers(self):
         provider = TimeoutThenSuccessProvider()

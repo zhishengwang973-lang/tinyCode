@@ -33,8 +33,17 @@ providers:
 # 当前使用的 provider（必须是上面列表中的 name）
 active_provider: claude
 
-# 单次复杂任务允许的最大 Agent 轮数（1-100）
+# 单次任务的初始软预算
 max_rounds: 30
+
+# 软预算耗尽后每次增加的轮数
+round_extension: 10
+
+# 单次任务绝对不能超过的硬上限（1-100，且不小于 max_rounds）
+hard_max_rounds: 100
+
+# 软预算耗尽时：ask 询问 / auto 自动续跑 / stop 直接暂停
+round_limit_action: ask
 
 # 默认安全等级：strict / normal / permissive
 # 可在单次启动时用 tinyCode --mode <等级> 覆盖

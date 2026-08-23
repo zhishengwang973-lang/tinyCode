@@ -18,6 +18,10 @@ from tinyCode.agent.events import (
     AgentDoneEvent,
     ErrorEvent,
     HITLRequestEvent,
+    RoundLimitDecision,
+    RoundLimitDecisionAction,
+    RoundLimitExtendedEvent,
+    RoundLimitReachedEvent,
     RoundStartEvent,
     ThinkingEvent,
     TextDeltaEvent,
@@ -314,6 +318,24 @@ class TinyCodeTUI(UIControl):
     def set_max_rounds(self, value: int) -> int:
         return self._agent_loop.set_max_rounds(value)
 
+    def get_round_extension(self) -> int:
+        return self._agent_loop.round_extension
+
+    def set_round_extension(self, value: int) -> int:
+        return self._agent_loop.set_round_extension(value)
+
+    def get_hard_max_rounds(self) -> int:
+        return self._agent_loop.hard_max_rounds
+
+    def set_hard_max_rounds(self, value: int) -> int:
+        return self._agent_loop.set_hard_max_rounds(value)
+
+    def get_round_limit_action(self) -> str:
+        return self._agent_loop.round_limit_action
+
+    def set_round_limit_action(self, value: str) -> str:
+        return self._agent_loop.set_round_limit_action(value)
+
     def request_exit(self) -> None:
         self._exit_requested = True
 
@@ -545,12 +567,49 @@ class TinyCodeTUI(UIControl):
                     self._resolve_hitl(decision)
                     self._start_progress("已确认 · 继续执行")
 
+                elif isinstance(event, RoundLimitReachedEvent):
+                    stream_line_open = self._close_stream_line(stream_line_open)
+                    self._stop_progress()
+                    if event.stalled:
+                        self._print_warning(
+                            "最近 3 轮重复了相同工具调用，已暂停自动续跑"
+                        )
+                    self._print_warning(
+                        f"任务尚未完成，已用完轮次预算 "
+                        f"{event.round_number}/{event.current_limit}"
+                        f"（硬上限 {event.hard_limit}）"
+                    )
+                    decision = await self._prompt_for_round_limit(event)
+                    self._runtime.resolve_round_limit(decision)
+                    if decision.action == RoundLimitDecisionAction.STOP:
+                        self._start_progress("正在暂停任务")
+                    else:
+                        self._start_progress("轮次预算已确认 · 继续执行")
+
+                elif isinstance(event, RoundLimitExtendedEvent):
+                    mode = "自动续跑" if event.automatic else "本次续跑"
+                    self._print_info(
+                        f"轮次预算已扩展：{event.previous_limit} → "
+                        f"{event.new_limit}（{mode} · 硬上限 {event.hard_limit}）"
+                    )
+                    self._start_progress(
+                        f"预算 {event.new_limit} 轮 · 继续执行"
+                    )
+
                 elif isinstance(event, AgentDoneEvent):
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
-                    if event.reason == "max_rounds":
-                        self._status_text = "就绪 · 本轮达到轮数上限"
-                        self._print_warning("已达到最大工具调用轮数，本轮已停止")
+                    if event.reason in {"max_rounds", "round_budget_stopped"}:
+                        self._status_text = "就绪 · 任务因轮次预算暂停"
+                        self._print_warning(
+                            "任务尚未完成，已暂停并保留当前进度；可输入“继续”恢复"
+                        )
+                    elif event.reason == "hard_max_rounds":
+                        self._status_text = "就绪 · 任务达到轮次硬上限"
+                        self._print_error(
+                            "任务尚未完成，已达到轮次硬上限；"
+                            "当前进度已保留，可调整配置后输入“继续”"
+                        )
                     elif event.reason == "cancelled":
                         self._status_text = "就绪 · 本轮已取消"
                         self._print_info("本轮已取消")
@@ -620,6 +679,66 @@ class TinyCodeTUI(UIControl):
             if decision is not None:
                 return decision
             self._print_warning("请输入 A、S、P 或 D")
+
+    async def _prompt_for_round_limit(
+        self, event: RoundLimitReachedEvent,
+    ) -> RoundLimitDecision:
+        prompt = (
+            f"轮次 [A再执行{event.extension}轮/C持续执行/S停止，"
+            "也可输入 +N 或目标轮数] › "
+        )
+        while True:
+            try:
+                answer = (
+                    await self._prompt_session.prompt_async(
+                        [("class:warning", prompt)]
+                    )
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return RoundLimitDecision(RoundLimitDecisionAction.STOP)
+
+            if answer == "a":
+                return RoundLimitDecision(
+                    RoundLimitDecisionAction.EXTEND,
+                    min(event.hard_limit, event.current_limit + event.extension),
+                )
+            if answer == "c":
+                return RoundLimitDecision(RoundLimitDecisionAction.AUTO)
+            if answer == "s":
+                return RoundLimitDecision(RoundLimitDecisionAction.STOP)
+
+            value_text = answer
+            update_session_default = False
+            for prefix in ("/rounds ", "/config max-rounds ", "/config max_rounds "):
+                if value_text.startswith(prefix):
+                    value_text = value_text[len(prefix):].strip()
+                    update_session_default = prefix.startswith("/config")
+                    break
+            try:
+                if value_text.startswith("+"):
+                    target = event.current_limit + int(value_text[1:])
+                else:
+                    target = int(value_text)
+            except ValueError:
+                self._print_warning("请输入 A、C、S、+N 或目标轮数")
+                continue
+
+            if not event.current_limit < target <= event.hard_limit:
+                self._print_warning(
+                    f"目标轮数必须大于 {event.current_limit} 且不超过 "
+                    f"{event.hard_limit}"
+                )
+                continue
+            if update_session_default:
+                try:
+                    self.set_max_rounds(target)
+                except ValueError as exc:
+                    self._print_warning(str(exc))
+                    continue
+            return RoundLimitDecision(
+                RoundLimitDecisionAction.EXTEND,
+                target,
+            )
 
     def _resolve_hitl(self, decision: HITLDecision) -> None:
         if self._runtime.resolve_approval(decision):

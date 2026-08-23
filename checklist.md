@@ -54,7 +54,10 @@
 - [ ] 用户发消息 → ReAct 循环启动 → LLM 调工具 → 工具结果回填 → LLM 继续 → 无工具调用终止
 - [ ] 多工具调用 → 读并发/写串行
 - [ ] cancel 信号 → AgentDoneEvent("cancelled")
-- [ ] 超过 max_rounds → AgentDoneEvent("max_rounds")
+- [ ] 达到 max_rounds 且任务未完成 → 询问续跑、自动扩展或暂停，不误报正常完成
+- [ ] 选择续跑 → 保持同一任务上下文、统计和工具结果继续执行
+- [ ] 达到 hard_max_rounds → AgentDoneEvent("hard_max_rounds")，明确显示未完成
+- [ ] 自动续跑连续 3 轮重复相同工具调用 → 暂停并请求用户决策
 
 ## TUI 交互
 

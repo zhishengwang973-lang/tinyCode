@@ -14,6 +14,9 @@ from tinyCode.agent.events import (
     AgentEvent,
     ErrorEvent,
     HITLRequestEvent,
+    RoundLimitDecision,
+    RoundLimitDecisionAction,
+    RoundLimitReachedEvent,
 )
 from tinyCode.security.models import HITLDecision
 
@@ -27,7 +30,10 @@ class TurnState(Enum):
     PREPARING = "preparing"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_ROUND_LIMIT = "waiting_round_limit"
     COMPLETED = "completed"
+    PAUSED = "paused"
+    LIMIT_REACHED = "limit_reached"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -49,6 +55,7 @@ class TurnRuntime:
         TurnState.PREPARING,
         TurnState.RUNNING,
         TurnState.WAITING_APPROVAL,
+        TurnState.WAITING_ROUND_LIMIT,
     }
 
     def __init__(self, agent_loop: "AgentLoop") -> None:
@@ -60,6 +67,7 @@ class TurnRuntime:
         self._last_error = ""
         self._owner_task: asyncio.Task | None = None
         self._approval_future: asyncio.Future | None = None
+        self._round_limit_future: asyncio.Future | None = None
 
     @property
     def state(self) -> TurnState:
@@ -82,6 +90,14 @@ class TurnRuntime:
         """Read-only compatibility hook for UI/tests; runtime owns mutation."""
         return self._approval_future
 
+    @property
+    def waiting_for_round_limit(self) -> bool:
+        return (
+            self._state == TurnState.WAITING_ROUND_LIMIT
+            and self._round_limit_future is not None
+            and not self._round_limit_future.done()
+        )
+
     def snapshot(self) -> TurnSnapshot:
         return TurnSnapshot(
             turn_id=self._turn_id,
@@ -102,6 +118,7 @@ class TurnRuntime:
         self._last_error = ""
         self._owner_task = None
         self._approval_future = None
+        self._round_limit_future = None
         return True
 
     def claim(self) -> bool:
@@ -132,12 +149,22 @@ class TurnRuntime:
                         raise RuntimeError("HITLRequestEvent.future 必须是 asyncio.Future")
                     self._approval_future = event.future
                     self._state = TurnState.WAITING_APPROVAL
+                elif isinstance(event, RoundLimitReachedEvent):
+                    if not isinstance(event.future, asyncio.Future):
+                        raise RuntimeError(
+                            "RoundLimitReachedEvent.future 必须是 asyncio.Future"
+                        )
+                    self._round_limit_future = event.future
+                    self._state = TurnState.WAITING_ROUND_LIMIT
                 elif isinstance(event, AgentDoneEvent):
-                    outcome = (
-                        TurnState.CANCELLED
-                        if event.reason == "cancelled"
-                        else TurnState.COMPLETED
-                    )
+                    if event.reason == "cancelled":
+                        outcome = TurnState.CANCELLED
+                    elif event.reason == "round_budget_stopped":
+                        outcome = TurnState.PAUSED
+                    elif event.reason == "hard_max_rounds":
+                        outcome = TurnState.LIMIT_REACHED
+                    else:
+                        outcome = TurnState.COMPLETED
                 elif isinstance(event, ErrorEvent):
                     outcome = TurnState.FAILED
                     self._last_error = event.message
@@ -180,11 +207,21 @@ class TurnRuntime:
         self._state = TurnState.RUNNING
         return True
 
+    def resolve_round_limit(self, decision: RoundLimitDecision) -> bool:
+        future = self._round_limit_future
+        if not self.waiting_for_round_limit or future is None:
+            return False
+        future.set_result(decision)
+        self._round_limit_future = None
+        self._state = TurnState.RUNNING
+        return True
+
     def cancel(self, *, interrupt: bool = True) -> bool:
         if not self.active:
             return False
         self._agent_loop.cancel()
         self._deny_pending_approval()
+        self._stop_pending_round_limit()
         self._state = TurnState.CANCELLED
         owner = self._owner_task
         if interrupt and owner is not None and owner is not asyncio.current_task():
@@ -211,8 +248,15 @@ class TurnRuntime:
             future.set_result(HITLDecision.DENY)
         self._approval_future = None
 
+    def _stop_pending_round_limit(self) -> None:
+        future = self._round_limit_future
+        if future is not None and not future.done():
+            future.set_result(RoundLimitDecision(RoundLimitDecisionAction.STOP))
+        self._round_limit_future = None
+
     def _finish(self, outcome: TurnState) -> None:
         self._deny_pending_approval()
+        self._stop_pending_round_limit()
         self._last_outcome = outcome
         self._state = TurnState.IDLE
         self._started_at = None

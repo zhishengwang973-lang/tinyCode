@@ -32,9 +32,9 @@
 
 ### Agent 循环
 15. **ReAct 范式**：调 LLM → 解析工具调用 → 分批执行（读并发/写串行）→ 回填 → 继续
-16. **事件流**：UserMessage / ThinkingEvent / TextDeltaEvent / ToolCallEvent / ToolResultEvent / ToolBlockedEvent / AgentDoneEvent / ErrorEvent / RoundStartEvent / TruncationEvent / HITLRequestEvent
+16. **事件流**：UserMessage / ThinkingEvent / TextDeltaEvent / ToolCallEvent / ToolResultEvent / ToolBlockedEvent / AgentDoneEvent / ErrorEvent / RoundStartEvent / RoundLimitReachedEvent / RoundLimitExtendedEvent / TruncationEvent / HITLRequestEvent
 17. **取消与超时**：asyncio.Event 打断中间状态
-18. **最大轮次限制**：默认 30 轮，YAML `max_rounds`（1–100）全局配置，`/config max-rounds N` 可在当前启动会话内调整
+18. **弹性轮次预算**：`max_rounds` 是初始软预算；耗尽后按 `round_limit_action` 询问、自动续跑或暂停，续跑步长由 `round_extension` 控制，且始终受 `hard_max_rounds`（1–100）约束；会话内可通过 `/config` 调整
 
 ### 安全系统
 19. **硬安全边界**：危险命令黑名单、Provider 凭据文件保护和命令环境凭据清理，始终生效不依赖档位

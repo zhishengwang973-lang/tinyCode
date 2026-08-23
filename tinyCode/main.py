@@ -324,6 +324,9 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         instructions_text=instructions_text,
         environment_text=environment_text,
         max_rounds=app_config.max_rounds,
+        round_extension=app_config.round_extension,
+        hard_max_rounds=app_config.hard_max_rounds,
+        round_limit_action=app_config.round_limit_action,
         compressor=compressor,
     )
 

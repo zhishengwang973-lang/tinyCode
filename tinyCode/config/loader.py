@@ -9,10 +9,14 @@ import yaml
 
 from tinyCode.config.models import AppConfig, ProviderConfig
 from tinyCode.config.constants import (
+    DEFAULT_HARD_MAX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_NOTES_ENABLED,
+    DEFAULT_ROUND_EXTENSION,
+    DEFAULT_ROUND_LIMIT_ACTION,
     DEFAULT_SECURITY_LEVEL,
     MAX_ALLOWED_ROUNDS,
+    SUPPORTED_ROUND_LIMIT_ACTIONS,
     SUPPORTED_SECURITY_LEVELS,
 )
 
@@ -281,12 +285,41 @@ def load_config() -> AppConfig:
         raw["providers"][active_index], active_index, resolve_secret=True,
     )
 
+    hard_max_rounds = raw.get("hard_max_rounds", DEFAULT_HARD_MAX_ROUNDS)
+    if (
+        isinstance(hard_max_rounds, bool) or not isinstance(hard_max_rounds, int)
+        or not 1 <= hard_max_rounds <= MAX_ALLOWED_ROUNDS
+    ):
+        raise ConfigError(
+            f"hard_max_rounds 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数"
+        )
+
     max_rounds = raw.get("max_rounds", DEFAULT_MAX_ROUNDS)
     if (
         isinstance(max_rounds, bool) or not isinstance(max_rounds, int)
-        or not 1 <= max_rounds <= MAX_ALLOWED_ROUNDS
+        or not 1 <= max_rounds <= hard_max_rounds
     ):
-        raise ConfigError(f"max_rounds 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数")
+        raise ConfigError(
+            f"max_rounds 必须是 1 到 hard_max_rounds（{hard_max_rounds}）之间的整数"
+        )
+
+    round_extension = raw.get("round_extension", DEFAULT_ROUND_EXTENSION)
+    if (
+        isinstance(round_extension, bool) or not isinstance(round_extension, int)
+        or not 1 <= round_extension <= MAX_ALLOWED_ROUNDS
+    ):
+        raise ConfigError(
+            f"round_extension 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数"
+        )
+
+    round_limit_action = raw.get(
+        "round_limit_action", DEFAULT_ROUND_LIMIT_ACTION,
+    )
+    if not isinstance(round_limit_action, str):
+        raise ConfigError("round_limit_action 必须是 ask、auto 或 stop")
+    round_limit_action = round_limit_action.strip().lower()
+    if round_limit_action not in SUPPORTED_ROUND_LIMIT_ACTIONS:
+        raise ConfigError("round_limit_action 必须是 ask、auto 或 stop")
 
     security_level = raw.get("security_level", DEFAULT_SECURITY_LEVEL)
     if not isinstance(security_level, str):
@@ -301,6 +334,10 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         providers=providers, active_provider=active_provider,
-        max_rounds=max_rounds, security_level=security_level,
+        max_rounds=max_rounds,
+        round_extension=round_extension,
+        hard_max_rounds=hard_max_rounds,
+        round_limit_action=round_limit_action,
+        security_level=security_level,
         notes_enabled=notes_enabled,
     )

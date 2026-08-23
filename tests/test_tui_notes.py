@@ -10,6 +10,9 @@ from rich.console import Console
 from tinyCode.agent.events import (
     AgentDoneEvent,
     HITLRequestEvent,
+    RoundLimitDecisionAction,
+    RoundLimitExtendedEvent,
+    RoundLimitReachedEvent,
     RoundStartEvent,
     TextDeltaEvent,
     ToolCallEvent,
@@ -77,6 +80,9 @@ class FakeAgentLoop:
         self.response = response
         self.recorded_rounds: list[tuple[str, str]] = []
         self.max_rounds = 30
+        self.round_extension = 10
+        self.hard_max_rounds = 100
+        self.round_limit_action = "ask"
 
     async def run(self, history):
         yield TextDeltaEvent(self.response)
@@ -96,6 +102,18 @@ class FakeAgentLoop:
 
     def set_max_rounds(self, value: int) -> int:
         self.max_rounds = value
+        return value
+
+    def set_round_extension(self, value: int) -> int:
+        self.round_extension = value
+        return value
+
+    def set_hard_max_rounds(self, value: int) -> int:
+        self.hard_max_rounds = value
+        return value
+
+    def set_round_limit_action(self, value: str) -> str:
+        self.round_limit_action = value
         return value
 
     def get_system_prompt(self, section: str = "all") -> str:
@@ -212,6 +230,44 @@ class ApprovalAgentLoop(FakeAgentLoop):
         await self.future
         yield TextDeltaEvent("approved")
         yield AgentDoneEvent("no_tool_call")
+
+
+class RoundBudgetAgentLoop(FakeAgentLoop):
+    def __init__(self, *, stalled: bool = False) -> None:
+        super().__init__()
+        self.future: asyncio.Future | None = None
+        self.stalled = stalled
+
+    async def run(self, history):
+        self.future = asyncio.get_running_loop().create_future()
+        yield RoundStartEvent(30, 30)
+        yield RoundLimitReachedEvent(
+            round_number=30,
+            current_limit=30,
+            extension=10,
+            hard_limit=100,
+            stalled=self.stalled,
+            future=self.future,
+        )
+        decision = await self.future
+        if decision.action == RoundLimitDecisionAction.STOP:
+            yield AgentDoneEvent("round_budget_stopped")
+            return
+        new_limit = decision.requested_limit or 40
+        yield RoundLimitExtendedEvent(
+            previous_limit=30,
+            new_limit=new_limit,
+            hard_limit=100,
+            automatic=decision.action == RoundLimitDecisionAction.AUTO,
+        )
+        yield TextDeltaEvent("finished")
+        yield AgentDoneEvent("no_tool_call")
+
+
+class HardLimitAgentLoop(FakeAgentLoop):
+    async def run(self, history):
+        yield RoundStartEvent(100, 100)
+        yield AgentDoneEvent("hard_max_rounds")
 
 
 class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
@@ -523,6 +579,59 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(HITLDecision.DENY, loop.future.result())
         self.assertEqual(2, len(prompt.prompts))
         self.assertIn("请输入 A、S、P 或 D", output.getvalue())
+
+    async def test_round_budget_can_extend_without_starting_a_new_turn(self):
+        loop = RoundBudgetAgentLoop()
+        tui, output = self._make_tui(loop, answers=["A"])
+
+        await tui._on_user_input("long task")
+
+        self.assertEqual(RoundLimitDecisionAction.EXTEND, loop.future.result().action)
+        self.assertEqual(40, loop.future.result().requested_limit)
+        rendered = output.getvalue()
+        self.assertIn("任务尚未完成，已用完轮次预算 30/30", rendered)
+        self.assertIn("轮次预算已扩展：30 → 40", rendered)
+        self.assertIn("✓ 本轮已正常完成", rendered)
+
+    async def test_round_budget_accepts_custom_target_and_stall_warning(self):
+        loop = RoundBudgetAgentLoop(stalled=True)
+        tui, output = self._make_tui(loop, answers=["/rounds 55"])
+
+        await tui._on_user_input("long task")
+
+        self.assertEqual(55, loop.future.result().requested_limit)
+        self.assertIn("最近 3 轮重复了相同工具调用", output.getvalue())
+        self.assertIn("轮次预算已扩展：30 → 55", output.getvalue())
+
+    async def test_round_budget_config_syntax_also_updates_session_default(self):
+        loop = RoundBudgetAgentLoop()
+        tui, _ = self._make_tui(loop, answers=["/config max-rounds 55"])
+
+        await tui._on_user_input("long task")
+
+        self.assertEqual(55, loop.future.result().requested_limit)
+        self.assertEqual(55, loop.max_rounds)
+
+    async def test_stopping_at_soft_budget_is_not_rendered_as_completion(self):
+        loop = RoundBudgetAgentLoop()
+        tui, output = self._make_tui(loop, answers=["S"])
+
+        await tui._on_user_input("long task")
+
+        rendered = output.getvalue()
+        self.assertIn("任务尚未完成，已暂停并保留当前进度", rendered)
+        self.assertNotIn("✓ 本轮已正常完成", rendered)
+        self.assertEqual("就绪 · 任务因轮次预算暂停", tui._status_text)
+
+    async def test_hard_limit_is_distinct_from_normal_completion(self):
+        tui, output = self._make_tui(HardLimitAgentLoop())
+
+        await tui._on_user_input("long task")
+
+        rendered = output.getvalue()
+        self.assertIn("已达到轮次硬上限", rendered)
+        self.assertNotIn("✓ 本轮已正常完成", rendered)
+        self.assertEqual("就绪 · 任务达到轮次硬上限", tui._status_text)
 
     async def test_normal_prompt_is_restored_after_hitl_confirmation(self):
         loop = ApprovalAgentLoop()

@@ -108,6 +108,24 @@ class UIControl(ABC):
         """Set the process-level maximum for subsequent turns."""
         raise NotImplementedError
 
+    def get_round_extension(self) -> int:
+        raise NotImplementedError
+
+    def set_round_extension(self, value: int) -> int:
+        raise NotImplementedError
+
+    def get_hard_max_rounds(self) -> int:
+        raise NotImplementedError
+
+    def set_hard_max_rounds(self, value: int) -> int:
+        raise NotImplementedError
+
+    def get_round_limit_action(self) -> str:
+        raise NotImplementedError
+
+    def set_round_limit_action(self, value: str) -> str:
+        raise NotImplementedError
+
     def request_exit(self) -> None:
         """Ask the UI input loop to finish through its normal cleanup path."""
         raise NotImplementedError

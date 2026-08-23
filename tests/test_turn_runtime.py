@@ -1,7 +1,15 @@
 import asyncio
 import unittest
 
-from tinyCode.agent.events import AgentDoneEvent, ErrorEvent, HITLRequestEvent, TextDeltaEvent
+from tinyCode.agent.events import (
+    AgentDoneEvent,
+    ErrorEvent,
+    HITLRequestEvent,
+    RoundLimitDecision,
+    RoundLimitDecisionAction,
+    RoundLimitReachedEvent,
+    TextDeltaEvent,
+)
 from tinyCode.agent.runtime import TurnRuntime, TurnState
 from tinyCode.security.models import HITLDecision
 
@@ -47,6 +55,23 @@ class StallingThenSuccessLoop(FakeLoop):
             self.started.set()
             await asyncio.Event().wait()
         yield AgentDoneEvent("no_tool_call")
+
+
+class WaitingForRoundLimitLoop(FakeLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.future: asyncio.Future | None = None
+
+    async def run(self, history):
+        self.future = asyncio.get_running_loop().create_future()
+        yield RoundLimitReachedEvent(1, 1, 10, 100, False, self.future)
+        decision = await self.future
+        reason = (
+            "round_budget_stopped"
+            if decision.action == RoundLimitDecisionAction.STOP
+            else "no_tool_call"
+        )
+        yield AgentDoneEvent(reason)
 
 
 class TurnRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -111,6 +136,64 @@ class TurnRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runtime.active)
         self.assertFalse(runtime.waiting_for_approval)
         self.assertEqual(TurnState.CANCELLED, runtime.snapshot().last_outcome)
+
+    async def test_round_limit_decision_is_owned_and_resolved_by_runtime(self):
+        loop = WaitingForRoundLimitLoop()
+        runtime = TurnRuntime(loop)
+
+        async def consume():
+            runtime.reserve()
+            runtime.claim()
+            return [event async for event in runtime.run(object())]
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if runtime.waiting_for_round_limit:
+                break
+            await asyncio.sleep(0)
+
+        self.assertTrue(runtime.waiting_for_round_limit)
+        self.assertTrue(runtime.resolve_round_limit(RoundLimitDecision(
+            RoundLimitDecisionAction.EXTEND,
+        )))
+        await task
+
+        self.assertFalse(runtime.waiting_for_round_limit)
+        self.assertEqual(TurnState.COMPLETED, runtime.snapshot().last_outcome)
+
+    async def test_stopping_at_soft_budget_is_paused_not_completed(self):
+        loop = WaitingForRoundLimitLoop()
+        runtime = TurnRuntime(loop)
+
+        async def consume():
+            runtime.reserve()
+            runtime.claim()
+            return [event async for event in runtime.run(object())]
+
+        task = asyncio.create_task(consume())
+        for _ in range(100):
+            if runtime.waiting_for_round_limit:
+                break
+            await asyncio.sleep(0)
+        runtime.resolve_round_limit(RoundLimitDecision(
+            RoundLimitDecisionAction.STOP,
+        ))
+        await task
+
+        self.assertEqual(TurnState.PAUSED, runtime.snapshot().last_outcome)
+
+    async def test_hard_round_limit_has_distinct_terminal_state(self):
+        runtime = TurnRuntime(FakeLoop([AgentDoneEvent("hard_max_rounds")]))
+        runtime.reserve()
+        runtime.claim()
+
+        await self._collect(runtime)
+
+        self.assertEqual(TurnState.LIMIT_REACHED, runtime.snapshot().last_outcome)
+
+    @staticmethod
+    async def _collect(runtime: TurnRuntime):
+        return [event async for event in runtime.run(object())]
 
     async def test_exception_becomes_error_event_and_next_turn_can_start(self):
         runtime = TurnRuntime(FakeLoop(error=RuntimeError("disconnected")))

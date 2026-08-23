@@ -1,7 +1,7 @@
 """Agent event types — the event stream contract between Agent Loop and TUI."""
 
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
 
 from tinyCode.providers.base import ToolCall
 from tinyCode.tools.base import ToolResult
@@ -49,7 +49,7 @@ class ToolBlockedEvent:
 @dataclass
 class AgentDoneEvent:
     """Agent 循环终止。"""
-    reason: str  # "no_tool_call", "max_rounds", "cancelled"
+    reason: str  # completed, paused, hard-limit, or cancelled reason
 
     @property
     def is_normal(self) -> bool:
@@ -69,6 +69,42 @@ class RoundStartEvent:
     """新一轮 ReAct 回合开始。"""
     round_number: int
     max_rounds: int
+
+
+class RoundLimitDecisionAction(Enum):
+    """User choice after the current task consumes its soft round budget."""
+
+    EXTEND = "extend"
+    AUTO = "auto"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class RoundLimitDecision:
+    action: RoundLimitDecisionAction
+    requested_limit: int | None = None
+
+
+@dataclass
+class RoundLimitReachedEvent:
+    """The task is incomplete and is waiting for a round-budget decision."""
+
+    round_number: int
+    current_limit: int
+    extension: int
+    hard_limit: int
+    stalled: bool
+    future: object  # asyncio.Future[RoundLimitDecision]
+
+
+@dataclass
+class RoundLimitExtendedEvent:
+    """The in-flight task received more rounds without restarting."""
+
+    previous_limit: int
+    new_limit: int
+    hard_limit: int
+    automatic: bool
 
 
 @dataclass
@@ -115,6 +151,8 @@ AgentEvent = (
     | AgentDoneEvent
     | ErrorEvent
     | RoundStartEvent
+    | RoundLimitReachedEvent
+    | RoundLimitExtendedEvent
     | PlanOnlyToggleEvent
     | HITLRequestEvent
     | TruncationEvent

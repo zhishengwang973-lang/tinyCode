@@ -222,6 +222,9 @@ class FakeUI(UIControl):
     def __init__(self):
         self.injected: list[str] = []
         self.max_rounds = 30
+        self.round_extension = 10
+        self.hard_max_rounds = 100
+        self.round_limit_action = "ask"
         self.exit_requested = False
 
     def show_system_message(self, text: str) -> None:
@@ -262,6 +265,27 @@ class FakeUI(UIControl):
 
     def set_max_rounds(self, value: int) -> int:
         self.max_rounds = value
+        return value
+
+    def get_round_extension(self) -> int:
+        return self.round_extension
+
+    def set_round_extension(self, value: int) -> int:
+        self.round_extension = value
+        return value
+
+    def get_hard_max_rounds(self) -> int:
+        return self.hard_max_rounds
+
+    def set_hard_max_rounds(self, value: int) -> int:
+        self.hard_max_rounds = value
+        return value
+
+    def get_round_limit_action(self) -> str:
+        return self.round_limit_action
+
+    def set_round_limit_action(self, value: str) -> str:
+        self.round_limit_action = value
         return value
 
     def request_exit(self) -> None:
@@ -431,10 +455,40 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         _, changed = await dispatcher.dispatch("/config max-rounds 50")
         _, current = await dispatcher.dispatch("/cfg max_rounds")
 
-        self.assertEqual("当前会话最大轮次: 30", initial)
+        self.assertEqual("当前会话初始轮次预算: 30", initial)
         self.assertIn("已设为 50", changed)
-        self.assertEqual("当前会话最大轮次: 50", current)
+        self.assertEqual("当前会话初始轮次预算: 50", current)
         self.assertEqual(50, ui.max_rounds)
+
+    async def test_config_round_budget_policy_can_be_changed_for_session(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(config_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, extension = await dispatcher.dispatch("/config round-extension 15")
+        _, hard_limit = await dispatcher.dispatch("/config hard-max-rounds 80")
+        _, action = await dispatcher.dispatch("/config round-limit-action auto")
+        _, summary = await dispatcher.dispatch("/config")
+
+        self.assertIn("续跑步长已设为 15", extension)
+        self.assertIn("轮次硬上限已设为 80", hard_limit)
+        self.assertIn("预算耗尽策略已设为 auto", action)
+        self.assertIn("初始预算: 30", summary)
+        self.assertIn("续跑步长: 15", summary)
+        self.assertIn("硬上限: 80", summary)
+        self.assertIn("达到预算时: auto", summary)
+
+    async def test_config_max_rounds_supports_increment_syntax(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(config_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, result = await dispatcher.dispatch("/config max-rounds +10")
+
+        self.assertIn("已设为 40", result)
+        self.assertEqual(40, ui.max_rounds)
 
     async def test_config_max_rounds_rejects_invalid_values(self):
         ui = FakeUI()

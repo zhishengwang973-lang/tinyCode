@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tinyCode.config.constants import DEFAULT_NOTES_ENABLED
 from tinyCode.config.loader import ConfigError, load_config
 
 
@@ -45,8 +46,11 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("openai", config.active_provider)
             self.assertEqual("https://api.openai.com", config.providers[0].base_url)
             self.assertEqual(30, config.max_rounds)
+            self.assertEqual(10, config.round_extension)
+            self.assertEqual(100, config.hard_max_rounds)
+            self.assertEqual("ask", config.round_limit_action)
             self.assertEqual("normal", config.security_level)
-            self.assertTrue(config.notes_enabled)
+            self.assertEqual(DEFAULT_NOTES_ENABLED, config.notes_enabled)
 
     def test_notes_enabled_is_configurable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +146,62 @@ class ConfigLoaderTests(unittest.TestCase):
             )
             with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
                 with self.assertRaisesRegex(ConfigError, "max_rounds"):
+                    load_config()
+
+    def test_round_budget_policy_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "max_rounds: 20\n"
+                "round_extension: 5\n"
+                "hard_max_rounds: 60\n"
+                "round_limit_action: AUTO\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertEqual(20, config.max_rounds)
+        self.assertEqual(5, config.round_extension)
+        self.assertEqual(60, config.hard_max_rounds)
+        self.assertEqual("auto", config.round_limit_action)
+
+    def test_soft_round_budget_cannot_exceed_hard_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "max_rounds: 30\n"
+                "hard_max_rounds: 20\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "hard_max_rounds"):
+                    load_config()
+
+    def test_round_limit_action_rejects_unknown_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "round_limit_action: forever\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "ask、auto 或 stop"):
                     load_config()
 
     def test_provider_entry_must_be_mapping(self):

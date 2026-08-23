@@ -148,10 +148,13 @@ providers:
     base_url: http://localhost:11434/v1
     api_key: ollama
 
-active_provider: claude   # ← 当前使用哪个
-max_rounds: 30            # 单个任务最大 Agent 轮数，范围 1-100
-security_level: normal    # strict / normal / permissive
-notes_enabled: true       # 持久笔记开关，仅在全局配置中生效
+active_provider: claude    # ← 当前使用哪个
+max_rounds: 30             # 单个任务的初始软预算
+round_extension: 10        # 每次续跑增加的轮数
+hard_max_rounds: 100       # 单个任务的绝对硬上限，范围 1-100
+round_limit_action: ask    # ask / auto / stop
+security_level: normal     # strict / normal / permissive
+notes_enabled: true        # 持久笔记开关，仅在全局配置中生效
 ```
 
 密钥支持三种互斥写法：`api_key_env: ENV_NAME`、`api_key: ${ENV_NAME}`，或安装
@@ -227,7 +230,7 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 | `/compress` | `zip` | 手动触发上下文压缩 |
 | `/mode [plan\|security]` | — | 切换模式 |
 | `/status` | `st info` | 显示综合状态 |
-| `/config max-rounds [N]` | `cfg` | 查看或修改当前会话最大轮次 |
+| `/config [轮次选项] [值]` | `cfg` | 查看或修改当前会话轮次预算策略 |
 | `/prompt [部分]` | `system-prompt sp` | 查看当前实际生效的系统提示词 |
 | `/exit` | `quit q` | 保存会话并安全退出 |
 | `/session [list\|load\|new\|delete]` | `sess` | 管理会话 |
@@ -240,8 +243,23 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 | `/team [list\|show\|dir\|run]` | `tm` | Team 管理和执行 |
 
 `/prompt` 只读取当前系统上下文，不会请求模型。可查看 `all`、`base`、
-`instructions`、`skills`、`environment` 或 `injection`；可连续执行，不会消耗对话轮次。
-`/config max-rounds 50` 只影响当前启动会话，重启后恢复 YAML 中的 `max_rounds`。
+`instructions`、`skills`、`environment`、`notes` 或 `injection`；可连续执行，不会消耗对话轮次。
+
+`/config` 可以查看当前轮次策略，也可以修改 `max-rounds`、`round-extension`、
+`hard-max-rounds` 和 `round-limit-action`。这些修改只影响当前启动会话，重启后恢复 YAML。
+任务达到软预算且仍在调用工具时，`ask` 会暂停并提供以下选择：
+
+```text
+A                 # 按 round_extension 再执行一段
+C                 # 自动分段续跑到完成或硬上限
+S                 # 暂停并保留进度
++20               # 本任务再增加 20 轮
+/rounds 60        # 把本任务目标预算设为 60 轮
+```
+
+续跑不会创建新任务，也不会丢失历史、工具结果或本轮统计。如果最近三轮重复完全相同的
+工具调用，自动续跑会暂停并重新询问。达到 `hard_max_rounds` 时始终停止，并明确显示任务
+尚未完成。
 
 ---
 
