@@ -36,6 +36,7 @@ class ToolCallEvent:
 class ToolResultEvent:
     """工具执行完毕，返回结果。"""
     tool_name: str
+    call_id: str
     result: ToolResult
 
 

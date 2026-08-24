@@ -51,6 +51,49 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("ask", config.round_limit_action)
             self.assertEqual("normal", config.security_level)
             self.assertEqual(DEFAULT_NOTES_ENABLED, config.notes_enabled)
+            self.assertTrue(config.tracing.enabled)
+            self.assertFalse(config.tracing.capture_payloads)
+
+    def test_tracing_is_configurable_and_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "tracing:\n"
+                "  enabled: false\n"
+                "  capture_payloads: true\n"
+                "  retention_days: 30\n"
+                "  max_files: 250\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertFalse(config.tracing.enabled)
+        self.assertTrue(config.tracing.capture_payloads)
+        self.assertEqual(30, config.tracing.retention_days)
+        self.assertEqual(250, config.tracing.max_files)
+
+    def test_tracing_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "tracing:\n"
+                "  max_files: 0\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "tracing.max_files"):
+                    load_config()
 
     def test_notes_enabled_is_configurable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,6 +314,38 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("strict", config.security_level)
             self.assertEqual(12, config.max_rounds)
             self.assertEqual("global-secret", config.providers[0].api_key)
+
+    def test_project_cannot_enable_global_trace_payload_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "project"
+            (home / ".tinyCode").mkdir(parents=True)
+            project.mkdir()
+            (home / ".tinyCode" / "config.yaml").write_text(
+                "providers:\n"
+                "  - name: global\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "tracing:\n"
+                "  enabled: true\n"
+                "  capture_payloads: false\n",
+                encoding="utf-8",
+            )
+            (project / ".tinyCode.yaml").write_text(
+                "tracing:\n"
+                "  capture_payloads: true\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": ""}, clear=False), \
+                 patch("tinyCode.config.loader.Path.home", return_value=home), \
+                 patch("tinyCode.config.loader.Path.cwd", return_value=project):
+                config = load_config()
+
+            self.assertTrue(config.tracing.enabled)
+            self.assertFalse(config.tracing.capture_payloads)
 
     def test_project_provider_never_inherits_global_api_key(self):
         with tempfile.TemporaryDirectory() as tmp:

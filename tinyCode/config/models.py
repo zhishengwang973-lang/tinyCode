@@ -1,6 +1,6 @@
 """Configuration data models."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tinyCode.config.constants import (
     DEFAULT_HARD_MAX_ROUNDS,
@@ -23,6 +23,15 @@ class ProviderConfig(BaseModel):
     context_window: int | None = None
 
 
+class TracingConfig(BaseModel):
+    """Local execution-trace configuration."""
+
+    enabled: bool = True
+    capture_payloads: bool = False
+    retention_days: int = 14
+    max_files: int = 100
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -34,3 +43,4 @@ class AppConfig(BaseModel):
     round_limit_action: str = DEFAULT_ROUND_LIMIT_ACTION
     security_level: str = DEFAULT_SECURITY_LEVEL
     notes_enabled: bool = DEFAULT_NOTES_ENABLED
+    tracing: TracingConfig = Field(default_factory=TracingConfig)

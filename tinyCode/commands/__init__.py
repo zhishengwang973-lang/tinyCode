@@ -22,6 +22,7 @@ def register_builtins(
     task_manager=None,
     worktree_manager=None,
     team_runner=None,
+    trace_recorder=None,
 ) -> None:
     """Register all built-in commands with the given registry."""
     from tinyCode.commands.builtin.help_cmd import create as _help
@@ -41,6 +42,7 @@ def register_builtins(
     from tinyCode.commands.builtin.tasks_cmd import create as _tasks
     from tinyCode.commands.builtin.worktree_cmd import create as _worktree
     from tinyCode.commands.builtin.team_cmd import create as _team
+    from tinyCode.commands.builtin.trace_cmd import create as _trace
 
     registry.register(_help(registry))
     registry.register(_compress(ui))
@@ -63,3 +65,5 @@ def register_builtins(
     if worktree_manager:
         registry.register(_worktree(worktree_manager, workspace_changed=ui.workspace_changed))
     registry.register(_team(runner=team_runner, confirmer=ui.confirm_action))
+    if trace_recorder:
+        registry.register(_trace(trace_recorder, confirmer=ui.confirm_action))

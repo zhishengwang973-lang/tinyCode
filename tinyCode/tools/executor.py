@@ -56,6 +56,12 @@ class ToolExecutor:
                     content="",
                     error=f"工具返回的 ToolResult 字段类型无效: {tool.name}",
                 )
+            if not result.success and not result.error.strip():
+                return ToolResult(
+                    success=False,
+                    content=result.content,
+                    error=f"工具 '{tool.name}' 执行失败，但未提供错误详情",
+                )
             return result
         except asyncio.TimeoutError:
             return ToolResult(

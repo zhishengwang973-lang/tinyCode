@@ -227,7 +227,23 @@ class RunCommandTool(BaseTool):
         if truncated:
             result_lines.append("\n(输出已截断)")
 
+        error = ""
+        if proc.returncode != 0:
+            if proc.returncode < 0:
+                error = f"命令被信号 {-proc.returncode} 终止"
+            else:
+                error = f"命令执行失败（退出码 {proc.returncode}）"
+            detail_source = stderr.strip() or stdout.strip()
+            if detail_source:
+                first_line = next(
+                    (line.strip() for line in detail_source.splitlines() if line.strip()),
+                    "",
+                )
+                if first_line:
+                    error += f": {first_line[:500]}"
+
         return ToolResult(
             success=proc.returncode == 0,
             content="\n".join(result_lines),
+            error=error,
         )

@@ -3,8 +3,10 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
 import httpx
 
@@ -63,6 +65,7 @@ from tinyCode.security.models import HITLDecision, SecurityLevel
 from tinyCode.tools.base import ToolResult
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tracing.recorder import TraceRecorder
 
 DEFAULT_FIRST_EVENT_TIMEOUT = 45.0
 DEFAULT_IDLE_EVENT_TIMEOUT = 60.0
@@ -112,6 +115,7 @@ class AgentLoop:
         retry_delay: float = DEFAULT_RETRY_DELAY,
         max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
         compressor: ContextCompressor | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self._provider = provider
         self._tool_registry = tool_registry
@@ -143,6 +147,7 @@ class AgentLoop:
         self._retry_delay = max(0.0, retry_delay)
         self._max_response_chars = max(1, max_response_chars)
         self._compressor = compressor
+        self._trace_recorder = trace_recorder
         self._context_assembler = PromptContextAssembler(
             protocol=provider.config.protocol,
             prompt_builder=prompt_builder,
@@ -381,11 +386,50 @@ class AgentLoop:
                             ensure_ascii=False,
                         ),
                     }])
-                comp = await self._compressor.check_and_compress(
-                    request_history,
-                    self._provider,
-                    extra_tokens=max(0, full_tokens - history_tokens),
+                compression_scope = (
+                    self._trace_recorder.span(
+                        "context_compression",
+                        "context_compression",
+                        {
+                            "round": round_num,
+                            "estimated_tokens": full_tokens,
+                            "context_window": getattr(
+                                self._compressor, "context_window", 0,
+                            ),
+                        },
+                    )
+                    if self._trace_recorder is not None
+                    else nullcontext(None)
                 )
+                with compression_scope as compression_span:
+                    comp = await self._compressor.check_and_compress(
+                        request_history,
+                        self._provider,
+                        extra_tokens=max(0, full_tokens - history_tokens),
+                    )
+                    if compression_span is not None:
+                        compression_usage = (
+                            TokenUsage.from_raw(
+                                getattr(self._provider, "last_usage", None)
+                            )
+                            if comp.model_request_made
+                            else TokenUsage()
+                        )
+                        compression_span.finish(
+                            "error" if comp.error else "ok",
+                            {
+                                "round": round_num,
+                                "warning_issued": comp.warning_issued,
+                                "was_compressed": comp.was_compressed,
+                                "model_request_made": comp.model_request_made,
+                                "estimated_tokens_before": comp.estimated_tokens_before,
+                                "estimated_tokens_after": comp.estimated_tokens_after,
+                                "error": comp.error,
+                                "input_tokens": compression_usage.input_tokens,
+                                "output_tokens": compression_usage.output_tokens,
+                                "total_tokens": compression_usage.total_tokens,
+                            },
+                        )
                 if comp.model_request_made:
                     self.turn_model_requests += 1
                     self.turn_usage = self.turn_usage + TokenUsage.from_raw(
@@ -419,6 +463,12 @@ class AgentLoop:
                     )
                     return
 
+            if self._trace_recorder is not None:
+                self._trace_recorder.record("round_start", attributes={
+                    "round": round_num,
+                    "max_rounds": budget.current_limit,
+                    "hard_limit": budget.hard_limit,
+                })
             yield RoundStartEvent(
                 round_number=round_num,
                 max_rounds=budget.current_limit,
@@ -440,6 +490,13 @@ class AgentLoop:
                 )
                 for info in trunc_infos:
                     from tinyCode.agent.events import TruncationEvent
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record("truncation", attributes={
+                            "round": round_num,
+                            "tool": info["tool_name"],
+                            "original_chars": info["original_chars"],
+                            "file_path": info["file_path"],
+                        })
                     yield TruncationEvent(
                         tool_name=info["tool_name"],
                         original_chars=info["original_chars"],
@@ -595,6 +652,19 @@ class AgentLoop:
                             )
                     tool_call_ids.add(raw.id)
                     tool_calls.append(raw)
+                    if self._trace_recorder is not None:
+                        attributes = self._trace_recorder.tool_attributes(
+                            raw.name, raw.input,
+                        )
+                        attributes.update({
+                            "round": round_num,
+                            "call_id": raw.id,
+                        })
+                        self._trace_recorder.record(
+                            "tool_call",
+                            name=raw.name,
+                            attributes=attributes,
+                        )
                     yield ToolCallEvent(tool_call=raw)
                 else:
                     message = (
@@ -699,7 +769,9 @@ class AgentLoop:
                 if invalid_result is not None:
                     self._append_tool_result(history, tc, invalid_result)
                     round_observations.append((tc, invalid_result))
-                    yield ToolResultEvent(tool_name=tc.name, result=invalid_result)
+                    yield ToolResultEvent(
+                        tool_name=tc.name, call_id=tc.id, result=invalid_result,
+                    )
                     continue
 
                 allowed, reason, hitl_future = self._precheck_tool(tc)
@@ -716,14 +788,18 @@ class AgentLoop:
                         blocked_result = ToolResult(success=False, content="", error="用户拒绝了该操作")
                         self._append_tool_result(history, tc, blocked_result)
                         round_observations.append((tc, blocked_result))
-                        yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
+                        yield ToolResultEvent(
+                            tool_name=tc.name, call_id=tc.id, result=blocked_result,
+                        )
                         continue
                     guard.apply_hitl(decision, tc.name, tc.input)
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
                     round_observations.append((tc, blocked_result))
-                    yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
+                    yield ToolResultEvent(
+                        tool_name=tc.name, call_id=tc.id, result=blocked_result,
+                    )
                     continue
                 valid_reads.append(tc)
 
@@ -732,7 +808,9 @@ class AgentLoop:
                 for tc, result in zip(valid_reads, results):
                     self._append_tool_result(history, tc, result)
                     round_observations.append((tc, result))
-                    yield ToolResultEvent(tool_name=tc.name, result=result)
+                    yield ToolResultEvent(
+                        tool_name=tc.name, call_id=tc.id, result=result,
+                    )
 
             # 写类 — 串行（每个执行前检查）
             for tc in writes:
@@ -748,7 +826,9 @@ class AgentLoop:
                 if invalid_result is not None:
                     self._append_tool_result(history, tc, invalid_result)
                     round_observations.append((tc, invalid_result))
-                    yield ToolResultEvent(tool_name=tc.name, result=invalid_result)
+                    yield ToolResultEvent(
+                        tool_name=tc.name, call_id=tc.id, result=invalid_result,
+                    )
                     continue
 
                 if self._plan_only and tc.name not in _PLAN_MODE_ALLOWED:
@@ -775,21 +855,27 @@ class AgentLoop:
                         blocked_result = ToolResult(success=False, content="", error="用户拒绝了该操作")
                         self._append_tool_result(history, tc, blocked_result)
                         round_observations.append((tc, blocked_result))
-                        yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
+                        yield ToolResultEvent(
+                            tool_name=tc.name, call_id=tc.id, result=blocked_result,
+                        )
                         continue
                     guard.apply_hitl(decision, tc.name, tc.input)
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
                     round_observations.append((tc, blocked_result))
-                    yield ToolResultEvent(tool_name=tc.name, result=blocked_result)
+                    yield ToolResultEvent(
+                        tool_name=tc.name, call_id=tc.id, result=blocked_result,
+                    )
                     continue
 
                 result = await self._execute_tool_with_hooks(tc)
 
                 self._append_tool_result(history, tc, result)
                 round_observations.append((tc, result))
-                yield ToolResultEvent(tool_name=tc.name, result=result)
+                yield ToolResultEvent(
+                    tool_name=tc.name, call_id=tc.id, result=result,
+                )
 
             deferred_count = history.flush_steering()
             if deferred_count:
@@ -1006,6 +1092,12 @@ class AgentLoop:
     async def _fire_round_end(
         self, round_number: int, tool_calls_count: int, outcome: str,
     ) -> None:
+        if self._trace_recorder is not None:
+            self._trace_recorder.record("round_end", status=outcome, attributes={
+                "round": round_number,
+                "tool_calls": tool_calls_count,
+                "outcome": outcome,
+            })
         if self._hook_engine:
             await self._hook_engine.fire(HookEvent.ROUND_END, {
                 "round_number": round_number,
@@ -1016,11 +1108,16 @@ class AgentLoop:
     async def _fire_error(
         self, message: str, code: str, round_number: int = 0,
     ) -> None:
-        if not self._hook_engine:
-            return
-        await self._hook_engine.fire(HookEvent.SYSTEM_ERROR, {
-            "error": message, "code": code, "round_number": round_number,
-        })
+        if self._trace_recorder is not None:
+            self._trace_recorder.record("error", status="error", attributes={
+                "error": message,
+                "code": code,
+                "round": round_number,
+            })
+        if self._hook_engine:
+            await self._hook_engine.fire(HookEvent.SYSTEM_ERROR, {
+                "error": message, "code": code, "round_number": round_number,
+            })
         if round_number:
             await self._fire_round_end(round_number, 0, "error")
 
@@ -1052,57 +1149,133 @@ class AgentLoop:
         attempt = 0
         while True:
             emitted = False
+            first_token_ms: float | None = None
             # Count actual provider attempts, including retries that fail before
             # producing their first event.
             self.turn_model_requests += 1
-            self._provider.begin_request()
-            stream = self._provider.chat_stream(
-                messages=messages,
-                tools=tools,
-                system_blocks=system_blocks,
-            ).__aiter__()
-            try:
-                while True:
-                    timeout = (
-                        self._idle_event_timeout
-                        if emitted
-                        else self._first_event_timeout
-                    )
-                    try:
-                        item = await asyncio.wait_for(stream.__anext__(), timeout)
-                    except StopAsyncIteration:
-                        return
-                    emitted = True
-                    yield item
-            except asyncio.CancelledError:
-                await self._close_provider_stream(stream)
-                raise
-            except Exception as exc:
-                await self._close_provider_stream(stream)
-                retryable = (
-                    isinstance(
-                        exc,
-                        (asyncio.TimeoutError, httpx.RequestError, ConnectionError, OSError),
-                    )
-                    or isinstance(exc, ProviderError) and exc.retryable
+            request_number = self.turn_model_requests
+            request_started = monotonic()
+            trace_scope = (
+                self._trace_recorder.span(
+                    f"request #{request_number}",
+                    "model_request",
+                    {
+                        "round": self._active_round,
+                        "request": request_number,
+                        "retry": attempt,
+                        "message_count": len(messages),
+                        "tool_schema_count": len(tools or []),
+                        "model": self._provider.config.model,
+                    },
                 )
-                if not emitted and retryable and attempt < self._provider_retries:
-                    attempt += 1
-                    if self._retry_delay:
-                        await asyncio.sleep(self._retry_delay * attempt)
-                    continue
-
-                if isinstance(exc, asyncio.TimeoutError):
-                    stage = "首个响应" if not emitted else "流式响应"
-                    timeout = (
-                        self._first_event_timeout
-                        if not emitted
-                        else self._idle_event_timeout
+                if self._trace_recorder is not None
+                else nullcontext(None)
+            )
+            with trace_scope as trace_span:
+                self._provider.begin_request()
+                stream = self._provider.chat_stream(
+                    messages=messages,
+                    tools=tools,
+                    system_blocks=system_blocks,
+                ).__aiter__()
+                try:
+                    while True:
+                        timeout = (
+                            self._idle_event_timeout
+                            if emitted
+                            else self._first_event_timeout
+                        )
+                        try:
+                            item = await asyncio.wait_for(stream.__anext__(), timeout)
+                        except StopAsyncIteration:
+                            usage = TokenUsage.from_raw(
+                                getattr(self._provider, "last_usage", None)
+                            )
+                            if trace_span is not None:
+                                trace_span.finish("ok", {
+                                    "round": self._active_round,
+                                    "request": request_number,
+                                    "retry": attempt,
+                                    "first_token_ms": first_token_ms,
+                                    "input_tokens": usage.input_tokens,
+                                    "output_tokens": usage.output_tokens,
+                                    "total_tokens": usage.total_tokens,
+                                    "usage_available": usage.available,
+                                })
+                            return
+                        if not emitted:
+                            first_token_ms = max(
+                                0.0, (monotonic() - request_started) * 1_000,
+                            )
+                            if trace_span is not None:
+                                trace_span.event("model_first_token", {
+                                    "round": self._active_round,
+                                    "request": request_number,
+                                    "first_token_ms": first_token_ms,
+                                })
+                        emitted = True
+                        yield item
+                except asyncio.CancelledError:
+                    await self._close_provider_stream(stream)
+                    if trace_span is not None:
+                        trace_span.finish("cancelled", {
+                            "round": self._active_round,
+                            "request": request_number,
+                            "first_token_ms": first_token_ms,
+                        })
+                    raise
+                except Exception as exc:
+                    await self._close_provider_stream(stream)
+                    retryable = (
+                        isinstance(
+                            exc,
+                            (
+                                asyncio.TimeoutError,
+                                httpx.RequestError,
+                                ConnectionError,
+                                OSError,
+                            ),
+                        )
+                        or isinstance(exc, ProviderError) and exc.retryable
                     )
-                    raise TimeoutError(
-                        f"模型{stage}超时（{timeout:g} 秒）"
-                    ) from exc
-                raise
+                    will_retry = (
+                        not emitted and retryable and attempt < self._provider_retries
+                    )
+                    if trace_span is not None:
+                        trace_span.finish("retry" if will_retry else "error", {
+                            "round": self._active_round,
+                            "request": request_number,
+                            "retry": attempt,
+                            "first_token_ms": first_token_ms,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                            "retryable": retryable,
+                        })
+                    if will_retry:
+                        attempt += 1
+                        if self._trace_recorder is not None:
+                            self._trace_recorder.record("retry", status="retry", attributes={
+                                "round": self._active_round,
+                                "request": request_number,
+                                "next_attempt": attempt,
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            })
+                        if self._retry_delay:
+                            await asyncio.sleep(self._retry_delay * attempt)
+                        continue
+
+                    if isinstance(exc, asyncio.TimeoutError):
+                        stage = "首个响应" if not emitted else "流式响应"
+                        timeout = (
+                            self._first_event_timeout
+                            if not emitted
+                            else self._idle_event_timeout
+                        )
+                        raise TimeoutError(
+                            f"模型{stage}超时（{timeout:g} 秒）"
+                        ) from exc
+                    raise
 
     @staticmethod
     async def _close_provider_stream(stream) -> None:
@@ -1225,27 +1398,53 @@ class AgentLoop:
         return await asyncio.gather(*[_one(tc) for tc in tool_calls])
 
     async def _execute_tool_with_hooks(self, tc: ToolCall) -> ToolResult:
-        intercept_reason: str | None = None
-        if self._hook_engine:
-            intercept_reason = await self._hook_engine.fire(
-                HookEvent.TOOL_PRE_EXEC,
-                {"tool_name": tc.name, "params": tc.input},
-            )
+        trace_attributes = (
+            self._trace_recorder.tool_attributes(tc.name, tc.input)
+            if self._trace_recorder is not None
+            else {}
+        )
+        trace_attributes.update({
+            "round": self._active_round,
+            "call_id": tc.id,
+        })
+        trace_scope = (
+            self._trace_recorder.span(tc.name, "tool", trace_attributes)
+            if self._trace_recorder is not None
+            else nullcontext(None)
+        )
+        with trace_scope as trace_span:
+            intercept_reason: str | None = None
+            if self._hook_engine:
+                intercept_reason = await self._hook_engine.fire(
+                    HookEvent.TOOL_PRE_EXEC,
+                    {"tool_name": tc.name, "params": tc.input},
+                )
 
-        if intercept_reason:
-            result = ToolResult(success=False, content="", error=intercept_reason)
-        else:
-            tool = self._tool_registry.get(tc.name)
-            if tool is None:
-                result = ToolResult(success=False, content="", error=f"未知工具: {tc.name}")
+            if intercept_reason:
+                result = ToolResult(success=False, content="", error=intercept_reason)
             else:
-                result = await self._tool_executor.execute(tool, tc.input)
+                tool = self._tool_registry.get(tc.name)
+                if tool is None:
+                    result = ToolResult(
+                        success=False, content="", error=f"未知工具: {tc.name}",
+                    )
+                else:
+                    result = await self._tool_executor.execute(tool, tc.input)
 
-        if self._hook_engine:
-            await self._hook_engine.fire(HookEvent.TOOL_POST_EXEC, {
-                "tool_name": tc.name, "params": tc.input,
-                "success": result.success,
-            })
+            if self._hook_engine:
+                await self._hook_engine.fire(HookEvent.TOOL_POST_EXEC, {
+                    "tool_name": tc.name, "params": tc.input,
+                    "success": result.success,
+                })
+
+            if trace_span is not None:
+                trace_span.finish("ok" if result.success else "error", {
+                    "round": self._active_round,
+                    "call_id": tc.id,
+                    "success": result.success,
+                    "content_chars": len(result.content),
+                    "error": result.error,
+                })
 
         return result
 
@@ -1254,6 +1453,13 @@ class AgentLoop:
             f"Plan-only 模式已开启，'{tc.name}' 是写入类工具，已被拦截。"
             f"请先关闭 plan-only 开关再执行修改操作。"
         )
+        if self._trace_recorder is not None:
+            self._trace_recorder.record("tool_blocked", status="blocked", attributes={
+                "round": self._active_round,
+                "tool": tc.name,
+                "call_id": tc.id,
+                "reason": reason,
+            })
         return ToolBlockedEvent(
             tool_name=tc.name, reason=reason,
         )

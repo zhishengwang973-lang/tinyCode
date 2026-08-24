@@ -41,6 +41,7 @@ from tinyCode.tools import (
     WebFetchTool,
 )
 from tinyCode.tui.app import TinyCodeTUI
+from tinyCode.tracing import TraceRecorder
 
 
 class _CleanupStack:
@@ -197,6 +198,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
 
     # 7. Tool registry (create early — needed by skills MCP subagent)
     tool_registry = _create_tool_registry(truncator.storage_dir)
+    trace_recorder = TraceRecorder(app_config.tracing, Path.cwd())
 
     # 7.5. Skills (needs tool_registry for whitelist validation)
     skill_loader = SkillLoader()
@@ -250,7 +252,13 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
     # Sub-agent system
     role_loader = RoleLoader()
     roles = role_loader.load_all()
-    sub_runner = SubAgentRunner(provider, tool_registry, tool_executor, roles)
+    sub_runner = SubAgentRunner(
+        provider,
+        tool_registry,
+        tool_executor,
+        roles,
+        trace_recorder=trace_recorder,
+    )
     task_manager = BackgroundTaskManager()
     cleanup.add("sub-agent", task_manager.shutdown)
     sub_agent_tool = SubAgentTool(sub_runner, task_manager, roles, history)
@@ -305,6 +313,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             )
             if resumed:
                 security_guard.set_project_root(Path.cwd())
+                trace_recorder.set_project_root(Path.cwd())
                 if note_manager is not None:
                     note_manager.set_cwd(Path.cwd())
             else:
@@ -328,6 +337,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         hard_max_rounds=app_config.hard_max_rounds,
         round_limit_action=app_config.round_limit_action,
         compressor=compressor,
+        trace_recorder=trace_recorder,
     )
 
     tui_ref: dict[str, TinyCodeTUI] = {}
@@ -379,6 +389,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         task_manager=task_manager,
         worktree_manager=worktree_manager,
         team_runner=team_runner,
+        trace_recorder=trace_recorder,
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui

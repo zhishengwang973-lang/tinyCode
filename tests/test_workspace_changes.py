@@ -38,6 +38,7 @@ class WorkspaceSnapshotTests(unittest.TestCase):
                 root / "node_modules" / "pkg" / "index.js",
                 root / "src" / "__pycache__" / "module.pyc",
                 root / ".tinyCode" / "tool_results" / "large.txt",
+                root / ".tinyCode" / "traces" / "task.jsonl",
             )
             for path in ignored:
                 path.parent.mkdir(parents=True, exist_ok=True)

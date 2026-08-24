@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from tinyCode.config.models import AppConfig, ProviderConfig
+from tinyCode.config.models import AppConfig, ProviderConfig, TracingConfig
 from tinyCode.config.constants import (
     DEFAULT_HARD_MAX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
@@ -95,6 +95,12 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["notes_enabled"] = global_raw["notes_enabled"]
     else:
         merged.pop("notes_enabled", None)
+    # Trace payload capture is a user-level privacy decision. A repository may
+    # not silently enable it through project-owned configuration.
+    if "tracing" in global_raw:
+        merged["tracing"] = global_raw["tracing"]
+    else:
+        merged.pop("tracing", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -332,6 +338,30 @@ def load_config() -> AppConfig:
     if not isinstance(notes_enabled, bool):
         raise ConfigError("notes_enabled 必须是 true 或 false")
 
+    tracing_raw = raw.get("tracing", {})
+    if not isinstance(tracing_raw, dict):
+        raise ConfigError("tracing 必须是对象（mapping）")
+    tracing_enabled = tracing_raw.get("enabled", True)
+    capture_payloads = tracing_raw.get("capture_payloads", False)
+    retention_days = tracing_raw.get("retention_days", 14)
+    max_trace_files = tracing_raw.get("max_files", 100)
+    if not isinstance(tracing_enabled, bool):
+        raise ConfigError("tracing.enabled 必须是 true 或 false")
+    if not isinstance(capture_payloads, bool):
+        raise ConfigError("tracing.capture_payloads 必须是 true 或 false")
+    if (
+        isinstance(retention_days, bool)
+        or not isinstance(retention_days, int)
+        or not 1 <= retention_days <= 3650
+    ):
+        raise ConfigError("tracing.retention_days 必须是 1 到 3650 之间的整数")
+    if (
+        isinstance(max_trace_files, bool)
+        or not isinstance(max_trace_files, int)
+        or not 1 <= max_trace_files <= 10_000
+    ):
+        raise ConfigError("tracing.max_files 必须是 1 到 10000 之间的整数")
+
     return AppConfig(
         providers=providers, active_provider=active_provider,
         max_rounds=max_rounds,
@@ -340,4 +370,10 @@ def load_config() -> AppConfig:
         round_limit_action=round_limit_action,
         security_level=security_level,
         notes_enabled=notes_enabled,
+        tracing=TracingConfig(
+            enabled=tracing_enabled,
+            capture_payloads=capture_payloads,
+            retention_days=retention_days,
+            max_files=max_trace_files,
+        ),
     )

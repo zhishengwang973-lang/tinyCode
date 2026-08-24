@@ -26,7 +26,10 @@ _EXCLUDED_DIR_NAMES = {
     "target",
     "venv",
 }
-_INTERNAL_RESULT_DIR = (".tinyCode", "tool_results")
+_INTERNAL_DIRS = {
+    (".tinyCode", "tool_results"),
+    (".tinyCode", "traces"),
+}
 
 
 @dataclass(frozen=True)
@@ -126,4 +129,4 @@ def _scan_files(root: Path) -> dict[str, _FileFingerprint]:
 def _should_skip_directory(parts: tuple[str, ...]) -> bool:
     if parts[-1] in _EXCLUDED_DIR_NAMES:
         return True
-    return parts[:len(_INTERNAL_RESULT_DIR)] == _INTERNAL_RESULT_DIR
+    return parts[:2] in _INTERNAL_DIRS

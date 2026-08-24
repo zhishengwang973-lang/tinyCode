@@ -12,6 +12,7 @@ from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.base import ToolCategory
 from tinyCode.tools.context import get_workspace_root
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tracing.recorder import TraceRecorder
 
 _FORK_INSTRUCTION = """\
 [Fork 模式] 你是一个子工作器。遵守以下规则：
@@ -31,11 +32,13 @@ class SubAgentRunner:
         tool_registry: ToolRegistry,
         tool_executor: ToolExecutor,
         roles: dict[str, SubAgentRole],
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self._provider = provider
         self._tool_registry = tool_registry
         self._tool_executor = tool_executor
         self._roles = roles
+        self._trace_recorder = trace_recorder
 
     async def run(self, task: SubAgentTask, parent_history: ConversationHistory) -> str:
         """Execute a sub-agent task to completion.
@@ -115,6 +118,7 @@ class SubAgentRunner:
             security_guard=security_guard,
             environment_text=f"cwd: {workspace}",
             max_rounds=role.max_rounds if role else 3,
+            trace_recorder=self._trace_recorder,
         )
 
         final_text = ""

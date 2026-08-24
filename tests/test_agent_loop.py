@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
@@ -25,7 +26,7 @@ from tinyCode.agent.loop import AgentLoop
 from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator, TruncateConfig
-from tinyCode.config.models import ProviderConfig
+from tinyCode.config.models import ProviderConfig, TracingConfig
 from tinyCode.hooks.models import HookEvent
 from tinyCode.providers.base import BaseProvider, Message, ProviderHTTPError, ToolCall
 from tinyCode.prompts.builder import PromptBuilder
@@ -35,6 +36,7 @@ from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
 from tinyCode.tools.tool_result_read import ToolResultReadTool
 from tinyCode.tools.tool_result_search import ToolResultSearchTool
+from tinyCode.tracing.recorder import TraceRecorder
 
 
 class UnknownToolProvider(BaseProvider):
@@ -442,6 +444,27 @@ class FailedOverflowCompressor:
         )
 
 
+class TraceCompressionCompressor:
+    context_window = 1000
+
+    def __init__(self, *, model_request_made: bool) -> None:
+        self.model_request_made = model_request_made
+
+    async def check_and_compress(self, history, provider, *, extra_tokens=0):
+        if self.model_request_made:
+            provider.last_usage = {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 7,
+            }
+        return CompressionResult(
+            was_compressed=self.model_request_made,
+            estimated_tokens_before=80,
+            estimated_tokens_after=40 if self.model_request_made else 80,
+            model_request_made=self.model_request_made,
+        )
+
+
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     def _make_loop(self, provider, **kwargs):
         return AgentLoop(
@@ -472,6 +495,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_results = [event for event in events if isinstance(event, ToolResultEvent)]
 
         self.assertEqual(1, len(tool_results))
+        self.assertEqual("tool-1", tool_results[0].call_id)
         self.assertFalse(tool_results[0].result.success)
         self.assertIn("未知工具", tool_results[0].result.error)
 
@@ -1394,6 +1418,138 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, loop.turn_model_requests)
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
         self.assertEqual("recovered", history.get_messages()[-1]["content"])
+
+    async def test_trace_records_real_model_request_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("hello", model="test-model")
+            loop = self._make_loop(
+                ToolCaptureProvider(),
+                trace_recorder=recorder,
+            )
+            history = ConversationHistory()
+            history.add_user_message("hello")
+
+            events = [event async for event in loop.run(history)]
+            recorder.finish_task(handle, status=events[-1].reason)
+
+            assert handle is not None
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            starts = [
+                row for row in rows
+                if row["event"] == "span_start" and row["kind"] == "model_request"
+            ]
+            ends = [
+                row for row in rows
+                if row["event"] == "span_end" and row["kind"] == "model_request"
+            ]
+
+            self.assertEqual(1, len(starts))
+            self.assertEqual(1, len(ends))
+            self.assertEqual("ok", ends[0]["status"])
+            self.assertGreaterEqual(ends[0]["attributes"]["first_token_ms"], 0)
+            self.assertTrue(any(row["event"] == "round_start" for row in rows))
+            self.assertTrue(any(row["event"] == "round_end" for row in rows))
+
+    async def test_trace_records_real_tool_execution_span(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("检查当前项目")
+            registry = ToolRegistry()
+            registry.register(ReadFixtureTool())
+            loop = AgentLoop(
+                provider=ReadToolProvider(),
+                tool_registry=registry,
+                tool_executor=ToolExecutor(),
+                prompt_builder=PromptBuilder(),
+                prompt_injector=PromptInjector(),
+                max_rounds=1,
+                round_limit_action="stop",
+                trace_recorder=recorder,
+            )
+            history = ConversationHistory()
+            history.add_user_message("检查当前项目")
+
+            events = [event async for event in loop.run(history)]
+            recorder.finish_task(handle, status=events[-1].reason)
+
+            assert handle is not None
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            tool_ends = [
+                row for row in rows
+                if row["event"] == "span_end"
+                and row["kind"] == "tool"
+                and row["name"] == "read_fixture"
+            ]
+
+            self.assertEqual(1, len(tool_ends))
+            self.assertEqual("ok", tool_ends[0]["status"])
+            self.assertTrue(tool_ends[0]["attributes"]["success"])
+
+    async def test_trace_counts_context_compression_model_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("compress context")
+            loop = self._make_loop(
+                ToolCaptureProvider(),
+                compressor=TraceCompressionCompressor(model_request_made=True),
+                trace_recorder=recorder,
+            )
+            history = ConversationHistory()
+            history.add_user_message("compress context")
+
+            events = [event async for event in loop.run(history)]
+            recorder.finish_task(handle, status=events[-1].reason)
+
+            assert handle is not None
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            compression_end = next(
+                row for row in rows
+                if row["event"] == "span_end"
+                and row["kind"] == "context_compression"
+            )
+            self.assertTrue(compression_end["attributes"]["model_request_made"])
+            self.assertEqual(7, compression_end["attributes"]["total_tokens"])
+            self.assertEqual(2, loop.turn_model_requests)
+
+    async def test_trace_does_not_reuse_stale_usage_without_compression_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("no compression")
+            provider = ToolCaptureProvider()
+            provider.last_usage = {"total_tokens": 999}
+            loop = self._make_loop(
+                provider,
+                compressor=TraceCompressionCompressor(model_request_made=False),
+                trace_recorder=recorder,
+            )
+            history = ConversationHistory()
+            history.add_user_message("no compression")
+
+            events = [event async for event in loop.run(history)]
+            recorder.finish_task(handle, status=events[-1].reason)
+
+            assert handle is not None
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            compression_end = next(
+                row for row in rows
+                if row["event"] == "span_end"
+                and row["kind"] == "context_compression"
+            )
+            self.assertFalse(compression_end["attributes"]["model_request_made"])
+            self.assertEqual(0, compression_end["attributes"]["total_tokens"])
 
     async def test_idle_timeout_after_output_does_not_retry_or_duplicate_text(self):
         provider = StalledAfterOutputProvider()

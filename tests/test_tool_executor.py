@@ -41,6 +41,12 @@ class MalformedResultTool(RecordingTool):
         return ToolResult(success=True, content=["not text"], error="")
 
 
+class SilentFailureTool(RecordingTool):
+    async def execute(self, **kwargs):
+        self.executed = True
+        return ToolResult(success=False, content="partial output", error="")
+
+
 class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def test_execute_returns_structured_failure_when_tool_is_missing(self):
         result = await ToolExecutor().execute(None, {})
@@ -72,6 +78,13 @@ class ToolExecutorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.success)
         self.assertIn("字段类型无效", result.error)
+
+    async def test_execute_adds_fallback_error_for_silent_tool_failure(self):
+        result = await ToolExecutor().execute(SilentFailureTool(), {})
+
+        self.assertFalse(result.success)
+        self.assertEqual("partial output", result.content)
+        self.assertIn("未提供错误详情", result.error)
 
 
 if __name__ == "__main__":

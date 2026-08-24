@@ -45,6 +45,7 @@ from tinyCode.security.models import HITLDecision, SecurityLevel
 from tinyCode.tui.render import STYLE
 from tinyCode.tui.metrics import TurnMetrics
 from tinyCode.tui.workspace_changes import WorkspaceChanges, WorkspaceSnapshot
+from tinyCode.tracing.recorder import TraceHandle, TraceRecorder
 
 if TYPE_CHECKING:
     from tinyCode.agent.loop import AgentLoop
@@ -146,6 +147,7 @@ class TinyCodeTUI(UIControl):
         task_manager=None,
         worktree_manager=None,
         team_runner=None,
+        trace_recorder: TraceRecorder | None = None,
         console: Console | None = None,
         prompt_session: Any | None = None,
     ) -> None:
@@ -159,6 +161,7 @@ class TinyCodeTUI(UIControl):
         self._provider_name = provider_name
         self._model = model
         self._mcp_server_count = mcp_server_count
+        self._trace_recorder = trace_recorder
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -169,6 +172,7 @@ class TinyCodeTUI(UIControl):
             task_manager=task_manager,
             worktree_manager=worktree_manager,
             team_runner=team_runner,
+            trace_recorder=trace_recorder,
         )
         if skill_registry:
             for meta in skill_registry.list_available():
@@ -361,6 +365,11 @@ class TinyCodeTUI(UIControl):
         cancelled = self._runtime.cancel()
         if cancelled:
             discarded = self._history.discard_steering_messages()
+            if self._trace_recorder is not None:
+                self._trace_recorder.record(
+                    "cancellation_requested",
+                    attributes={"discarded_steering_messages": discarded},
+                )
             self._status_text = "正在取消当前任务"
             if discarded:
                 self._print_info(f"已丢弃 {discarded} 条尚未注入的追加指令")
@@ -377,10 +386,10 @@ class TinyCodeTUI(UIControl):
         return decision != HITLDecision.DENY
 
     def workspace_changed(self) -> None:
-        from pathlib import Path
-
         workspace = Path.cwd().resolve()
         self._agent_loop.set_workspace(workspace)
+        if self._trace_recorder is not None:
+            self._trace_recorder.set_project_root(workspace)
         if self._note_manager is not None:
             self._note_manager.set_cwd(workspace)
 
@@ -548,6 +557,11 @@ class TinyCodeTUI(UIControl):
             return
         self._history.queue_steering_message(text)
         count = getattr(self._history, "steering_count", 1)
+        if self._trace_recorder is not None:
+            self._trace_recorder.record(
+                "steering_queued",
+                attributes={"characters": len(text), "queued_messages": count},
+            )
         self._print_info(
             f"↪ 已排队追加指令（当前等待 {count} 条），"
             "将在本轮模型/工具步骤完成后注入"
@@ -572,6 +586,9 @@ class TinyCodeTUI(UIControl):
             return
         metrics = TurnMetrics()
         workspace_snapshot: WorkspaceSnapshot | None = None
+        trace_handle: TraceHandle | None = None
+        trace_status = "error"
+        trace_error = ""
         response_started = False
         stream_line_open = False
         current_response = ""
@@ -580,6 +597,15 @@ class TinyCodeTUI(UIControl):
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
+            if self._trace_recorder is not None:
+                trace_handle = self._trace_recorder.begin_task(
+                    text,
+                    session_id=str(
+                        getattr(self._session_store, "current_id", "") or ""
+                    ),
+                    model=self._model,
+                    context_window=int(self._compressor.context_window),
+                )
             if display_user:
                 self._print_user(text)
             self._history.flush_deferred()
@@ -622,6 +648,19 @@ class TinyCodeTUI(UIControl):
 
                 elif isinstance(event, ToolResultEvent):
                     metrics.record_tool_result(event.result.success)
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record(
+                            "tool_result",
+                            status="ok" if event.result.success else "error",
+                            attributes={
+                                "round": metrics.turns,
+                                "tool": event.tool_name,
+                                "call_id": event.call_id,
+                                "success": event.result.success,
+                                "content_chars": len(event.result.content),
+                                "error": event.result.error,
+                            },
+                        )
                     self._save_checkpoint()
                     state = "已返回" if event.result.success else "失败，交给模型处理"
                     self._start_progress(f"工具 {event.tool_name} {state}")
@@ -636,6 +675,19 @@ class TinyCodeTUI(UIControl):
                     )
 
                 elif isinstance(event, ContextCompressionEvent):
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record(
+                            "context_compression",
+                            status="error" if event.error else "ok",
+                            attributes={
+                                "round": metrics.turns,
+                                "warning_issued": event.warning_issued,
+                                "was_compressed": event.was_compressed,
+                                "estimated_tokens_before": event.estimated_tokens_before,
+                                "estimated_tokens_after": event.estimated_tokens_after,
+                                "error": event.error,
+                            },
+                        )
                     if event.warning_issued:
                         self._print_warning(
                             "上下文接近窗口上限，正在执行任务内压缩"
@@ -658,7 +710,19 @@ class TinyCodeTUI(UIControl):
                     stream_line_open = self._close_stream_line(stream_line_open)
                     self._stop_progress()
                     self._print_warning(event.prompt)
-                    decision = await self._prompt_for_approval()
+                    trace_scope = (
+                        self._trace_recorder.span(
+                            event.tool_name,
+                            "user_wait",
+                            {"round": metrics.turns, "wait_type": "security_approval"},
+                        )
+                        if self._trace_recorder is not None
+                        else nullcontext(None)
+                    )
+                    with trace_scope as trace_span:
+                        decision = await self._prompt_for_approval()
+                        if trace_span is not None:
+                            trace_span.finish("ok", {"decision": decision.value})
                     self._resolve_hitl(decision)
                     self._start_progress("已确认 · 继续执行")
 
@@ -674,7 +738,26 @@ class TinyCodeTUI(UIControl):
                         f"{event.round_number}/{event.current_limit}"
                         f"（硬上限 {event.hard_limit}）"
                     )
-                    decision = await self._prompt_for_round_limit(event)
+                    trace_scope = (
+                        self._trace_recorder.span(
+                            "round_limit",
+                            "user_wait",
+                            {
+                                "round": event.round_number,
+                                "current_limit": event.current_limit,
+                                "hard_limit": event.hard_limit,
+                            },
+                        )
+                        if self._trace_recorder is not None
+                        else nullcontext(None)
+                    )
+                    with trace_scope as trace_span:
+                        decision = await self._prompt_for_round_limit(event)
+                        if trace_span is not None:
+                            trace_span.finish("ok", {
+                                "decision": decision.action.value,
+                                "requested_limit": decision.requested_limit,
+                            })
                     self._runtime.resolve_round_limit(decision)
                     if decision.action == RoundLimitDecisionAction.STOP:
                         self._start_progress("正在暂停任务")
@@ -682,6 +765,13 @@ class TinyCodeTUI(UIControl):
                         self._start_progress("轮次预算已确认 · 继续执行")
 
                 elif isinstance(event, RoundLimitExtendedEvent):
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record("round_limit", attributes={
+                            "previous_limit": event.previous_limit,
+                            "new_limit": event.new_limit,
+                            "hard_limit": event.hard_limit,
+                            "automatic": event.automatic,
+                        })
                     mode = "自动续跑" if event.automatic else "本次续跑"
                     self._print_info(
                         f"轮次预算已扩展：{event.previous_limit} → "
@@ -692,6 +782,12 @@ class TinyCodeTUI(UIControl):
                     )
 
                 elif isinstance(event, ProgressWarningEvent):
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record("progress_warning", attributes={
+                            "round": metrics.turns,
+                            "state": event.state,
+                            "reasons": event.reasons,
+                        })
                     reason = "；".join(event.reasons)
                     labels = {
                         "slow": "任务进展变慢",
@@ -705,6 +801,12 @@ class TinyCodeTUI(UIControl):
                     self._start_progress("已要求模型更换重复步骤")
 
                 elif isinstance(event, SteeringAppliedEvent):
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record("steering", attributes={
+                            "round": metrics.turns,
+                            "message_count": event.message_count,
+                            "continued": event.continued,
+                        })
                     stream_line_open = self._close_stream_line(stream_line_open)
                     self._save_checkpoint()
                     if event.continued:
@@ -731,7 +833,26 @@ class TinyCodeTUI(UIControl):
                     )
                     for reason in event.reasons:
                         self._print_info(f"  - {reason}")
-                    decision = await self._prompt_for_stalled_task(event)
+                    trace_scope = (
+                        self._trace_recorder.span(
+                            "stalled_task",
+                            "user_wait",
+                            {
+                                "round": event.round_number,
+                                "state": event.state,
+                                "reasons": event.reasons,
+                            },
+                        )
+                        if self._trace_recorder is not None
+                        else nullcontext(None)
+                    )
+                    with trace_scope as trace_span:
+                        decision = await self._prompt_for_stalled_task(event)
+                        if trace_span is not None:
+                            trace_span.finish("ok", {
+                                "decision": decision.action.value,
+                                "continue_rounds": decision.continue_rounds,
+                            })
                     self._runtime.resolve_progress(decision)
                     if decision.action == TaskStalledDecisionAction.STOP:
                         self._start_progress("正在暂停任务")
@@ -741,6 +862,7 @@ class TinyCodeTUI(UIControl):
                         self._start_progress("已确认继续观察")
 
                 elif isinstance(event, AgentDoneEvent):
+                    trace_status = event.reason
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
                     await self._print_workspace_changes(workspace_snapshot)
@@ -785,6 +907,8 @@ class TinyCodeTUI(UIControl):
                     break
 
                 elif isinstance(event, ErrorEvent):
+                    trace_status = "error"
+                    trace_error = event.message
                     self._stop_progress()
                     stream_line_open = self._close_stream_line(stream_line_open)
                     await self._print_workspace_changes(workspace_snapshot)
@@ -800,11 +924,14 @@ class TinyCodeTUI(UIControl):
                     break
 
         except asyncio.CancelledError:
+            trace_status = "cancelled"
             self._stop_progress()
             self._status_text = "就绪 · 本轮已取消"
             await self._print_workspace_changes(workspace_snapshot)
             raise
         except Exception as exc:
+            trace_status = "error"
+            trace_error = f"{type(exc).__name__}: {exc}"
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
             stream_line_open = self._close_stream_line(stream_line_open)
@@ -812,6 +939,22 @@ class TinyCodeTUI(UIControl):
             self._status_text = "就绪 · 上一轮失败"
             self._print_error(f"对话执行失败: {type(exc).__name__}: {exc}")
         finally:
+            if self._trace_recorder is not None:
+                usage = getattr(self._agent_loop, "turn_usage", None)
+                self._trace_recorder.finish_task(
+                    trace_handle,
+                    status=trace_status,
+                    attributes={
+                        "turns": metrics.turns,
+                        "model_requests": max(
+                            0, getattr(self._agent_loop, "turn_model_requests", 0),
+                        ),
+                        "tool_calls": metrics.tool_calls,
+                        "successful_tool_calls": metrics.successful_tool_calls,
+                        "total_tokens": max(0, getattr(usage, "total_tokens", 0)),
+                        "error": trace_error,
+                    },
+                )
             self._runtime.release()
             try:
                 self._do_save()
@@ -1013,6 +1156,15 @@ class TinyCodeTUI(UIControl):
         changes = await asyncio.to_thread(snapshot.compare)
         if not changes.any:
             return
+        if self._trace_recorder is not None:
+            self._trace_recorder.record("file_changes", attributes={
+                "added": changes.added,
+                "modified": changes.modified,
+                "deleted": changes.deleted,
+                "added_count": len(changes.added),
+                "modified_count": len(changes.modified),
+                "deleted_count": len(changes.deleted),
+            })
         self._render_workspace_changes(changes)
 
     def _render_workspace_changes(self, changes: WorkspaceChanges) -> None:
@@ -1069,6 +1221,14 @@ class TinyCodeTUI(UIControl):
         else:
             style = "dim"
 
+        if self._trace_recorder is not None:
+            self._trace_recorder.record("context_snapshot", attributes={
+                "used_tokens": used,
+                "context_window": window,
+                "remaining_tokens": remaining,
+                "percentage": percentage,
+            })
+
         self._console.print(
             "上下文   · "
             f"≈{self._format_compact_tokens(used)} / "
@@ -1114,19 +1274,32 @@ class TinyCodeTUI(UIControl):
     # -- background lifecycle ---------------------------------------------
 
     async def _maybe_update_notes(self) -> None:
+        trace_scope = (
+            self._trace_recorder.span("automatic_notes", "notes")
+            if self._trace_recorder is not None
+            else nullcontext(None)
+        )
         try:
-            await asyncio.sleep(1.0)
-            count = await self._agent_loop.update_notes_if_needed()
-            if count > 0:
+            with trace_scope as trace_span:
+                await asyncio.sleep(1.0)
+                count = await self._agent_loop.update_notes_if_needed()
                 requests = getattr(self._note_manager, "last_update_model_requests", 0)
                 tokens = getattr(self._note_manager, "last_update_tokens", 0)
-                self._print_info(
-                    f"📝 已更新 {count} 个笔记文件 · 模型请求 {requests} 次"
-                    + (f" · Token {tokens:,}" if tokens else "")
-                )
-            errors = getattr(self._note_manager, "last_errors", [])
-            if errors:
-                self._print_warning("部分自动笔记更新失败: " + "; ".join(errors))
+                errors = getattr(self._note_manager, "last_errors", [])
+                if trace_span is not None:
+                    trace_span.finish("error" if errors else "ok", {
+                        "files_updated": count,
+                        "model_requests": requests,
+                        "total_tokens": tokens,
+                        "errors": errors,
+                    })
+                if count > 0:
+                    self._print_info(
+                        f"📝 已更新 {count} 个笔记文件 · 模型请求 {requests} 次"
+                        + (f" · Token {tokens:,}" if tokens else "")
+                    )
+                if errors:
+                    self._print_warning("部分自动笔记更新失败: " + "; ".join(errors))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

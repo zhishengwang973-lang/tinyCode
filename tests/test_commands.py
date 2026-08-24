@@ -15,6 +15,7 @@ from tinyCode.commands.builtin import (
     skill_cmd,
     tasks_cmd,
     team_cmd,
+    trace_cmd,
     worktree_cmd,
     mode_cmd,
 )
@@ -214,6 +215,7 @@ class BuiltinCommandPackageTests(unittest.TestCase):
             "status_cmd",
             "tasks_cmd",
             "team_cmd",
+            "trace_cmd",
             "worktree_cmd",
         }
 
@@ -541,6 +543,43 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(registry.lookup("config"))
         self.assertIs(registry.lookup("config"), registry.lookup("cfg"))
         self.assertIsNotNone(registry.lookup("cancel"))
+
+    async def test_trace_command_controls_and_renders_recorder(self):
+        class FakeTraceRecorder:
+            enabled = True
+            last_error = ""
+            storage_dir = Path("/tmp/traces")
+
+            def status_text(self):
+                return "Trace: ON"
+
+            def render_last_text(self):
+                return "trace tree"
+
+            def latest_path(self):
+                return Path("/tmp/traces/latest.jsonl")
+
+            def open_last(self):
+                return Path("/tmp/traces/latest.html")
+
+            def set_enabled(self, enabled):
+                self.enabled = enabled
+
+            def clear(self):
+                return 2
+
+        recorder = FakeTraceRecorder()
+        registry = CommandRegistry()
+        registry.register(trace_cmd.create(recorder))
+        dispatcher = CommandDispatcher(registry, ui=FakeUI())
+
+        self.assertEqual((True, "Trace: ON"), await dispatcher.dispatch("/trace"))
+        self.assertEqual((True, "trace tree"), await dispatcher.dispatch("/trace last"))
+        _, opened = await dispatcher.dispatch("/trace open")
+        self.assertIn("latest.html", opened)
+        _, disabled = await dispatcher.dispatch("/trace off")
+        self.assertIn("已关闭", disabled)
+        self.assertFalse(recorder.enabled)
 
     async def test_dispatch_returns_false_for_non_command_input(self):
         dispatcher = CommandDispatcher(CommandRegistry(), ui=FakeUI())

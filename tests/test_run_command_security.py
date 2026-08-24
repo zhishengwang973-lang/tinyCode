@@ -59,6 +59,19 @@ class RunCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.success)
         self.assertIn("command 不能为空", result.error)
 
+    async def test_nonzero_exit_includes_exit_code_and_stderr_in_error(self):
+        command = (
+            f'{sys.executable} -c "import sys; '
+            'sys.stderr.write(\'database unavailable\\n\'); sys.exit(7)"'
+        )
+
+        result = await RunCommandTool().execute(command)
+
+        self.assertFalse(result.success)
+        self.assertIn("退出码 7", result.error)
+        self.assertIn("database unavailable", result.error)
+        self.assertIn("--- stderr ---", result.content)
+
     async def test_large_output_is_drained_but_memory_result_is_bounded(self):
         command = (
             f'{sys.executable} -c "import sys; '

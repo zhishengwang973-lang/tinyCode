@@ -52,3 +52,11 @@ security_level: normal
 # 是否启用持久笔记（自动更新、读取及上下文注入）
 # 仅在全局 ~/.tinyCode/config.yaml 中生效，项目配置不能覆盖
 notes_enabled: true
+
+# 本地执行 Trace（仅在全局 ~/.tinyCode/config.yaml 中生效）
+# 默认只保存元数据和摘要；capture_payloads 开启后也会执行敏感字段脱敏
+tracing:
+  enabled: true
+  capture_payloads: false
+  retention_days: 14
+  max_files: 100

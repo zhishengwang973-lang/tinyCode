@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,8 @@ from tinyCode.security.models import SecurityLevel
 from tinyCode.providers.base import TokenUsage, ToolCall
 from tinyCode.tools.base import ToolResult
 from tinyCode.tui.app import TinyCodeTUI
+from tinyCode.config.models import TracingConfig
+from tinyCode.tracing.recorder import TraceRecorder
 
 
 class FakeHistory:
@@ -199,10 +202,11 @@ class MetricsAgentLoop(FakeAgentLoop):
     async def run(self, history):
         yield RoundStartEvent(round_number=1, max_rounds=30)
         for index, success in enumerate((True, True, False), start=1):
-            name = f"tool_{index}"
+            name = "shared_tool"
             yield ToolCallEvent(ToolCall(f"call_{index}", name, {}))
             yield ToolResultEvent(
                 tool_name=name,
+                call_id=f"call_{index}",
                 result=ToolResult(
                     success=success,
                     content="ok" if success else "",
@@ -225,6 +229,7 @@ class WorkspaceChangingAgentLoop(FakeAgentLoop):
         (self.root / "deleted.py").unlink()
         yield ToolResultEvent(
             tool_name="run_command",
+            call_id="call_1",
             result=ToolResult(success=True, content="ok"),
         )
         yield TextDeltaEvent("done")
@@ -364,7 +369,7 @@ class StalledAgentLoop(FakeAgentLoop):
 
 
 class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
-    def _make_tui(self, agent_loop=None, answers=()):
+    def _make_tui(self, agent_loop=None, answers=(), trace_recorder=None):
         output = io.StringIO()
         tui = TinyCodeTUI(
             agent_loop=agent_loop or FakeAgentLoop(),
@@ -374,6 +379,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             note_manager=None,
             provider_name="fake",
             model="fake",
+            trace_recorder=trace_recorder,
             console=Console(
                 file=output,
                 force_terminal=False,
@@ -548,6 +554,55 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TinyCode: done", rendered)
         self.assertIn("✓ 本轮已正常完成", rendered)
         self.assertEqual("就绪 · 上一轮已正常完成", tui._status_text)
+
+    async def test_turn_lifecycle_is_persisted_to_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            tui, _output = self._make_tui(
+                FakeAgentLoop("done"),
+                trace_recorder=recorder,
+            )
+
+            await tui._on_user_input("trace this task")
+
+            path = recorder.latest_path()
+            self.assertIsNotNone(path)
+            assert path is not None
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual("task_start", rows[0]["event"])
+            self.assertEqual("task_end", rows[-1]["event"])
+            self.assertEqual("no_tool_call", rows[-1]["status"])
+            self.assertTrue(any(row["event"] == "context_snapshot" for row in rows))
+
+    async def test_tool_result_trace_keeps_call_ids_for_same_named_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            tui, _output = self._make_tui(
+                MetricsAgentLoop(),
+                trace_recorder=recorder,
+            )
+
+            await tui._on_user_input("run concurrent tools")
+
+            path = recorder.latest_path()
+            assert path is not None
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            results = [row for row in rows if row["event"] == "tool_result"]
+            self.assertEqual(3, len(results))
+            self.assertEqual(
+                ["call_1", "call_2", "call_3"],
+                [row["attributes"]["call_id"] for row in results],
+            )
+            self.assertEqual(
+                {"shared_tool"},
+                {row["attributes"]["tool"] for row in results},
+            )
 
     async def test_completion_shows_turn_token_time_and_tool_metrics(self):
         tui, output = self._make_tui(MetricsAgentLoop())
@@ -880,25 +935,36 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["输出快速排序", "输出归并排序"], tui._history.user_messages)
 
     async def test_active_turn_accepts_steering_and_cancel_command(self):
-        loop = PausingAgentLoop()
-        tui, output = self._make_tui(
-            loop,
-            answers=[
-                "开始长任务",
-                "不要修改测试，先检查根因",
-                "/cancel",
-                "/exit",
-            ],
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = PausingAgentLoop()
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            tui, output = self._make_tui(
+                loop,
+                answers=[
+                    "开始长任务",
+                    "不要修改测试，先检查根因",
+                    "/cancel",
+                    "/exit",
+                ],
+                trace_recorder=recorder,
+            )
 
-        await tui.run_async()
+            await tui.run_async()
 
-        self.assertEqual([], tui._history.steering_messages)
-        rendered = output.getvalue()
-        self.assertIn("已排队追加指令", rendered)
-        self.assertIn("已丢弃 1 条尚未注入的追加指令", rendered)
-        self.assertIn("正在取消当前任务", rendered)
-        self.assertIn("Goodbye!", rendered)
+            self.assertEqual([], tui._history.steering_messages)
+            rendered = output.getvalue()
+            self.assertIn("已排队追加指令", rendered)
+            self.assertIn("已丢弃 1 条尚未注入的追加指令", rendered)
+            self.assertIn("正在取消当前任务", rendered)
+            self.assertIn("Goodbye!", rendered)
+            path = recorder.latest_path()
+            assert path is not None
+            events = {
+                json.loads(line)["event"]
+                for line in path.read_text(encoding="utf-8").splitlines()
+            }
+            self.assertIn("steering_queued", events)
+            self.assertIn("cancellation_requested", events)
 
     def test_cancel_command_is_available_in_completion(self):
         tui, _output = self._make_tui()

@@ -1,9 +1,12 @@
 import asyncio
+import json
+import tempfile
 import unittest
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from tinyCode.conversation.history import ConversationHistory
-from tinyCode.config.models import ProviderConfig
+from tinyCode.config.models import ProviderConfig, TracingConfig
 from tinyCode.providers.base import BaseProvider, Message, ToolCall
 from tinyCode.subagent.manager import BackgroundTaskManager
 from tinyCode.subagent.models import SubAgentRole, SubAgentTask, TaskStatus
@@ -12,6 +15,8 @@ from tinyCode.subagent.tool import SubAgentTool
 from tinyCode.subagent.filter import ToolFilter
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tracing.recorder import TraceRecorder
+from tinyCode.tracing.render import render_text
 
 
 class ToolOnlyProvider(BaseProvider):
@@ -69,6 +74,11 @@ class FailingProvider(ToolOnlyProvider):
     async def chat_stream(self, messages, tools=None, system_blocks=None):
         yield "partial"
         raise RuntimeError("connection dropped")
+
+
+class FinalTextProvider(ToolOnlyProvider):
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        yield "sub-agent finished"
 
 
 class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -185,6 +195,45 @@ class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner.run(task, ConversationHistory())
 
         self.assertEqual(TaskStatus.FAILED, task.status)
+
+    async def test_sub_agent_model_span_is_child_of_parent_tool_span(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("delegate")
+            runner = SubAgentRunner(
+                provider=FinalTextProvider(),
+                tool_registry=ToolRegistry(),
+                tool_executor=ToolExecutor(),
+                roles={},
+                trace_recorder=recorder,
+            )
+            task = SubAgentTask(task="inspect")
+            task.start()
+
+            recorder.record("round_start", attributes={"round": 5})
+            with recorder.span(
+                "sub_agent", "tool", {"round": 5},
+            ) as parent_span:
+                result = await runner.run(task, ConversationHistory())
+                parent_span.finish("ok")
+            recorder.record("round_end", status="completed", attributes={"round": 5})
+            recorder.finish_task(handle, status="no_tool_call")
+
+            self.assertEqual("sub-agent finished", result)
+            assert handle is not None
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            model_start = next(
+                row for row in rows
+                if row["event"] == "span_start" and row["kind"] == "model_request"
+            )
+            self.assertEqual(parent_span.span_id, model_start["parent_span_id"])
+            rendered = render_text(handle.path)
+            self.assertIn("Turn 5", rendered)
+            self.assertIn("工具 sub_agent", rendered)
+            self.assertIn("模型 request #1", rendered)
 
     async def test_background_concurrency_is_bounded_and_shutdown_joins_tasks(self):
         task_manager = BackgroundTaskManager(max_concurrent=1)
