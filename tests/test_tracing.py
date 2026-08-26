@@ -34,6 +34,10 @@ class TraceRecorderTests(unittest.TestCase):
                     "input_tokens": 10,
                     "output_tokens": 5,
                     "total_tokens": 15,
+                    "cache_read_tokens": 8,
+                    "cache_write_tokens": 2,
+                    "cache_miss_tokens": 2,
+                    "cache_usage_available": True,
                 })
             recorder.record("round_end", status="completed", attributes={"round": 1})
             recorder.record(
@@ -65,6 +69,7 @@ class TraceRecorderTests(unittest.TestCase):
             self.assertIn("模型 Token 曲线", page)
             self.assertIn("上下文窗口曲线", page)
             self.assertIn("累计 15 Token", page)
+            self.assertIn("缓存 8 (80%) · 写入 2", page)
             self.assertNotIn(">None<", page)
             self.assertIn("<details class='span-row'>", page)
             self.assertIn("<summary class='span-summary'>", page)

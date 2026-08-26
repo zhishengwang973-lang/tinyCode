@@ -78,13 +78,13 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def list_tools(self) -> list[BaseTool]:
-        """Return all registered tools."""
-        return list(self._tools.values())
+        """Return tools in canonical order for stable provider schemas."""
+        return [self._tools[name] for name in sorted(self._tools)]
 
     def to_openai_format(self) -> list[dict]:
         """Return tool definitions in OpenAI tool-calling format."""
-        return [t.to_openai_schema() for t in self._tools.values()]
+        return [t.to_openai_schema() for t in self.list_tools()]
 
     def to_anthropic_format(self) -> list[dict]:
         """Return tool definitions in Anthropic tool-use format."""
-        return [t.to_anthropic_schema() for t in self._tools.values()]
+        return [t.to_anthropic_schema() for t in self.list_tools()]

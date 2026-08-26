@@ -208,13 +208,14 @@ def render_html(path: Path) -> str:
         width = max(0.4, min(100.0 - left, span.duration_ms / timeline_ms * 100))
         depth = _span_depth(span, span_ids)
         details = html.escape(json.dumps(span.attributes, ensure_ascii=False, indent=2))
+        cache_summary = _cache_summary(span.attributes)
         bars.append(
             "<details class='span-row'>"
             "<summary class='span-summary'>"
             f"<div class='span-label' style='padding-left:{depth * 18}px'>"
             f"<span class='dot {html.escape(span.status)}'></span>"
             f"{html.escape(_kind_label(span.kind))} · {html.escape(span.name)}"
-            f"<small>{html.escape(_duration(span.duration_ms))}</small></div>"
+            f"<small>{html.escape(_duration(span.duration_ms))}{cache_summary}</small></div>"
             "<div class='track'>"
             f"<div class='bar {html.escape(span.status)}' style='left:{left:.3f}%;width:{width:.3f}%' "
             f"title='{html.escape(span.name)} · {_duration(span.duration_ms)}'></div></div>"
@@ -353,6 +354,9 @@ def _span_text(span: _Span) -> str:
         extras.append(f"首 Token {_duration(float(span.attributes['first_token_ms']))}")
     if isinstance(span.attributes.get("total_tokens"), (int, float)):
         extras.append(f"{int(span.attributes['total_tokens']):,} Token")
+    cache_text = _cache_summary_text(span.attributes)
+    if cache_text:
+        extras.append(cache_text)
     if (
         isinstance(span.attributes.get("retry"), (int, float))
         and span.attributes["retry"] > 0
@@ -363,6 +367,33 @@ def _span_text(span: _Span) -> str:
         f"{_kind_label(span.kind)} {span.name} · {_duration(span.duration_ms)} · "
         f"{_status_label(span.status)}{suffix}"
     )
+
+
+def _cache_summary(attributes: dict[str, Any]) -> str:
+    """Return a compact HTML cache summary for model-request spans."""
+    text = _cache_summary_text(attributes)
+    return f" · {html.escape(text)}" if text else ""
+
+
+def _cache_summary_text(attributes: dict[str, Any]) -> str:
+    """Format cache counters when the provider reports them."""
+    if attributes.get("cache_usage_available") is not True:
+        return ""
+    read = attributes.get("cache_read_tokens")
+    miss = attributes.get("cache_miss_tokens")
+    write = attributes.get("cache_write_tokens")
+    if not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        for value in (read, miss, write)
+    ):
+        return ""
+    read_count, miss_count, write_count = int(read), int(miss), int(write)
+    denominator = read_count + miss_count
+    rate = f"{read_count / denominator:.0%}" if denominator else "—"
+    parts = [f"缓存 {read_count:,} ({rate})"]
+    if write_count:
+        parts.append(f"写入 {write_count:,}")
+    return " · ".join(parts)
 
 
 def _span_depth(span: _Span, spans: dict[str, _Span]) -> int:

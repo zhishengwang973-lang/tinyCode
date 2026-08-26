@@ -40,7 +40,14 @@ class PromptContextAssembler:
         return self._notes_text
 
     def assemble(
-        self, history: ConversationHistory, round_number: int,
+        self,
+        history: ConversationHistory,
+        round_number: int,
+        *,
+        environment_text: str | None = None,
+        notes_text: str | None = None,
+        skill_instructions: str | None = None,
+        task_injection: str | None = None,
     ) -> list[dict]:
         result: list[dict] = []
         is_anthropic = self._protocol == "anthropic"
@@ -56,20 +63,33 @@ class PromptContextAssembler:
             self._append_pinned(
                 result,
                 "Activated Skills",
-                self._skill_registry.get_active_instructions(),
+                (
+                    self._skill_registry.get_active_instructions()
+                    if skill_instructions is None
+                    else skill_instructions
+                ),
                 is_anthropic,
             )
 
         self._append_pinned(
-            result, "Notes", self.notes_text(), is_anthropic,
+            result,
+            "Notes",
+            self.notes_text() if notes_text is None else notes_text,
+            is_anthropic,
         )
 
-        injection = self._prompt_injector.build_injection(round_number)
+        injection = (
+            self._prompt_injector.build_injection(round_number)
+            if task_injection is None else task_injection
+        )
         if injection:
             result.append({"role": "user", "content": injection})
 
         self._append_pinned(
-            result, "Environment", self.environment_text(), is_anthropic,
+            result,
+            "Environment",
+            self.environment_text() if environment_text is None else environment_text,
+            is_anthropic,
         )
 
         conversation = history.get_messages()

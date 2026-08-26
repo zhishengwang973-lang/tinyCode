@@ -81,6 +81,16 @@ class FinalTextProvider(ToolOnlyProvider):
         yield "sub-agent finished"
 
 
+class CapturingFinalTextProvider(FinalTextProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.received_messages: list[list[Message]] = []
+
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.received_messages.append(messages)
+        yield "sub-agent finished"
+
+
 class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
     def test_background_filter_uses_registry_read_categories(self):
         role = SubAgentRole(name="reader", tools_allow=None)
@@ -130,6 +140,75 @@ class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(TaskStatus.FAILED, task.status)
         self.assertIn("未返回结果", task.result)
+
+    async def test_fork_omits_in_flight_parent_tool_calls(self):
+        provider = CapturingFinalTextProvider()
+        runner = SubAgentRunner(
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            tool_executor=ToolExecutor(),
+            roles={},
+        )
+        parent_history = ConversationHistory()
+        parent_history.add_user_message("审查当前项目")
+        parent_history.add_raw_message({
+            "role": "assistant",
+            "content": "我会委派这个审查。",
+            "tool_calls": [{
+                "id": "call_subagent_in_flight",
+                "type": "function",
+                "function": {"name": "sub_agent", "arguments": "{}"},
+            }],
+        })
+        task = SubAgentTask(task="只审查缓存相关逻辑")
+        task.start()
+
+        result = await runner.run(task, parent_history)
+
+        self.assertEqual("sub-agent finished", result)
+        self.assertEqual(1, len(provider.received_messages))
+        copied = provider.received_messages[0]
+        self.assertFalse(any("tool_calls" in message for message in copied))
+        self.assertTrue(any(
+            "我会委派这个审查。" in str(message.get("content"))
+            for message in copied
+        ))
+
+    async def test_fork_preserves_completed_tool_call_pairs(self):
+        provider = CapturingFinalTextProvider()
+        runner = SubAgentRunner(
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            tool_executor=ToolExecutor(),
+            roles={},
+        )
+        parent_history = ConversationHistory()
+        parent_history.add_raw_message({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_finished",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        })
+        parent_history.add_raw_message({
+            "role": "tool",
+            "tool_call_id": "call_finished",
+            "name": "read_file",
+            "content": "README 内容",
+        })
+        task = SubAgentTask(task="总结已有上下文")
+        task.start()
+
+        await runner.run(task, parent_history)
+
+        copied = provider.received_messages[0]
+        assistant = next(message for message in copied if message.get("role") == "assistant")
+        self.assertEqual("call_finished", assistant["tool_calls"][0]["id"])
+        self.assertTrue(any(
+            message.get("tool_call_id") == "call_finished" for message in copied
+        ))
 
     async def test_sub_agent_tool_returns_failure_when_runner_has_no_result(self):
         task_manager = BackgroundTaskManager()

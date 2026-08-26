@@ -27,7 +27,7 @@ from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.security.models import HITLDecision
 from tinyCode.security.models import SecurityLevel
-from tinyCode.providers.base import TokenUsage, ToolCall
+from tinyCode.providers.base import CacheUsage, TokenUsage, ToolCall
 from tinyCode.tools.base import ToolResult
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.config.models import TracingConfig
@@ -195,6 +195,12 @@ class MetricsAgentLoop(FakeAgentLoop):
             input_tokens=100,
             output_tokens=25,
             total_tokens=125,
+            available=True,
+        )
+        self.turn_cache_usage = CacheUsage(
+            read_tokens=80,
+            write_tokens=20,
+            miss_tokens=20,
             available=True,
         )
         self.turn_model_requests = 2
@@ -620,6 +626,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("耗时: 2.35 秒", rendered)
         self.assertIn("工具调用: 3 次", rendered)
         self.assertIn("成功率: 66.7%", rendered)
+        self.assertIn("cache 命中 80 Token (80%) · 写入 20", rendered)
 
     async def test_completion_lists_all_workspace_file_changes(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -765,7 +765,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider.received_tools[0])
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
 
-    async def test_tool_result_helpers_are_exposed_only_after_result_is_stored(self):
+    async def test_tool_result_helpers_keep_a_stable_schema_before_and_after_storage(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage_dir = Path(tmp)
             provider = LargeToolResultProvider()
@@ -795,10 +795,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
         first_names = self._openai_tool_names(provider.received_tools[0])
         second_names = self._openai_tool_names(provider.received_tools[1])
-        self.assertNotIn("tool_result_search", first_names)
-        self.assertNotIn("tool_result_read", first_names)
+        self.assertIn("tool_result_search", first_names)
+        self.assertIn("tool_result_read", first_names)
         self.assertIn("tool_result_search", second_names)
         self.assertIn("tool_result_read", second_names)
+        self.assertEqual(first_names, second_names)
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
 
     async def test_existing_cache_keeps_helpers_visible_without_new_truncation(self):
@@ -838,7 +839,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("tool_result_read", names)
         self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
 
-    async def test_hidden_tool_result_helper_cannot_be_called_prematurely(self):
+    async def test_tool_result_helper_returns_structured_error_when_no_file_exists(self):
         registry = ToolRegistry()
         registry.register(ToolResultReadTool())
         loop = AgentLoop(
@@ -855,11 +856,13 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         events = [event async for event in loop.run(history)]
 
         errors = [event for event in events if isinstance(event, ErrorEvent)]
-        self.assertEqual(1, len(errors))
-        self.assertEqual("unadvertised_tool_call", errors[0].code)
-        self.assertIn("当前不可用", errors[0].message)
+        tool_results = [event for event in events if isinstance(event, ToolResultEvent)]
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(tool_results))
+        self.assertFalse(tool_results[0].result.success)
+        self.assertIn("工具结果文件", tool_results[0].result.error)
 
-    def test_deferred_tool_filter_supports_anthropic_schemas(self):
+    def test_tool_result_helpers_are_always_present_for_anthropic_schemas(self):
         registry = ToolRegistry()
         registry.register(ToolResultReadTool())
         loop = AgentLoop(
@@ -873,8 +876,78 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         hidden = loop._build_tool_defs(include_tool_result_tools=False)
         visible = loop._build_tool_defs(include_tool_result_tools=True)
 
-        self.assertEqual(set(), loop._tool_definition_names(hidden))
+        self.assertEqual({"tool_result_read"}, loop._tool_definition_names(hidden))
         self.assertEqual({"tool_result_read"}, loop._tool_definition_names(visible))
+
+    async def test_dynamic_environment_and_notes_are_snapshotted_per_task(self):
+        calls = {"environment": 0, "notes": 0}
+
+        def environment() -> str:
+            calls["environment"] += 1
+            return f"environment version {calls['environment']}"
+
+        class NoteManager:
+            def context_text(self) -> str:
+                calls["notes"] += 1
+                return f"notes version {calls['notes']}"
+
+        class SkillRegistry:
+            def get_active_instructions(self) -> str:
+                calls["skills"] = calls.get("skills", 0) + 1
+                return f"skill version {calls['skills']}"
+
+            def get_active_tool_whitelist(self):
+                return None
+
+        class CapturingProvider(UnknownToolProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.received_messages: list[list[Message]] = []
+
+            async def chat_stream(self, messages, tools=None, system_blocks=None):
+                self.received_messages.append(messages)
+                yield ToolCall(id=f"tool-{len(self.received_messages)}", name="missing_tool", input={})
+
+        provider = CapturingProvider()
+        loop = self._make_loop(
+            provider,
+            max_rounds=2,
+            environment_text=environment,
+            note_manager=NoteManager(),
+            skill_registry=SkillRegistry(),
+        )
+        history = ConversationHistory()
+        history.add_user_message("检查项目文件")
+
+        _events = [event async for event in loop.run(history)]
+
+        self.assertEqual({"environment": 1, "notes": 1, "skills": 1}, calls)
+        first, second = provider.received_messages[:2]
+        first_environment = next(
+            msg["content"] for msg in first if "[Environment]" in str(msg.get("content"))
+        )
+        second_environment = next(
+            msg["content"] for msg in second if "[Environment]" in str(msg.get("content"))
+        )
+        first_notes = next(
+            msg["content"] for msg in first if "[Notes]" in str(msg.get("content"))
+        )
+        second_notes = next(
+            msg["content"] for msg in second if "[Notes]" in str(msg.get("content"))
+        )
+        self.assertEqual(first_environment, second_environment)
+        self.assertEqual(first_notes, second_notes)
+        first_skills = next(
+            msg["content"]
+            for msg in first
+            if "[Activated Skills]" in str(msg.get("content"))
+        )
+        second_skills = next(
+            msg["content"]
+            for msg in second
+            if "[Activated Skills]" in str(msg.get("content"))
+        )
+        self.assertEqual(first_skills, second_skills)
 
     def test_workspace_switch_moves_tool_result_cache_root(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
@@ -1451,6 +1524,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, len(ends))
             self.assertEqual("ok", ends[0]["status"])
             self.assertGreaterEqual(ends[0]["attributes"]["first_token_ms"], 0)
+            self.assertIn("prompt_fingerprint", starts[0]["attributes"])
+            self.assertIn("tools_fingerprint", starts[0]["attributes"])
+            self.assertIn("first_changed_message_index", starts[0]["attributes"])
+            self.assertIn("cache_read_tokens", ends[0]["attributes"])
+            self.assertIn("cache_miss_tokens", ends[0]["attributes"])
             self.assertTrue(any(row["event"] == "round_start" for row in rows))
             self.assertTrue(any(row["event"] == "round_end" for row in rows))
 

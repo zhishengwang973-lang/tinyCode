@@ -69,6 +69,20 @@ class ToolRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "read_file"):
             registry.register(DummyTool("read_file"))
 
+    def test_provider_schemas_use_canonical_name_order(self):
+        registry = ToolRegistry()
+        registry.register(DummyTool("zeta"))
+        registry.register(DummyTool("alpha"))
+        registry.register(DummyTool("middle"))
+
+        openai_names = [
+            item["function"]["name"] for item in registry.to_openai_format()
+        ]
+        anthropic_names = [item["name"] for item in registry.to_anthropic_format()]
+
+        self.assertEqual(["alpha", "middle", "zeta"], openai_names)
+        self.assertEqual(openai_names, anthropic_names)
+
     def test_empty_tool_name_is_rejected(self):
         registry = ToolRegistry()
 

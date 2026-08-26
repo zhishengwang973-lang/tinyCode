@@ -14,6 +14,7 @@ from tinyCode.providers.base import (
     ToolCall,
     MAX_TOOL_ARGUMENT_CHARS,
     build_api_url,
+    normalize_usage,
     normalize_tool_call_index,
     read_error_detail,
 )
@@ -93,11 +94,7 @@ class OpenAIProvider(BaseProvider):
 
                     usage = data.get("usage")
                     if isinstance(usage, dict) and usage:
-                        self.last_usage = {
-                            key: value
-                            for key, value in usage.items()
-                            if isinstance(value, int) and not isinstance(value, bool)
-                        }
+                        self.last_usage = normalize_usage(usage)
 
                     choices = data.get("choices", [])
                     if not isinstance(choices, list) or not choices:

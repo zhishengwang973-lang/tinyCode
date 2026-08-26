@@ -1,13 +1,9 @@
-"""PromptInjector — manages per-round dynamic instruction injection."""
+"""PromptInjector — manages task snapshots and append-only recovery context."""
 
 from tinyCode.prompts.loader import load_injection
 
-#: Round interval for repeating the full injection (slim used on off-rounds).
-FULL_INJECTION_INTERVAL = 3
-
-
 class PromptInjector:
-    """Generates per-round injection messages for session-level state.
+    """Generates stable task instructions and queued recovery context.
 
     Injection messages use the ``user`` role with a ``[TinyCode]`` prefix
     so the model treats them as system-level context rather than user input.
@@ -27,41 +23,50 @@ class PromptInjector:
         """Add a one-shot injection for the next round only."""
         self._pending_injections.append(f"[TinyCode] {text}")
 
-    # -- per-round injection --------------------------------------------------
+    # -- task and recovery context -------------------------------------------
+
+    def build_task_injection(self) -> str | None:
+        """Return a task-stable instruction snapshot.
+
+        Plan mode used to alternate between two strings every round.  That
+        placed a changing message before the complete conversation and broke
+        prompt-cache reuse.  Enforcement remains in the tool layer, while a
+        single full instruction is stable for the active task.
+        """
+        if not self._plan_only:
+            return None
+        text = load_injection("plan-mode")
+        return text or None
+
+    def consume_pending_injections(self) -> list[str]:
+        """Consume recovery prompts for append-only conversation history."""
+        pending = self._pending_injections
+        self._pending_injections = []
+        return pending
+
+    # -- compatibility helpers -----------------------------------------------
 
     def build_injection(self, round_number: int) -> str | None:
-        """Return the injection message for the given round, or None."""
-        parts: list[str] = []
+        """Return current context for legacy callers.
 
-        # One-shot injections
-        parts.extend(self._pending_injections)
-        self._pending_injections.clear()
-
-        # Plan-only mode: full every N rounds, slim on off-rounds
-        if self._plan_only:
-            is_first = (round_number == 1)
-            is_full_round = (round_number % FULL_INJECTION_INTERVAL == 0)
-            if is_first or is_full_round:
-                text = load_injection("plan-mode")
-            else:
-                text = load_injection("plan-mode-slim")
-            if text:
-                parts.append(text)
-
-        if not parts:
-            return None
-        return "\n\n".join(parts)
+        AgentLoop uses :meth:`build_task_injection` and persists one-shot
+        entries instead, so this method deliberately no longer varies by
+        round number.
+        """
+        del round_number
+        parts = self.consume_pending_injections()
+        task_instruction = self.build_task_injection()
+        if task_instruction:
+            parts.append(task_instruction)
+        return "\n\n".join(parts) if parts else None
 
     def preview_injection(self, round_number: int = 1) -> str | None:
         """Preview an injection without consuming one-shot entries."""
         parts = list(self._pending_injections)
 
-        if self._plan_only:
-            is_first = round_number == 1
-            is_full_round = round_number % FULL_INJECTION_INTERVAL == 0
-            name = "plan-mode" if is_first or is_full_round else "plan-mode-slim"
-            text = load_injection(name)
-            if text:
-                parts.append(text)
+        del round_number
+        task_instruction = self.build_task_injection()
+        if task_instruction:
+            parts.append(task_instruction)
 
         return "\n\n".join(parts) if parts else None

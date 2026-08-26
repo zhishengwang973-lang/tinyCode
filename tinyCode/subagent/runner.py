@@ -75,8 +75,14 @@ class SubAgentRunner:
         sub_history = ConversationHistory()
 
         if is_fork:
-            # Fork: inherit parent history
-            sub_history.replace_messages(parent_history.get_messages())
+            # Fork while the parent is executing ``sub_agent``: the parent's
+            # latest assistant message can legitimately contain this very
+            # tool call before its result has been appended.  Passing that
+            # incomplete protocol pair to another provider causes OpenAI-style
+            # APIs to reject the entire fork request with HTTP 400.  Preserve
+            # the useful conversational text, but exclude only unresolved
+            # tool-call blocks from the fork snapshot.
+            sub_history = self._fork_history(parent_history)
             # Append fork instruction as user message
             sub_history.add_user_message(f"{_FORK_INSTRUCTION}\n\n任务: {task.task}")
         else:
@@ -151,3 +157,79 @@ class SubAgentRunner:
         finally:
             if provider is not self._provider:
                 await provider.close()
+
+    @staticmethod
+    def _fork_history(parent_history: ConversationHistory) -> ConversationHistory:
+        """Copy parent context without unresolved provider tool-call pairs."""
+        messages = parent_history.get_messages()
+        pending = SubAgentRunner._unpaired_tool_call_ids(messages)
+        fork_history = ConversationHistory()
+
+        for message in messages:
+            copied = dict(message)
+            if copied.get("role") == "assistant" and pending:
+                tool_calls = copied.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    copied["tool_calls"] = [
+                        call for call in tool_calls
+                        if not (
+                            isinstance(call, dict)
+                            and call.get("id") in pending
+                        )
+                    ]
+                    if not copied["tool_calls"]:
+                        copied.pop("tool_calls", None)
+
+                content = copied.get("content")
+                if isinstance(content, list):
+                    copied["content"] = [
+                        block for block in content
+                        if not (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and block.get("id") in pending
+                        )
+                    ]
+            fork_history.add_raw_message(copied)
+        return fork_history
+
+    @staticmethod
+    def _unpaired_tool_call_ids(messages: list[dict]) -> set[str]:
+        """Return tool IDs without a following provider-native result."""
+        pending: set[str] = set()
+        for message in messages:
+            if message.get("role") == "assistant":
+                tool_calls = message.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    pending.update(
+                        call_id
+                        for call in tool_calls
+                        if isinstance(call, dict)
+                        and isinstance((call_id := call.get("id")), str)
+                        and call_id
+                    )
+                content = message.get("content")
+                if isinstance(content, list):
+                    pending.update(
+                        call_id
+                        for block in content
+                        if isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and isinstance((call_id := block.get("id")), str)
+                        and call_id
+                    )
+            elif message.get("role") == "tool":
+                call_id = message.get("tool_call_id")
+                if isinstance(call_id, str):
+                    pending.discard(call_id)
+            elif message.get("role") == "user":
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                            and isinstance(block.get("tool_use_id"), str)
+                        ):
+                            pending.discard(block["tool_use_id"])
+        return pending

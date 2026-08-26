@@ -15,6 +15,7 @@ from tinyCode.providers.base import (
     ToolCall,
     MAX_TOOL_ARGUMENT_CHARS,
     build_api_url,
+    normalize_usage,
     normalize_tool_call_index,
     read_error_detail,
 )
@@ -60,11 +61,6 @@ class AnthropicProvider(BaseProvider):
     def thinking_enabled(self) -> bool:
         return self._thinking_enabled
 
-    @property
-    def cache_hit(self) -> bool:
-        """Whether the last request had a cache read (prompt caching)."""
-        return self.last_usage.get("cache_read_input_tokens", 0) > 0
-
     # -- streaming -----------------------------------------------------------
 
     async def chat_stream(
@@ -92,12 +88,19 @@ class AnthropicProvider(BaseProvider):
                 "budget_tokens": self._thinking_budget_tokens,
             }
 
-        # Tool definitions with cache_control
+        # One breakpoint on the final tool covers the stable tool prefix.
+        # Anthropic accepts at most four explicit cache breakpoints, so marking
+        # every tool is both unnecessary and invalid for the built-in set.
         if tools:
-            body["tools"] = [
-                {**t, "cache_control": {"type": "ephemeral"}}
-                for t in tools
-            ]
+            cached_tools = list(tools)
+            cached_tools[-1] = {
+                **cached_tools[-1], "cache_control": {"type": "ephemeral"},
+            }
+            body["tools"] = cached_tools
+
+        # Advance a cache entry with the growing conversation while retaining
+        # the explicit stable system/tool breakpoints above.
+        body["cache_control"] = {"type": "ephemeral"}
 
         headers = {
             "x-api-key": self.config.api_key or "",
@@ -141,11 +144,7 @@ class AnthropicProvider(BaseProvider):
                         message = data.get("message", {})
                         usage = message.get("usage", {}) if isinstance(message, dict) else {}
                         if isinstance(usage, dict) and usage:
-                            self.last_usage.update({
-                                key: value
-                                for key, value in usage.items()
-                                if isinstance(value, int) and not isinstance(value, bool)
-                            })
+                            self.last_usage.update(normalize_usage(usage))
 
                     # --- content block delta ---
                     elif event_type == "content_block_delta":
@@ -240,11 +239,7 @@ class AnthropicProvider(BaseProvider):
                     elif event_type == "message_delta":
                         usage = data.get("usage", {})
                         if isinstance(usage, dict) and usage:
-                            self.last_usage.update({
-                                key: value
-                                for key, value in usage.items()
-                                if isinstance(value, int) and not isinstance(value, bool)
-                            })
+                            self.last_usage.update(normalize_usage(usage))
 
                     # --- message stop ---
                     elif event_type == "message_stop":

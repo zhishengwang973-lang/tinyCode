@@ -888,7 +888,7 @@ class TinyCodeTUI(UIControl):
                         self._print_info("本轮已取消")
                     else:
                         self._status_text = "就绪 · 上一轮已正常完成"
-                        cache = " · cache ✓" if self._agent_loop.cache_hit else ""
+                        cache = self._format_cache_summary()
                         self._console.print(
                             f"✓ 本轮已正常完成{cache}", style="bold green", highlight=False
                         )
@@ -1146,6 +1146,20 @@ class TinyCodeTUI(UIControl):
             style="dim",
             highlight=False,
         )
+
+    def _format_cache_summary(self) -> str:
+        usage = getattr(self._agent_loop, "turn_cache_usage", None)
+        if usage is None or not getattr(usage, "available", False):
+            return ""
+        read = max(0, int(getattr(usage, "read_tokens", 0)))
+        miss = max(0, int(getattr(usage, "miss_tokens", 0)))
+        write = max(0, int(getattr(usage, "write_tokens", 0)))
+        total = read + miss
+        rate = f"{read / total:.0%}" if total else "—"
+        parts = [f"cache 命中 {read:,} Token ({rate})"]
+        if write:
+            parts.append(f"写入 {write:,}")
+        return " · " + " · ".join(parts)
 
     async def _print_workspace_changes(
         self,

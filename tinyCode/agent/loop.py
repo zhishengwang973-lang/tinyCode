@@ -1,6 +1,7 @@
 """Agent Loop — ReAct pattern with prompt assembly, injections, and cache tracking."""
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import nullcontext
@@ -52,6 +53,7 @@ from tinyCode.hooks.models import HookEvent
 from tinyCode.skills.registry import SkillRegistry
 from tinyCode.providers.base import (
     BaseProvider,
+    CacheUsage,
     MAX_PARALLEL_TOOL_CALLS,
     Message,
     ProviderError,
@@ -161,10 +163,17 @@ class AgentLoop:
         self._plan_only = False
         self._cancel_event = asyncio.Event()
         self.cache_hit = False
+        self.turn_cache_usage = CacheUsage()
         self.turn_usage = TokenUsage()
         self.turn_model_requests = 0
         self._active_round = 0
         self._active_budget: _TurnRoundBudget | None = None
+        self._task_environment_text: str | None = None
+        self._task_notes_text: str | None = None
+        self._task_skill_instructions: str | None = None
+        self._task_injection: str | None = None
+        self._task_tool_defs: list[dict] | None = None
+        self._previous_request_cache_shape: dict[str, object] | None = None
 
     # -- public API -----------------------------------------------------------
 
@@ -313,6 +322,7 @@ class AgentLoop:
         """Run one user turn and keep history valid if the pipeline fails."""
         history.flush_deferred()
         start_index = len(history.get_messages())
+        self._begin_task_prompt_snapshot()
         try:
             async for event in self._run_impl(history):
                 yield event
@@ -342,14 +352,21 @@ class AgentLoop:
             )
         finally:
             self._active_budget = None
+            self._clear_task_prompt_snapshot()
 
     async def _run_impl(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         self.reset_cancel()
         self.cache_hit = False
+        self.turn_cache_usage = CacheUsage()
         self.turn_usage = TokenUsage()
         self.turn_model_requests = 0
+        self._previous_request_cache_shape = None
         response_chars = 0
         tools_enabled = should_enable_tools(history.get_messages())
+        # Skill activation and large-result persistence used to rebuild this
+        # list between ReAct rounds.  Freeze the advertised schema for one
+        # task; execution-time policy checks remain authoritative.
+        self._task_tool_defs = self._build_tool_defs() if tools_enabled else None
         request_history = self._request_history(history, tools_enabled)
         budget = _TurnRoundBudget(
             current_limit=self._max_rounds,
@@ -370,6 +387,12 @@ class AgentLoop:
 
             self._active_round = round_num
 
+            # Recovery instructions are real events in the conversation, not
+            # a temporary prefix injected before all prior messages.  Keeping
+            # them append-only preserves earlier cacheable history.
+            for injection in self._prompt_injector.consume_pending_injections():
+                request_history.add_context_message(injection)
+
             if self._compressor is not None:
                 history_tokens = StructuredSummarizer._estimate_tokens(
                     request_history.get_messages()
@@ -380,9 +403,9 @@ class AgentLoop:
                     full_tokens += StructuredSummarizer._estimate_tokens([{
                         "role": "system",
                         "content": json.dumps(
-                            # Conservatively count deferred schemas even when
-                            # they will be hidden from this provider request.
-                            self._build_tool_defs(include_tool_result_tools=True),
+                            # Tool schemas are frozen for this task, so this
+                            # mirrors the request payload exactly.
+                            self._task_tool_defs or [],
                             ensure_ascii=False,
                         ),
                     }])
@@ -408,12 +431,18 @@ class AgentLoop:
                         extra_tokens=max(0, full_tokens - history_tokens),
                     )
                     if compression_span is not None:
+                        compression_raw_usage = getattr(
+                            self._provider, "last_usage", None,
+                        )
                         compression_usage = (
-                            TokenUsage.from_raw(
-                                getattr(self._provider, "last_usage", None)
-                            )
+                            TokenUsage.from_raw(compression_raw_usage)
                             if comp.model_request_made
                             else TokenUsage()
+                        )
+                        compression_cache_usage = (
+                            CacheUsage.from_raw(compression_raw_usage)
+                            if comp.model_request_made
+                            else CacheUsage()
                         )
                         compression_span.finish(
                             "error" if comp.error else "ok",
@@ -428,13 +457,21 @@ class AgentLoop:
                                 "input_tokens": compression_usage.input_tokens,
                                 "output_tokens": compression_usage.output_tokens,
                                 "total_tokens": compression_usage.total_tokens,
+                                "cache_read_tokens": compression_cache_usage.read_tokens,
+                                "cache_write_tokens": compression_cache_usage.write_tokens,
+                                "cache_miss_tokens": compression_cache_usage.miss_tokens,
+                                "cache_usage_available": compression_cache_usage.available,
+                                "cache_hit": compression_cache_usage.read_tokens > 0,
                             },
                         )
                 if comp.model_request_made:
                     self.turn_model_requests += 1
-                    self.turn_usage = self.turn_usage + TokenUsage.from_raw(
-                        getattr(self._provider, "last_usage", None)
+                    raw_usage = getattr(self._provider, "last_usage", None)
+                    self.turn_usage = self.turn_usage + TokenUsage.from_raw(raw_usage)
+                    self.turn_cache_usage = self.turn_cache_usage + CacheUsage.from_raw(
+                        raw_usage
                     )
+                    self.cache_hit = self.turn_cache_usage.read_tokens > 0
                 if comp.warning_issued or comp.was_compressed or comp.error:
                     yield ContextCompressionEvent(
                         warning_issued=comp.warning_issued,
@@ -478,16 +515,8 @@ class AgentLoop:
             messages = self._assemble_messages(request_history, round_num)
 
             # --- 1.5. Layer 1 截断 ---
-            tool_result_files_available = False
             if self._truncator is not None:
                 messages, trunc_infos = self._truncator.process_round(messages)
-                # ``trunc_infos`` only describes work performed in this
-                # round. Cached files remain readable after history
-                # compression or a process restart, so tool visibility must
-                # come from the active project's on-disk cache directory.
-                tool_result_files_available = (
-                    self._truncator.has_available_results
-                )
                 for info in trunc_infos:
                     from tinyCode.agent.events import TruncationEvent
                     if self._trace_recorder is not None:
@@ -526,12 +555,9 @@ class AgentLoop:
             tool_call_ids: set[str] = set()
             text_parts: list[str] = []
             tool_defs = (
-                self._build_tool_defs(
-                    include_tool_result_tools=tool_result_files_available,
-                )
+                self._task_tool_defs
                 if tools_enabled else None
             )
-            advertised_tool_names = self._tool_definition_names(tool_defs)
 
             async for raw in self._stream_provider(
                 messages=messages,
@@ -585,23 +611,6 @@ class AgentLoop:
                         )
                         self._active_round = 0
                         yield ErrorEvent(message=identity_error)
-                        return
-                    if (
-                        raw.name in _DEFERRED_TOOL_RESULT_TOOLS
-                        and raw.name not in advertised_tool_names
-                    ):
-                        message = (
-                            f"工具 '{raw.name}' 当前不可用："
-                            "本轮没有已落盘的超长工具结果"
-                        )
-                        await self._fire_error(
-                            message, "unadvertised_tool_call", round_num,
-                        )
-                        self._active_round = 0
-                        yield ErrorEvent(
-                            message=message,
-                            code="unadvertised_tool_call",
-                        )
                         return
                     if raw.id in tool_call_ids:
                         message = f"模型返回了重复的工具调用 ID: {raw.id}"
@@ -688,8 +697,11 @@ class AgentLoop:
                 })
 
             # --- 3. 检测缓存命中 ---
-            if hasattr(self._provider, 'cache_hit') and self._provider.cache_hit:
-                self.cache_hit = True
+            cache_usage = CacheUsage.from_raw(
+                getattr(self._provider, "last_usage", None)
+            )
+            self.turn_cache_usage = self.turn_cache_usage + cache_usage
+            self.cache_hit = self.turn_cache_usage.read_tokens > 0
 
             if not text_parts and not tool_calls:
                 message = "模型返回空响应，请重试本轮对话"
@@ -1131,11 +1143,85 @@ class AgentLoop:
         Structure (for Anthropic): system is sent separately via _build_system_blocks.
         For OpenAI/DeepSeek: system prompt + env + injections all go in messages.
         """
-        return self._context_assembler.assemble(history, round_num)
+        return self._context_assembler.assemble(
+            history,
+            round_num,
+            environment_text=self._task_environment_text,
+            notes_text=self._task_notes_text,
+            skill_instructions=self._task_skill_instructions,
+            task_injection=self._task_injection,
+        )
 
     def _build_system_blocks(self) -> list[dict] | None:
         """Build Anthropic system blocks (None for other providers)."""
         return self._context_assembler.system_blocks()
+
+    def _begin_task_prompt_snapshot(self) -> None:
+        """Freeze dynamic prefix inputs for the lifetime of one user task."""
+        self._task_environment_text = self._current_environment_text()
+        self._task_notes_text = self._current_notes_text()
+        self._task_skill_instructions = (
+            self._skill_registry.get_active_instructions()
+            if self._skill_registry is not None
+            else ""
+        )
+        self._task_injection = self._prompt_injector.build_task_injection() or ""
+
+    def _clear_task_prompt_snapshot(self) -> None:
+        self._task_environment_text = None
+        self._task_notes_text = None
+        self._task_skill_instructions = None
+        self._task_injection = None
+        self._task_tool_defs = None
+        self._previous_request_cache_shape = None
+
+    @staticmethod
+    def _cache_fingerprint(value: object) -> str:
+        serialized = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+    def _cache_shape_attributes(
+        self,
+        messages: list,
+        tools: list[dict] | None,
+        system_blocks: list[dict] | None,
+    ) -> dict[str, object]:
+        """Describe request-shape changes without recording prompt content."""
+        message_parts = [self._cache_fingerprint(message) for message in messages]
+        current = {
+            "system": self._cache_fingerprint(system_blocks or []),
+            "tools": self._cache_fingerprint(tools or []),
+            "messages": message_parts,
+        }
+        previous = self._previous_request_cache_shape
+        first_changed: int | None = 0
+        common_prefix = 0
+        if previous is not None:
+            previous_messages = previous.get("messages", [])
+            if not isinstance(previous_messages, list):
+                previous_messages = []
+            for before, after in zip(previous_messages, message_parts):
+                if before != after:
+                    break
+                common_prefix += 1
+            if common_prefix == len(previous_messages) and common_prefix == len(message_parts):
+                first_changed = None
+            else:
+                first_changed = common_prefix
+
+        self._previous_request_cache_shape = current
+        return {
+            "prompt_fingerprint": self._cache_fingerprint(current),
+            "system_fingerprint": current["system"],
+            "tools_fingerprint": current["tools"],
+            "message_fingerprint": self._cache_fingerprint(message_parts),
+            "first_changed_message_index": first_changed,
+            "common_message_prefix_count": common_prefix,
+            "system_changed": previous is not None and previous.get("system") != current["system"],
+            "tools_changed": previous is not None and previous.get("tools") != current["tools"],
+        }
 
     # -- internals ------------------------------------------------------------
 
@@ -1155,6 +1241,7 @@ class AgentLoop:
             self.turn_model_requests += 1
             request_number = self.turn_model_requests
             request_started = monotonic()
+            cache_shape = self._cache_shape_attributes(messages, tools, system_blocks)
             trace_scope = (
                 self._trace_recorder.span(
                     f"request #{request_number}",
@@ -1166,6 +1253,7 @@ class AgentLoop:
                         "message_count": len(messages),
                         "tool_schema_count": len(tools or []),
                         "model": self._provider.config.model,
+                        **cache_shape,
                     },
                 )
                 if self._trace_recorder is not None
@@ -1188,9 +1276,11 @@ class AgentLoop:
                         try:
                             item = await asyncio.wait_for(stream.__anext__(), timeout)
                         except StopAsyncIteration:
+                            raw_usage = getattr(self._provider, "last_usage", None)
                             usage = TokenUsage.from_raw(
-                                getattr(self._provider, "last_usage", None)
+                                raw_usage
                             )
+                            cache_usage = CacheUsage.from_raw(raw_usage)
                             if trace_span is not None:
                                 trace_span.finish("ok", {
                                     "round": self._active_round,
@@ -1201,6 +1291,11 @@ class AgentLoop:
                                     "output_tokens": usage.output_tokens,
                                     "total_tokens": usage.total_tokens,
                                     "usage_available": usage.available,
+                                    "cache_read_tokens": cache_usage.read_tokens,
+                                    "cache_write_tokens": cache_usage.write_tokens,
+                                    "cache_miss_tokens": cache_usage.miss_tokens,
+                                    "cache_usage_available": cache_usage.available,
+                                    "cache_hit": cache_usage.read_tokens > 0,
                                 })
                             return
                         if not emitted:
@@ -1288,15 +1383,17 @@ class AgentLoop:
             pass
 
     def _build_tool_defs(
-        self, *, include_tool_result_tools: bool = False,
+        self, *, include_tool_result_tools: bool = True,
     ) -> list[dict]:
-        definitions = self._context_assembler.tool_definitions(self._tool_registry)
-        if include_tool_result_tools:
-            return definitions
-        return [
-            definition for definition in definitions
-            if self._tool_definition_name(definition) not in _DEFERRED_TOOL_RESULT_TOOLS
-        ]
+        """Return a stable tool schema for every tool-enabled request.
+
+        ``tool_result_read`` and ``tool_result_search`` validate their storage
+        at execution time.  Keeping their schemas present avoids invalidating
+        the provider cache the first time a large tool result is persisted.
+        ``include_tool_result_tools`` remains accepted for compatibility.
+        """
+        del include_tool_result_tools
+        return self._context_assembler.tool_definitions(self._tool_registry)
 
     @classmethod
     def _tool_definition_names(cls, definitions: list[dict] | None) -> set[str]:

@@ -144,23 +144,117 @@ class TokenUsage:
         )
 
 
+@dataclass(frozen=True)
+class CacheUsage:
+    """Provider-neutral prompt-cache accounting for one request or turn."""
+
+    read_tokens: int = 0
+    write_tokens: int = 0
+    miss_tokens: int = 0
+    available: bool = False
+
+    @classmethod
+    def from_raw(cls, raw: object) -> "CacheUsage":
+        if not isinstance(raw, dict) or not raw:
+            return cls()
+
+        def _count(*names: str) -> int:
+            for name in names:
+                value = raw.get(name)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+            return 0
+
+        # Chat Completions and Responses expose the cache counters in
+        # differently named nested objects.  Keep this parsing here so all
+        # frontends and trace sinks report the same meaning.
+        details = raw.get("prompt_tokens_details")
+        if not isinstance(details, dict):
+            details = raw.get("input_tokens_details")
+        if not isinstance(details, dict):
+            details = {}
+
+        read = _count("cache_read_input_tokens", "prompt_cache_hit_tokens")
+        if not read:
+            nested_read = details.get("cached_tokens")
+            if isinstance(nested_read, int) and not isinstance(nested_read, bool):
+                read = max(0, nested_read)
+
+        write = _count("cache_creation_input_tokens")
+        nested_write = details.get("cache_write_tokens")
+        if not write and isinstance(nested_write, int) and not isinstance(nested_write, bool):
+            write = max(0, nested_write)
+
+        miss = _count("prompt_cache_miss_tokens")
+        if not miss:
+            # Anthropic's input_tokens excludes cache reads/writes.  OpenAI's
+            # prompt/input tokens include them, hence subtract only nested
+            # OpenAI-style values from that total.
+            input_tokens = _count("prompt_tokens", "input_tokens")
+            if details:
+                miss = max(0, input_tokens - read - write)
+            elif "cache_read_input_tokens" in raw or "cache_creation_input_tokens" in raw:
+                miss = input_tokens
+
+        available = bool(
+            raw
+            and (
+                "prompt_cache_hit_tokens" in raw
+                or "prompt_cache_miss_tokens" in raw
+                or "cache_read_input_tokens" in raw
+                or "cache_creation_input_tokens" in raw
+                or bool(details)
+            )
+        )
+        return cls(read, write, miss, available)
+
+    def __add__(self, other: "CacheUsage") -> "CacheUsage":
+        return CacheUsage(
+            read_tokens=self.read_tokens + other.read_tokens,
+            write_tokens=self.write_tokens + other.write_tokens,
+            miss_tokens=self.miss_tokens + other.miss_tokens,
+            available=self.available or other.available,
+        )
+
+    @property
+    def hit_rate(self) -> float | None:
+        total = self.read_tokens + self.miss_tokens
+        return self.read_tokens / total if total else None
+
+
+def normalize_usage(raw: object) -> dict[str, Any]:
+    """Keep provider usage counters while discarding malformed SSE payloads."""
+    if not isinstance(raw, dict):
+        return {}
+    nested_names = {"prompt_tokens_details", "input_tokens_details"}
+    return {
+        key: value
+        for key, value in raw.items()
+        if (
+            isinstance(value, int) and not isinstance(value, bool)
+        ) or (
+            key in nested_names and isinstance(value, dict)
+        )
+    }
+
+
 class BaseProvider(ABC):
     """Abstract interface for an LLM provider backend."""
 
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
-        self._last_usage_var: ContextVar[dict[str, int]] = ContextVar(
+        self._last_usage_var: ContextVar[dict[str, Any]] = ContextVar(
             f"tinycode_provider_usage_{id(self)}", default={}
         )
         self.last_stream_diagnostics: dict[str, int] = {}
 
     @property
-    def last_usage(self) -> dict[str, int]:
+    def last_usage(self) -> dict[str, Any]:
         """Usage for the current async task, isolated from background calls."""
         return self._last_usage_var.get()
 
     @last_usage.setter
-    def last_usage(self, value: dict[str, int]) -> None:
+    def last_usage(self, value: dict[str, Any]) -> None:
         holder = self._last_usage_var.get()
         holder.clear()
         if isinstance(value, dict):
@@ -169,6 +263,14 @@ class BaseProvider(ABC):
     def begin_request(self) -> None:
         """Create a request-local usage holder before spawning timeout tasks."""
         self._last_usage_var.set({})
+
+    @property
+    def cache_usage(self) -> CacheUsage:
+        return CacheUsage.from_raw(self.last_usage)
+
+    @property
+    def cache_hit(self) -> bool:
+        return self.cache_usage.read_tokens > 0
 
     async def close(self) -> None:
         """Release provider-owned network resources."""

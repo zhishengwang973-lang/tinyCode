@@ -8,6 +8,7 @@ from tinyCode.providers.anthropic import AnthropicProvider
 from tinyCode.providers.base import (
     ProviderError,
     ProviderHTTPError,
+    CacheUsage,
     TokenUsage,
     ToolCall,
     build_api_url,
@@ -202,6 +203,28 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["ok"], events)
         self.assertEqual(112, TokenUsage.from_raw(provider.last_usage).total_tokens)
+        self.assertEqual(20, CacheUsage.from_raw(provider.last_usage).read_tokens)
+
+    async def test_tools_use_one_explicit_breakpoint_and_enable_auto_caching(self):
+        _FakeAsyncClient.lines = ["data: [DONE]"]
+        provider = AnthropicProvider(
+            ProviderConfig(
+                name="anthropic", protocol="anthropic", model="claude-test",
+                base_url="https://api.anthropic.com", api_key="test-key",
+            )
+        )
+        tools = [
+            {"name": "alpha", "description": "a", "input_schema": {"type": "object"}},
+            {"name": "beta", "description": "b", "input_schema": {"type": "object"}},
+        ]
+
+        with patch("tinyCode.providers.anthropic.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=[], tools=tools))
+
+        body = _FakeAsyncClient.last_stream_kwargs["json"]
+        self.assertEqual({"type": "ephemeral"}, body["cache_control"])
+        self.assertNotIn("cache_control", body["tools"][0])
+        self.assertEqual({"type": "ephemeral"}, body["tools"][1]["cache_control"])
 
     async def test_empty_input_tool_use_yields_tool_call(self):
         _FakeAsyncClient.lines = [
@@ -440,6 +463,26 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
             _FakeAsyncClient.last_stream_kwargs["json"]["stream_options"],
         )
 
+    async def test_nested_cached_tokens_are_preserved_for_cache_accounting(self):
+        _FakeAsyncClient.lines = [
+            'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}',
+            "data: [DONE]",
+        ]
+        provider = OpenAIProvider(
+            ProviderConfig(
+                name="openai", protocol="openai", model="gpt-test",
+                base_url="https://api.openai.com", api_key="test-key",
+            )
+        )
+
+        with patch("tinyCode.providers.openai.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=[]))
+
+        cache = CacheUsage.from_raw(provider.last_usage)
+        self.assertEqual(80, cache.read_tokens)
+        self.assertEqual(20, cache.miss_tokens)
+        self.assertTrue(provider.cache_hit)
+
     async def test_sse_data_line_without_space_is_accepted(self):
         _FakeAsyncClient.lines = [
             'data:{"choices":[{"delta":{"content":"works"}}]}',
@@ -671,6 +714,26 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeepSeekProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_usage_is_exposed_from_deepseek_counters(self):
+        _FakeAsyncClient.lines = [
+            'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_cache_hit_tokens":75,"prompt_cache_miss_tokens":25}}',
+            "data: [DONE]",
+        ]
+        provider = DeepSeekProvider(
+            ProviderConfig(
+                name="deepseek", protocol="deepseek", model="deepseek-chat",
+                base_url="https://api.deepseek.com", api_key="test-key",
+            )
+        )
+
+        with patch("tinyCode.providers.deepseek.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=[]))
+
+        cache = CacheUsage.from_raw(provider.last_usage)
+        self.assertEqual(75, cache.read_tokens)
+        self.assertEqual(25, cache.miss_tokens)
+        self.assertTrue(provider.cache_hit)
+
     async def test_non_object_sse_payload_is_skipped(self):
         _FakeAsyncClient.lines = [
             "data: []",
