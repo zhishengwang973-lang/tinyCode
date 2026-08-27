@@ -26,6 +26,13 @@ class OutputPromptTests(unittest.TestCase):
         self.assertIn("普通文本会被视为任务已经完成", prompt)
         self.assertIn("安全权限确认由系统的 HITL 流程处理", prompt)
 
+    def test_direct_answer_prompt_omits_only_tool_operations_policy(self):
+        prompt = PromptBuilder().build(include_tool_instructions=False)
+
+        self.assertNotIn("## 工具使用", prompt)
+        self.assertIn("## 安全边界", prompt)
+        self.assertIn("## 输出风格", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

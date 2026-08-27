@@ -20,7 +20,9 @@ from tinyCode.providers.base import create_provider
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.compression import ContextCompressor
 from tinyCode.conversation.truncator import ToolResultTruncator
-from tinyCode.prompts import PromptBuilder, PromptInjector, collect_environment
+from tinyCode.prompts import (
+    PromptBuilder, PromptInjector, collect_current_time, collect_environment,
+)
 from tinyCode.security import SecurityGuard, SecurityPolicy, PathSandbox, SecurityLevel
 from tinyCode.storage.sessions import SessionStore
 from tinyCode.tools import (
@@ -332,6 +334,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         hook_engine=hook_engine,
         instructions_text=instructions_text,
         environment_text=environment_text,
+        current_time_text=collect_current_time,
         max_rounds=app_config.max_rounds,
         round_extension=app_config.round_extension,
         hard_max_rounds=app_config.hard_max_rounds,

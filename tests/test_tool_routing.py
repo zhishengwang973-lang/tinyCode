@@ -8,6 +8,7 @@ class ToolRoutingTests(unittest.TestCase):
         prompts = [
             "写一个快速排序",
             "输出一个快速排序算法",
+            "给我一个归并排序的 Python 实现",
             "解释什么是二分查找",
             "give me a Python code snippet for quicksort",
             "write merge sort in Python",

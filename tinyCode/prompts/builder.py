@@ -24,22 +24,34 @@ class PromptBuilder:
 
     # -- output ---------------------------------------------------------------
 
-    def build(self) -> str:
-        """Plain string system prompt."""
+    def build(self, *, include_tool_instructions: bool = True) -> str:
+        """Plain string system prompt.
+
+        Direct, self-contained questions have no tool schema and therefore do
+        not need the long operational tool policy.  The remaining modules are
+        unchanged, so behavior, safety, and answer-format instructions stay
+        intact.
+        """
         parts: list[str] = []
         for m in self._modules:
+            if not include_tool_instructions and m.name == "tools":
+                continue
             parts.append(m.content)
         parts.extend(self._extra_sections)
         return "\n\n".join(parts)
 
-    def build_anthropic(self) -> list[dict]:
+    def build_anthropic(self, *, include_tool_instructions: bool = True) -> list[dict]:
         """Anthropic content blocks with ``cache_control`` on the last block.
 
         All stable modules share one cache breakpoint at the end.
         Extra (dynamic) sections are appended without cache markers.
         """
         blocks: list[dict] = []
-        stable_text = "\n\n".join(m.content for m in self._modules)
+        stable_text = "\n\n".join(
+            m.content
+            for m in self._modules
+            if include_tool_instructions or m.name != "tools"
+        )
 
         # Wrap stable text in a cache-controlled block
         blocks.append({

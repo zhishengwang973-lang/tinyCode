@@ -14,7 +14,9 @@ import httpx
 
 MAX_URL_CHARS = 4_096
 MAX_WEB_BYTES = 512_000
-MAX_WEB_TEXT_CHARS = 100_000
+# Web pages are particularly prone to boilerplate.  Keep a useful first page
+# in context; callers can fetch a more focused source when necessary.
+MAX_WEB_TEXT_CHARS = 32_000
 MAX_REDIRECTS = 5
 WEB_TIMEOUT_SECONDS = 20.0
 _ALLOWED_PORTS = {None, 80, 443}

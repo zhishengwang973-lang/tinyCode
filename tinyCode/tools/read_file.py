@@ -13,6 +13,7 @@ class ReadFileTool(BaseTool):
     """Read the contents of a file."""
 
     _allowed_encodings = ("utf-8", "gbk", "latin-1")
+    _default_chars = 16_000
     _max_chars = 200_000
 
     @property
@@ -32,14 +33,19 @@ class ReadFileTool(BaseTool):
         return [
             ToolParameter("path", "string", "文件路径，相对于工作目录。"),
             ToolParameter("offset", "integer", "从第几个字符开始读取，默认 0。", required=False),
-            ToolParameter("limit", "integer", "最多读取字符数，默认且最大 200000。", required=False),
+            ToolParameter(
+                "limit", "integer",
+                "最多读取字符数，默认 16000、最大 200000；大文件请分页读取。",
+                required=False,
+                default=self._default_chars,
+            ),
         ]
 
     async def execute(
         self,
         path: str,
         offset: int = 0,
-        limit: int = _max_chars,
+        limit: int = _default_chars,
     ) -> ToolResult:
         try:
             resolved = self._resolve(path)

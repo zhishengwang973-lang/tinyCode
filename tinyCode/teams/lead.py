@@ -16,7 +16,9 @@ from tinyCode.teams.tasks import SharedTaskList
 from tinyCode.providers.base import TokenUsage
 
 
-MAX_TEAM_PLAN_CHARS = 200_000
+# A Team plan is a small JSON routing artifact.  A bounded response prevents
+# a malformed planner stream from becoming an outsized, duplicated context.
+MAX_TEAM_PLAN_CHARS = 16_000
 
 
 class LeadAgent:

@@ -26,8 +26,11 @@ _MODEL_WINDOWS: dict[str, int] = {
 }
 DEFAULT_WINDOW = 128_000
 KEEP_RECENT = 4  # messages preserved verbatim at the tail
-MAX_SUMMARY_INPUT_CHARS = 400_000
-MAX_SUMMARY_OUTPUT_CHARS = 200_000
+# Compression is an exceptional extra model request.  These caps retain a
+# broad task history while preventing a single summary from costing more than
+# the working context it is meant to replace.
+MAX_SUMMARY_INPUT_CHARS = 160_000
+MAX_SUMMARY_OUTPUT_CHARS = 48_000
 
 # ---------------------------------------------------------------------------
 # Structured summary prompt
@@ -67,9 +70,9 @@ _SUMMARY_PROMPT = """\
 
 ---
 
-先将你的分析写成草稿，用 ```draft ... ``` 包裹。草稿写完后再输出正式摘要。
+摘要必须简洁、可执行；不要生成草稿或思维过程。
 
-**再次强调：不要调用任何工具，只输出摘要文本。**"""
+**再次强调：不要调用任何工具，只输出正式摘要文本。**"""
 
 #: Post-compression boundary message (appended after the summary).
 _BOUNDARY_MSG = (

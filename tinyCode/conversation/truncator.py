@@ -13,7 +13,10 @@ from pathlib import Path
 from tinyCode.providers.base import Message
 
 TOOL_RESULT_STORAGE_SUBDIR = Path(".tinyCode") / "tool_results"
-DEFAULT_PER_RESULT_THRESHOLD = 50_000
+# Keep ordinary tool observations compact enough to be repeated across a few
+# ReAct turns.  The complete result is persisted locally and can be searched
+# or read in pages, so this does not discard information.
+DEFAULT_PER_RESULT_THRESHOLD = 16_000
 
 
 def default_storage_dir(project_root: Path | None = None) -> Path:
@@ -31,7 +34,7 @@ DEFAULT_STORAGE_DIR = default_storage_dir()
 @dataclass
 class TruncateConfig:
     per_result_threshold: int = DEFAULT_PER_RESULT_THRESHOLD
-    total_round_threshold: int = 200_000     # chars — total tool-result context budget
+    total_round_threshold: int = 64_000      # chars — total tool-result context budget
     preview_length: int = 2_000              # chars of preview kept in-conversation
     storage_dir: Path = field(default_factory=default_storage_dir)
 

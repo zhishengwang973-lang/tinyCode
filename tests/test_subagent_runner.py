@@ -225,6 +225,17 @@ class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("task 19", compacted[-2]["content"])
         self.assertEqual("result 19", compacted[-1]["content"])
 
+    def test_fork_history_uses_the_character_budget_when_safe(self):
+        messages = [
+            {"role": "user", "content": f"task {index}: " + "x" * 3_000}
+            for index in range(20)
+        ]
+
+        compacted = SubAgentRunner._compact_fork_messages(messages)
+
+        self.assertLess(SubAgentRunner._fork_message_chars(compacted), 40_000)
+        self.assertEqual(messages[-1]["content"], compacted[-1]["content"])
+
     async def test_sub_agent_tool_returns_failure_when_runner_has_no_result(self):
         task_manager = BackgroundTaskManager()
         tool = SubAgentTool(

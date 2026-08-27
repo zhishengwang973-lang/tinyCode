@@ -54,7 +54,9 @@ def build_note_prompt(category: str, current_notes: str, recent_text: str) -> st
         category=category,
         category_description=NOTE_CATEGORY_DESCRIPTIONS.get(category, "用户指定的笔记分类"),
         current_notes=current_notes or "(暂无笔记)",
-        recent_conversation=recent_text[:8000],
+        # ``recent_text`` is append-only.  Its tail contains the last completed
+        # task, which is the information an incremental update must capture.
+        recent_conversation=recent_text[-8000:],
     )
 
 

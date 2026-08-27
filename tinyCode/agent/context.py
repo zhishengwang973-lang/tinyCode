@@ -48,11 +48,15 @@ class PromptContextAssembler:
         notes_text: str | None = None,
         skill_instructions: str | None = None,
         task_injection: str | None = None,
+        direct_answer: bool = False,
+        include_environment: bool = True,
     ) -> list[dict]:
         result: list[dict] = []
         is_anthropic = self._protocol == "anthropic"
         if not is_anthropic:
-            system_prompt = self._prompt_builder.build()
+            system_prompt = self._prompt_builder.build(
+                include_tool_instructions=not direct_answer,
+            )
             if system_prompt:
                 result.append({"role": "system", "content": system_prompt})
 
@@ -71,12 +75,16 @@ class PromptContextAssembler:
                 is_anthropic,
             )
 
-        self._append_pinned(
-            result,
-            "Notes",
-            self.notes_text() if notes_text is None else notes_text,
-            is_anthropic,
-        )
+        # Persistent project notes and workspace facts are useful for an
+        # in-project task, but add irrelevant cost (and cache churn) to a
+        # self-contained question such as an algorithm explanation.
+        if not direct_answer:
+            self._append_pinned(
+                result,
+                "Notes",
+                self.notes_text() if notes_text is None else notes_text,
+                is_anthropic,
+            )
 
         injection = (
             self._prompt_injector.build_injection(round_number)
@@ -85,12 +93,13 @@ class PromptContextAssembler:
         if injection:
             result.append({"role": "user", "content": injection})
 
-        self._append_pinned(
-            result,
-            "Environment",
-            self.environment_text() if environment_text is None else environment_text,
-            is_anthropic,
-        )
+        if not direct_answer or include_environment:
+            self._append_pinned(
+                result,
+                "Environment",
+                self.environment_text() if environment_text is None else environment_text,
+                is_anthropic,
+            )
 
         conversation = history.get_messages()
         if is_anthropic:
@@ -102,10 +111,12 @@ class PromptContextAssembler:
         result.extend(conversation)
         return result
 
-    def system_blocks(self) -> list[dict] | None:
+    def system_blocks(self, *, direct_answer: bool = False) -> list[dict] | None:
         if self._protocol != "anthropic":
             return None
-        return self._prompt_builder.build_anthropic()
+        return self._prompt_builder.build_anthropic(
+            include_tool_instructions=not direct_answer,
+        )
 
     def tool_definitions(self, registry: ToolRegistry) -> list[dict]:
         tools = (

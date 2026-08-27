@@ -520,6 +520,47 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         errors = [event for event in events if isinstance(event, ErrorEvent)]
         self.assertEqual("unadvertised_tool_call", errors[0].code)
 
+    async def test_direct_answer_omits_project_context_but_keeps_safe_prompt(self):
+        class NoteManager:
+            def context_text(self, *, query=""):
+                self.query = query
+                return "[项目知识]\n- 仅项目任务需要的背景"
+
+        provider = ToolCaptureProvider()
+        notes = NoteManager()
+        loop = self._make_loop(
+            provider,
+            note_manager=notes,
+            environment_text="cwd: /workspace",
+        )
+        history = ConversationHistory()
+        history.add_user_message("给我一个归并排序的 Python 实现")
+
+        _events = [event async for event in loop.run(history)]
+
+        sent = provider.received_messages[0]
+        contents = [str(message.get("content", "")) for message in sent]
+        self.assertFalse(any("[Notes]" in content for content in contents))
+        self.assertFalse(any("[Environment]" in content for content in contents))
+        self.assertFalse(any("## 工具使用" in content for content in contents))
+        self.assertTrue(any("## 安全边界" in content for content in contents))
+        self.assertFalse(hasattr(notes, "query"))
+
+    async def test_direct_time_question_includes_fresh_time_context(self):
+        provider = ToolCaptureProvider()
+        loop = self._make_loop(
+            provider,
+            environment_text="cwd: /workspace",
+            current_time_text=lambda: "当前时间: 2026-08-27 10:00 北京时间 (UTC+8)",
+        )
+        history = ConversationHistory()
+        history.add_user_message("现在几点？")
+
+        _events = [event async for event in loop.run(history)]
+
+        contents = [str(message.get("content", "")) for message in provider.received_messages[0]]
+        self.assertTrue(any("当前时间: 2026-08-27 10:00" in content for content in contents))
+
     async def test_new_direct_algorithm_request_does_not_send_previous_answer(self):
         provider = ToolCaptureProvider()
         loop = self._make_loop(provider)
@@ -1567,6 +1608,10 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("prompt_fingerprint", starts[0]["attributes"])
             self.assertIn("tools_fingerprint", starts[0]["attributes"])
             self.assertIn("first_changed_message_index", starts[0]["attributes"])
+            self.assertIn("estimated_input_tokens", starts[0]["attributes"])
+            self.assertIn("estimated_system_tokens", starts[0]["attributes"])
+            self.assertIn("estimated_conversation_tokens", starts[0]["attributes"])
+            self.assertIn("estimated_tool_schema_tokens", starts[0]["attributes"])
             self.assertIn("cache_read_tokens", ends[0]["attributes"])
             self.assertIn("cache_miss_tokens", ends[0]["attributes"])
             self.assertTrue(any(row["event"] == "round_start" for row in rows))

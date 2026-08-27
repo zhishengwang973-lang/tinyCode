@@ -10,6 +10,7 @@ from tinyCode.notes.manager import (
     MAX_NOTE_CONTEXT_CHARS,
     MAX_NOTE_OUTPUT_CHARS,
 )
+from tinyCode.notes.categories import build_note_prompt
 
 
 class CapturingProvider:
@@ -121,6 +122,14 @@ class AutoNoteManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("字符未注入", context)
         self.assertLess(len(context), MAX_NOTE_CONTEXT_CHARS + 200)
+
+    def test_note_update_uses_latest_conversation_window(self):
+        prompt = build_note_prompt(
+            "项目知识", "", "old-context\n" + "x" * 9_000 + "\nlatest-context",
+        )
+
+        self.assertIn("latest-context", prompt)
+        self.assertNotIn("old-context", prompt)
 
     async def test_update_all_runs_categories_concurrently_and_sums_usage(self):
         provider = ConcurrentProvider()

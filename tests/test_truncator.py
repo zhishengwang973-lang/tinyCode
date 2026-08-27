@@ -14,8 +14,8 @@ class ToolResultTruncatorTests(unittest.TestCase):
     def test_default_limits_match_public_context_contract(self):
         config = TruncateConfig()
 
-        self.assertEqual(50_000, config.per_result_threshold)
-        self.assertEqual(200_000, config.total_round_threshold)
+        self.assertEqual(16_000, config.per_result_threshold)
+        self.assertEqual(64_000, config.total_round_threshold)
         self.assertEqual(2_000, config.preview_length)
 
     def test_default_storage_is_project_local(self):

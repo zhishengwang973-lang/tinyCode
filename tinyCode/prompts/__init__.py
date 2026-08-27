@@ -3,11 +3,12 @@
 from tinyCode.prompts.loader import PromptModule, load_modules, load_injection
 from tinyCode.prompts.builder import PromptBuilder
 from tinyCode.prompts.injector import PromptInjector
-from tinyCode.prompts.environment import collect_environment
+from tinyCode.prompts.environment import collect_current_time, collect_environment
 
 __all__ = [
     "PromptModule",
     "PromptBuilder",
+    "collect_current_time",
     "PromptInjector",
     "collect_environment",
     "load_modules",

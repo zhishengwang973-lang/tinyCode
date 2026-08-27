@@ -26,7 +26,10 @@ _FORK_INSTRUCTION = """\
 - 报告格式：## 结果摘要 / ## 关键发现 / ## 文件与代码 / ## 建议"""
 
 _FORK_MAX_MESSAGES = 24
-_FORK_MAX_CHARS = 60_000
+# The delegated task is appended explicitly, so a concise recent, protocol-
+# safe parent suffix is enough for most forks.  Never cut at an unsafe tool
+# boundary; correctness wins when no valid suffix exists.
+_FORK_MAX_CHARS = 40_000
 
 
 class SubAgentRunner:

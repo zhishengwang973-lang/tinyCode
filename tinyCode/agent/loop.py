@@ -105,6 +105,7 @@ class AgentLoop:
         hook_engine: HookEngine | None = None,
         instructions_text: str = "",
         environment_text: str | Callable[[], str] = "",
+        current_time_text: Callable[[], str] | None = None,
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         round_extension: int = DEFAULT_ROUND_EXTENSION,
         hard_max_rounds: int = DEFAULT_HARD_MAX_ROUNDS,
@@ -131,6 +132,7 @@ class AgentLoop:
         self._hook_engine = hook_engine
         self._instructions_text = instructions_text
         self._environment_text = environment_text
+        self._current_time_text = current_time_text
         self._hard_max_rounds = self._validate_round_count(
             hard_max_rounds, "hard_max_rounds",
         )
@@ -173,6 +175,8 @@ class AgentLoop:
         self._task_skill_instructions: str | None = None
         self._task_injection: str | None = None
         self._task_tool_defs: list[dict] | None = None
+        self._task_is_direct_answer = False
+        self._task_needs_time = False
         self._previous_request_cache_shape: dict[str, object] | None = None
 
     # -- public API -----------------------------------------------------------
@@ -322,7 +326,7 @@ class AgentLoop:
         """Run one user turn and keep history valid if the pipeline fails."""
         history.flush_deferred()
         start_index = len(history.get_messages())
-        self._begin_task_prompt_snapshot()
+        self._begin_task_prompt_snapshot(history)
         try:
             async for event in self._run_impl(history):
                 yield event
@@ -1160,16 +1164,34 @@ class AgentLoop:
             notes_text=self._task_notes_text,
             skill_instructions=self._task_skill_instructions,
             task_injection=self._task_injection,
+            direct_answer=self._task_is_direct_answer,
+            include_environment=(
+                not self._task_is_direct_answer or self._task_needs_time
+            ),
         )
 
     def _build_system_blocks(self) -> list[dict] | None:
         """Build Anthropic system blocks (None for other providers)."""
-        return self._context_assembler.system_blocks()
+        return self._context_assembler.system_blocks(
+            direct_answer=self._task_is_direct_answer,
+        )
 
-    def _begin_task_prompt_snapshot(self) -> None:
+    def _begin_task_prompt_snapshot(self, history: ConversationHistory) -> None:
         """Freeze dynamic prefix inputs for the lifetime of one user task."""
+        self._task_is_direct_answer = not should_enable_tools(history.get_messages())
+        self._task_needs_time = self._task_needs_current_time(history)
         self._task_environment_text = self._current_environment_text()
-        self._task_notes_text = self._current_notes_text()
+        if self._task_needs_time and self._current_time_text:
+            current_time = self._current_time_text().strip()
+            if current_time:
+                self._task_environment_text = "\n".join(
+                    value for value in (self._task_environment_text, current_time) if value
+                )
+        self._task_notes_text = (
+            "" if self._task_is_direct_answer else self._current_notes_text(
+                self._latest_user_text(history),
+            )
+        )
         self._task_skill_instructions = (
             self._skill_registry.get_active_instructions()
             if self._skill_registry is not None
@@ -1183,6 +1205,8 @@ class AgentLoop:
         self._task_skill_instructions = None
         self._task_injection = None
         self._task_tool_defs = None
+        self._task_is_direct_answer = False
+        self._task_needs_time = False
         self._previous_request_cache_shape = None
 
     @staticmethod
@@ -1252,6 +1276,11 @@ class AgentLoop:
             request_number = self.turn_model_requests
             request_started = monotonic()
             cache_shape = self._cache_shape_attributes(messages, tools, system_blocks)
+            token_budget = (
+                self._request_token_budget_attributes(messages, tools, system_blocks)
+                if self._trace_recorder is not None
+                else {}
+            )
             trace_scope = (
                 self._trace_recorder.span(
                     f"request #{request_number}",
@@ -1263,6 +1292,7 @@ class AgentLoop:
                         "message_count": len(messages),
                         "tool_schema_count": len(tools or []),
                         "model": self._provider.config.model,
+                        **token_budget,
                         **cache_shape,
                     },
                 )
@@ -1329,6 +1359,7 @@ class AgentLoop:
                             "first_token_ms": first_token_ms,
                         })
                     raise
+
                 except Exception as exc:
                     await self._close_provider_stream(stream)
                     retryable = (
@@ -1381,6 +1412,73 @@ class AgentLoop:
                             f"模型{stage}超时（{timeout:g} 秒）"
                         ) from exc
                     raise
+
+    @staticmethod
+    def _request_token_budget_attributes(
+        messages: list[Message],
+        tools: list[dict] | None,
+        system_blocks: list[dict] | None,
+    ) -> dict[str, int]:
+        """Estimate input-token contributors for local cost diagnosis.
+
+        Provider usage remains the billing source of truth.  These stable,
+        tokenizer-independent estimates only identify which prompt component
+        is worth optimizing without recording prompt payloads in Trace.
+        """
+        components = {
+            "system": 0,
+            "instructions": 0,
+            "skills": 0,
+            "notes": 0,
+            "environment": 0,
+            "conversation": 0,
+            "tool_schema": 0,
+        }
+
+        def estimate_message(message: Message) -> int:
+            return StructuredSummarizer._estimate_tokens([message])
+
+        for block in system_blocks or []:
+            if isinstance(block, dict):
+                components["system"] += estimate_message({
+                    "role": "system", "content": block.get("text", ""),
+                })
+
+        labels = {
+            "[Instructions]": "instructions",
+            "[Activated Skills]": "skills",
+            "[Notes]": "notes",
+            "[Environment]": "environment",
+        }
+        for message in messages:
+            content = message.get("content")
+            target = (
+                next(
+                    (name for prefix, name in labels.items() if content.startswith(prefix)),
+                    None,
+                )
+                if isinstance(content, str) else None
+            )
+            if target is not None:
+                components[target] += estimate_message(message)
+            elif message.get("role") == "system":
+                components["system"] += estimate_message(message)
+            else:
+                components["conversation"] += estimate_message(message)
+
+        if tools:
+            components["tool_schema"] = StructuredSummarizer._estimate_tokens([{
+                "role": "system",
+                "content": json.dumps(tools, ensure_ascii=False),
+            }])
+
+        return {
+            "estimated_input_tokens": sum(components.values()),
+            **{
+                f"estimated_{name}_tokens": value
+                for name, value in components.items()
+            },
+        }
 
     @staticmethod
     async def _close_provider_stream(stream) -> None:
@@ -1628,10 +1726,33 @@ class AgentLoop:
     def _current_environment_text(self) -> str:
         return self._context_assembler.environment_text()
 
-    def _current_notes_text(self) -> str:
+    def _current_notes_text(self, query: str = "") -> str:
         if self._note_manager is None:
             return ""
-        return self._note_manager.context_text()
+        # Third-party note managers from earlier versions may not yet accept
+        # a query.  Keep that extension point compatible.
+        try:
+            return self._note_manager.context_text(query=query)
+        except TypeError:
+            return self._note_manager.context_text()
+
+    @staticmethod
+    def _latest_user_text(history: ConversationHistory) -> str:
+        for message in reversed(history.get_messages()):
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                return message["content"]
+        return ""
+
+    @classmethod
+    def _task_needs_current_time(cls, history: ConversationHistory) -> bool:
+        text = cls._latest_user_text(history).lower()
+        if not text:
+            return False
+        markers = (
+            "当前时间", "现在几点", "几点了", "今天几号", "今天日期", "北京时间",
+            "current time", "what time", "today's date", "todays date",
+        )
+        return any(marker in text for marker in markers)
 
     def _append_tool_result(
         self, history: ConversationHistory, tool_call: ToolCall, result: ToolResult,

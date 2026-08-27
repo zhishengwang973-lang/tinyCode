@@ -65,6 +65,11 @@ def should_enable_tools(messages: list[Message]) -> bool:
     normalized = " ".join(latest.casefold().split())
     if normalized in _SMALL_TALK:
         return False
+    # A concrete standalone algorithm/example remains direct even if it uses
+    # a verb such as “实现”.  Check this before broad workspace keywords so
+    # “给我一个归并排序实现” does not accidentally inspect the repository.
+    if _SELF_CONTAINED_RE.search(latest):
+        return False
     if any(term in normalized for term in _CHINESE_WORKSPACE_TERMS):
         return True
     if _ENGLISH_WORKSPACE_RE.search(latest):
@@ -73,8 +78,6 @@ def should_enable_tools(messages: list[Message]) -> bool:
         return True
     if normalized in _CONTINUATION_TERMS:
         return _has_prior_tool_exchange(messages)
-    if _SELF_CONTAINED_RE.search(latest):
-        return False
     # TinyCode is a workspace coding agent.  Unknown actionable requests are
     # safer to route with tools available than to silently make implementation
     # impossible.  Only high-confidence self-contained questions opt out.

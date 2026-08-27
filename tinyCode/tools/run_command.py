@@ -25,9 +25,9 @@ _INTERACTIVE_COMMANDS = {
     "less", "more", "man",
 }
 
-# This must remain above the conversation truncator threshold. Otherwise a
-# command can discard its large output before the session layer has a chance
-# to persist it and expose tool_result_search/tool_result_read.
+# This stays above the conversation truncator threshold.  A command can retain
+# enough diagnostic context while the session layer persists anything larger
+# for later targeted retrieval.
 OUTPUT_LIMIT = DEFAULT_PER_RESULT_THRESHOLD * 2
 COMMAND_TIMEOUT = 25.0
 _SENSITIVE_ENV_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
