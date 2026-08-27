@@ -210,6 +210,21 @@ class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
             message.get("tool_call_id") == "call_finished" for message in copied
         ))
 
+    def test_long_fork_history_keeps_a_recent_protocol_safe_suffix(self):
+        messages = []
+        for index in range(20):
+            messages.extend([
+                {"role": "user", "content": f"task {index}"},
+                {"role": "assistant", "content": f"result {index}"},
+            ])
+
+        compacted = SubAgentRunner._compact_fork_messages(messages)
+
+        self.assertLessEqual(len(compacted), 24)
+        self.assertEqual("user", compacted[0]["role"])
+        self.assertEqual("task 19", compacted[-2]["content"])
+        self.assertEqual("result 19", compacted[-1]["content"])
+
     async def test_sub_agent_tool_returns_failure_when_runner_has_no_result(self):
         task_manager = BackgroundTaskManager()
         tool = SubAgentTool(

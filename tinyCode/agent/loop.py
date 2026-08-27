@@ -393,6 +393,7 @@ class AgentLoop:
             for injection in self._prompt_injector.consume_pending_injections():
                 request_history.add_context_message(injection)
 
+            prepared_messages: list | None = None
             if self._compressor is not None:
                 history_tokens = StructuredSummarizer._estimate_tokens(
                     request_history.get_messages()
@@ -499,6 +500,11 @@ class AgentLoop:
                         code="context_compression_failed",
                     )
                     return
+                # Reuse the assembled request when history is unchanged. On
+                # long conversations this avoids a second full deepcopy and
+                # prompt rebuild before every model request.
+                if not comp.was_compressed:
+                    prepared_messages = assembled
 
             if self._trace_recorder is not None:
                 self._trace_recorder.record("round_start", attributes={
@@ -512,7 +518,11 @@ class AgentLoop:
             )
 
             # --- 1. 拼装本轮 messages ---
-            messages = self._assemble_messages(request_history, round_num)
+            messages = (
+                prepared_messages
+                if prepared_messages is not None
+                else self._assemble_messages(request_history, round_num)
+            )
 
             # --- 1.5. Layer 1 截断 ---
             if self._truncator is not None:
@@ -1593,6 +1603,16 @@ class AgentLoop:
         """Switch the global security level."""
         if self._security_guard:
             self._security_guard.set_level(level)
+
+    def tool_may_modify_workspace(self, tool_name: str) -> bool:
+        """Whether a call needs a before/after workspace snapshot.
+
+        Read tools are declared concurrency-safe and must not mutate the
+        project. Unknown tools retain the conservative answer so a newly added
+        extension cannot silently disappear from change reporting.
+        """
+        tool = self._tool_registry.get(tool_name)
+        return tool is None or tool.category.value != "read"
 
     def set_workspace(self, workspace: Path) -> None:
         if self._security_guard:

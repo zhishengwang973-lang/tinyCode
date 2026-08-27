@@ -1,7 +1,10 @@
 """Sub-agent runner — executes a sub-agent to completion (run-to-end mode)."""
 
+import json
+
 from tinyCode.agent.loop import AgentLoop
 from tinyCode.conversation.history import ConversationHistory
+from tinyCode.conversation.summarizer import _find_safe_split
 from tinyCode.providers.base import BaseProvider, create_provider
 from tinyCode.prompts.builder import PromptBuilder
 from tinyCode.prompts.injector import PromptInjector
@@ -21,6 +24,9 @@ _FORK_INSTRUCTION = """\
 - 直接使用工具完成任务，不需要征求许可
 - 完成后输出结构化报告，控制在 500 字以内
 - 报告格式：## 结果摘要 / ## 关键发现 / ## 文件与代码 / ## 建议"""
+
+_FORK_MAX_MESSAGES = 24
+_FORK_MAX_CHARS = 60_000
 
 
 class SubAgentRunner:
@@ -191,7 +197,46 @@ class SubAgentRunner:
                         )
                     ]
             fork_history.add_raw_message(copied)
+        compacted = SubAgentRunner._compact_fork_messages(
+            fork_history.get_messages(),
+        )
+        fork_history.replace_messages(compacted)
         return fork_history
+
+    @staticmethod
+    def _compact_fork_messages(messages: list[dict]) -> list[dict]:
+        """Keep a protocol-safe recent suffix for an unusually long fork."""
+        if (
+            len(messages) <= _FORK_MAX_MESSAGES
+            and SubAgentRunner._fork_message_chars(messages) <= _FORK_MAX_CHARS
+        ):
+            return messages
+
+        desired = max(0, len(messages) - _FORK_MAX_MESSAGES)
+        seen_splits: set[int] = set()
+        for candidate in range(desired, len(messages)):
+            split = _find_safe_split(messages, candidate)
+            if split in seen_splits:
+                continue
+            seen_splits.add(split)
+            suffix = messages[split:]
+            if not suffix:
+                continue
+            if (
+                len(suffix) <= _FORK_MAX_MESSAGES
+                and SubAgentRunner._fork_message_chars(suffix) <= _FORK_MAX_CHARS
+            ):
+                return suffix
+        # Prefer correctness over a lossy context cut when no protocol-safe
+        # suffix fits the bounded snapshot.
+        return messages
+
+    @staticmethod
+    def _fork_message_chars(messages: list[dict]) -> int:
+        return sum(
+            len(json.dumps(message, ensure_ascii=False, default=str))
+            for message in messages
+        )
 
     @staticmethod
     def _unpaired_tool_call_ids(messages: list[dict]) -> set[str]:

@@ -59,6 +59,14 @@ class MCPToolAdapter(_ClientBackedAdapter, BaseTool):
         self._description = tool_def.get("description", "")
         input_schema = tool_def.get("inputSchema", {})
         self._input_schema = input_schema if isinstance(input_schema, dict) else {}
+        # MCP tools may explicitly advertise that they are read-only.  Treat
+        # only the literal boolean True as safe for concurrent execution;
+        # missing or malformed hints retain the conservative WRITE default.
+        annotations = tool_def.get("annotations", {})
+        self._read_only = (
+            isinstance(annotations, dict)
+            and annotations.get("readOnlyHint") is True
+        )
 
     @property
     def name(self) -> str:
@@ -70,7 +78,7 @@ class MCPToolAdapter(_ClientBackedAdapter, BaseTool):
 
     @property
     def category(self) -> ToolCategory:
-        return ToolCategory.WRITE
+        return ToolCategory.READ if self._read_only else ToolCategory.WRITE
 
     @property
     def parameters(self) -> list[ToolParameter]:

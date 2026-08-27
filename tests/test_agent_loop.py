@@ -700,6 +700,32 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             for message in history.get_messages()
         ))
 
+    async def test_noop_compression_reuses_the_assembled_request(self):
+        class NoopCompressor:
+            context_window = 100_000
+
+            async def check_and_compress(self, history, provider, *, extra_tokens=0):
+                return CompressionResult()
+
+        loop = self._make_loop(
+            TimeoutThenSuccessProvider(), compressor=NoopCompressor(),
+        )
+        assemble = loop._assemble_messages
+        calls = 0
+
+        def counted(history, round_num):
+            nonlocal calls
+            calls += 1
+            return assemble(history, round_num)
+
+        loop._assemble_messages = counted
+        history = ConversationHistory()
+        history.add_user_message("explain this")
+
+        _events = [event async for event in loop.run(history)]
+
+        self.assertEqual(1, calls)
+
     async def test_completed_tool_history_survives_follow_up_provider_failure(self):
         registry = ToolRegistry()
         tool = WriteFixtureTool()
@@ -948,6 +974,20 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             if "[Activated Skills]" in str(msg.get("content"))
         )
         self.assertEqual(first_skills, second_skills)
+
+    def test_read_tools_do_not_require_a_workspace_change_snapshot(self):
+        registry = ToolRegistry()
+        registry.register(ReadFixtureTool())
+        loop = AgentLoop(
+            provider=UnknownToolProvider(),
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+        )
+
+        self.assertFalse(loop.tool_may_modify_workspace("read_fixture"))
+        self.assertTrue(loop.tool_may_modify_workspace("missing_extension"))
 
     def test_workspace_switch_moves_tool_result_cache_root(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:

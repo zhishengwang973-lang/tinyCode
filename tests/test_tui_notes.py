@@ -242,6 +242,21 @@ class WorkspaceChangingAgentLoop(FakeAgentLoop):
         yield AgentDoneEvent("no_tool_call")
 
 
+class ReadOnlyAgentLoop(FakeAgentLoop):
+    def tool_may_modify_workspace(self, _tool_name: str) -> bool:
+        return False
+
+    async def run(self, history):
+        yield ToolCallEvent(ToolCall("call_1", "read_file", {"path": "README.md"}))
+        yield ToolResultEvent(
+            tool_name="read_file",
+            call_id="call_1",
+            result=ToolResult(success=True, content="read"),
+        )
+        yield TextDeltaEvent("done")
+        yield AgentDoneEvent("no_tool_call")
+
+
 class RoundReportingAgentLoop(FakeAgentLoop):
     def __init__(self) -> None:
         super().__init__()
@@ -649,6 +664,14 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(rendered.index("文件变更"), rendered.index("✓ 本轮已正常完成"))
         self.assertLess(rendered.index("✓ 本轮已正常完成"), rendered.index("本轮统计"))
         self.assertLess(rendered.index("本轮统计"), rendered.index("上下文   ·"))
+
+    async def test_read_only_tool_skips_workspace_scan(self):
+        tui, _output = self._make_tui(ReadOnlyAgentLoop())
+
+        with patch("tinyCode.tui.app.WorkspaceSnapshot.capture") as capture:
+            await tui._on_user_input("read only")
+
+        capture.assert_not_called()
 
     async def test_context_snapshot_is_shown_after_turn_metrics(self):
         tui, output = self._make_tui(FakeAgentLoop("done"))

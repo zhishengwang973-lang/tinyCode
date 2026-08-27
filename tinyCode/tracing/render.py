@@ -110,6 +110,14 @@ def render_text(path: Path) -> str:
             summary_parts.append(f"{label} {int(value):,}")
     if summary_parts:
         lines.append("统计: " + " · ".join(summary_parts))
+    timing_summary = _timing_summary(spans, duration)
+    if timing_summary:
+        lines.append(
+            "关键路径耗时: " + " · ".join(
+                f"{label} {_duration(elapsed)} ({share:.0%})"
+                for label, elapsed, share in timing_summary
+            )
+        )
 
     # A sub-agent inherits the parent tool span and emits its own round events.
     # Keep only root rounds as section headers; nested model/tool spans remain
@@ -240,6 +248,12 @@ def render_html(path: Path) -> str:
             "</tr>"
         )
     token_svg = _token_chart(spans)
+    timing_cards = "".join(
+        "<div class='card'><span class='muted'>"
+        f"{html.escape(label)}</span><br><strong>{html.escape(_duration(elapsed))}</strong>"
+        f" <small>{share:.0%}</small></div>"
+        for label, elapsed, share in _timing_summary(spans, task_duration_ms)
+    )
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -262,6 +276,7 @@ svg{{width:100%;height:180px;background:var(--panel);border:1px solid var(--line
 <div class="cards"><div class="card">状态<br><strong class="{'ok-text' if status in {'ok','no_tool_call'} else 'error-text'}">{html.escape(_status_label(status))}</strong></div>
 <div class="card">任务耗时<br><strong>{html.escape(_duration(task_duration_ms))}</strong></div>
 <div class="card">Span<br><strong>{len(spans)}</strong></div><div class="card">事件<br><strong>{len(rows)}</strong></div></div>
+<h2>关键路径耗时</h2><div class="cards">{timing_cards or "<div class='muted'>没有可归类的耗时 Span</div>"}</div>
 <h2>执行时间线</h2>{''.join(bars) or '<div class="muted">没有 Span 数据</div>'}
 <h2>模型 Token 曲线</h2>{token_svg}
 <h2>上下文窗口曲线</h2>{_context_chart(rows)}
@@ -300,6 +315,35 @@ def _token_chart(spans: list[_Span]) -> str:
         f"<polyline points='{coordinates}' fill='none' stroke='#7799ff' stroke-width='3'/>"
         f"<text x='24' y='24' fill='#8d98aa'>累计 {max_y:,} Token</text></svg>"
     )
+
+
+def _timing_summary(
+    spans: list[_Span], task_duration_ms: float,
+) -> list[tuple[str, float, float]]:
+    """Summarize root spans so nested sub-agent time is not double-counted."""
+    span_ids = {span.span_id for span in spans}
+    totals: dict[str, float] = {}
+    labels = {
+        "model_request": "模型请求",
+        "context_compression": "上下文压缩",
+        "compression_model_request": "上下文压缩",
+        "tool": "工具执行",
+        "user_wait": "用户等待",
+        "notes": "自动笔记",
+        "workspace_scan": "工作区扫描",
+    }
+    for span in spans:
+        if span.parent_span_id in span_ids:
+            continue
+        label = labels.get(span.kind, "其他")
+        totals[label] = totals.get(label, 0.0) + max(0.0, span.duration_ms)
+
+    denominator = max(1.0, task_duration_ms)
+    return [
+        (label, elapsed, min(1.0, elapsed / denominator))
+        for label, elapsed in sorted(totals.items(), key=lambda item: -item[1])
+        if elapsed > 0
+    ]
 
 
 def _context_chart(rows: list[dict[str, Any]]) -> str:
@@ -442,6 +486,7 @@ def _kind_label(kind: str) -> str:
         "tool": "工具",
         "user_wait": "用户等待",
         "notes": "笔记",
+        "workspace_scan": "工作区扫描",
     }.get(kind, kind)
 
 

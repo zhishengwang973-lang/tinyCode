@@ -38,6 +38,30 @@ class FakePromptClient:
 
 
 class MCPToolAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def test_explicit_read_only_hint_allows_concurrent_read_batch(self):
+        adapter = MCPToolAdapter(
+            FakeMCPClient(),
+            {
+                "name": "remote_read",
+                "inputSchema": {},
+                "annotations": {"readOnlyHint": True},
+            },
+        )
+
+        self.assertEqual(ToolCategory.READ, adapter.category)
+
+    def test_missing_or_malformed_read_only_hint_keeps_safe_write_default(self):
+        for hint in (None, False, "true"):
+            adapter = MCPToolAdapter(
+                FakeMCPClient(),
+                {
+                    "name": "remote_action",
+                    "inputSchema": {},
+                    "annotations": {"readOnlyHint": hint},
+                },
+            )
+            self.assertEqual(ToolCategory.WRITE, adapter.category)
+
     async def test_tool_call_error_returns_structured_failure(self):
         adapter = MCPToolAdapter(
             FakeMCPClient(),

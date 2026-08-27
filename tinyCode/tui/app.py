@@ -637,11 +637,35 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(event.label)
 
                 elif isinstance(event, ToolCallEvent):
-                    if workspace_snapshot is None:
-                        workspace_snapshot = await asyncio.to_thread(
-                            WorkspaceSnapshot.capture,
-                            Path.cwd(),
+                    may_modify = getattr(
+                        self._agent_loop, "tool_may_modify_workspace", None,
+                    )
+                    should_capture = (
+                        True
+                        if not callable(may_modify)
+                        else bool(may_modify(event.tool_call.name))
+                    )
+                    if workspace_snapshot is None and should_capture:
+                        trace_scope = (
+                            self._trace_recorder.span(
+                                "workspace_snapshot",
+                                "workspace_scan",
+                                {"phase": "before_write", "tool": event.tool_call.name},
+                            )
+                            if self._trace_recorder is not None
+                            else nullcontext(None)
                         )
+                        with trace_scope as trace_span:
+                            workspace_snapshot = await asyncio.to_thread(
+                                WorkspaceSnapshot.capture,
+                                Path.cwd(),
+                            )
+                            if trace_span is not None:
+                                trace_span.finish("ok", {
+                                    "phase": "before_write",
+                                    "tool": event.tool_call.name,
+                                    "files": len(workspace_snapshot.files),
+                                })
                     metrics.record_tool_call()
                     stream_line_open = self._close_stream_line(stream_line_open)
                     self._start_progress(f"执行工具 {event.tool_call.name}")
@@ -1167,7 +1191,24 @@ class TinyCodeTUI(UIControl):
     ) -> None:
         if snapshot is None:
             return
-        changes = await asyncio.to_thread(snapshot.compare)
+        trace_scope = (
+            self._trace_recorder.span(
+                "workspace_snapshot",
+                "workspace_scan",
+                {"phase": "after_task"},
+            )
+            if self._trace_recorder is not None
+            else nullcontext(None)
+        )
+        with trace_scope as trace_span:
+            changes = await asyncio.to_thread(snapshot.compare)
+            if trace_span is not None:
+                trace_span.finish("ok", {
+                    "phase": "after_task",
+                    "added": len(changes.added),
+                    "modified": len(changes.modified),
+                    "deleted": len(changes.deleted),
+                })
         if not changes.any:
             return
         if self._trace_recorder is not None:

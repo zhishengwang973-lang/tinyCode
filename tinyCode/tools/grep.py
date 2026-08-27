@@ -1,7 +1,10 @@
 """Grep tool — search for a pattern in file contents."""
 
 import asyncio
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from tinyCode.tools.base import BaseTool, ToolCategory, ToolParameter, ToolResult
@@ -12,6 +15,7 @@ MAX_RESULTS = 50
 SNIPPET_LENGTH = 300  # max chars of context per match
 MAX_FILE_BYTES = 2_000_000
 MAX_PATTERN_CHARS = 1_000
+RG_TIMEOUT_SECONDS = 30.0
 _NESTED_REPEAT_RE = re.compile(
     r"\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)\s*(?:[*+]|\{\d*,?\d*\})"
 )
@@ -57,10 +61,108 @@ class GrepTool(BaseTool):
         # Repository traversal and decoding are blocking filesystem work. Run
         # them outside the event-loop thread so progress, cancellation and
         # other background tasks remain responsive on large projects.
-        return await asyncio.to_thread(self._search, cwd, regex)
+        return await asyncio.to_thread(self._search, cwd, regex, pattern)
 
     @staticmethod
-    def _search(cwd: Path, regex: re.Pattern[str]) -> ToolResult:
+    def _search(cwd: Path, regex: re.Pattern[str], pattern: str) -> ToolResult:
+        """Use ripgrep when installed; retain the portable Python fallback."""
+        rg = shutil.which("rg")
+        if rg:
+            result = GrepTool._search_with_rg(cwd, pattern, rg)
+            if result is not None:
+                return result
+        return GrepTool._search_python(cwd, regex)
+
+    @staticmethod
+    def _search_with_rg(
+        cwd: Path, pattern: str, executable: str,
+    ) -> ToolResult | None:
+        """Return ``None`` when ripgrep cannot safely replace Python regex."""
+        command = [
+            executable,
+            "--json",
+            "--no-messages",
+            "--no-ignore",
+            "--max-filesize", "2M",
+            "--max-count", str(MAX_RESULTS),
+            "--max-columns", str(SNIPPET_LENGTH),
+            "--glob", "!.git/**",
+            "--glob", "!.hg/**",
+            "--glob", "!.svn/**",
+            "--glob", "!node_modules/**",
+            "--glob", "!.venv/**",
+            "--glob", "!venv/**",
+            "--glob", "!__pycache__/**",
+            "--",
+            pattern,
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            return None
+
+        results: list[str] = []
+        truncated = False
+        try:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "match":
+                    continue
+                data = event.get("data")
+                if not isinstance(data, dict):
+                    continue
+                path_data = data.get("path")
+                line_data = data.get("lines")
+                line_number = data.get("line_number")
+                if not isinstance(path_data, dict) or not isinstance(line_data, dict):
+                    continue
+                path = path_data.get("text")
+                line = line_data.get("text")
+                if (
+                    not isinstance(path, str)
+                    or not isinstance(line, str)
+                    or not isinstance(line_number, int)
+                ):
+                    continue
+                results.append(f"{path}:{line_number}: {line.rstrip()[:SNIPPET_LENGTH]}")
+                if len(results) >= MAX_RESULTS:
+                    truncated = True
+                    process.terminate()
+                    break
+            return_code = process.wait(timeout=RG_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait()
+            return None
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+        # Exit 2 means the server's Rust regex engine rejected a construct
+        # accepted by Python. Preserve compatibility by using the fallback.
+        if return_code not in {0, 1, -15}:
+            return None
+        if not results:
+            return ToolResult(success=True, content="(无匹配)")
+        header = f"找到 {len(results)} 条匹配"
+        if truncated:
+            header += f"（已截断到前 {MAX_RESULTS} 条）"
+        return ToolResult(success=True, content=header + "\n" + "\n".join(results))
+
+    @staticmethod
+    def _search_python(cwd: Path, regex: re.Pattern[str]) -> ToolResult:
         results: list[str] = []
         truncated = False
 
