@@ -26,6 +26,9 @@ Thumbs.db
 !tinyCode/skills/builtin/
 !tinyCode/subagent/roles/builtin/
 
+# Generated evaluation reports
+evals/results/
+
 # Sensitive configs (keep examples)
 .tinyCode.yaml
 .tinyCode-security.yaml
@@ -44,4 +47,3 @@ temp_tinyCode
 
 #docs
 docs/
-

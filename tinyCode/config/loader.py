@@ -377,3 +377,31 @@ def load_config() -> AppConfig:
             max_files=max_trace_files,
         ),
     )
+
+
+def load_provider_config(provider_name: str) -> ProviderConfig:
+    """Load one named provider and resolve only that provider's credential.
+
+    Evaluation runs intentionally use two independent providers.  Resolving
+    every configured credential would make an otherwise valid multi-provider
+    setup fail merely because an unused vendor key is absent.
+    """
+    if not isinstance(provider_name, str) or not provider_name.strip():
+        raise ConfigError("Provider 名称必须是非空字符串")
+    wanted = provider_name.strip()
+    raw = _discover_raw_config()
+    providers_raw = raw.get("providers")
+    if not isinstance(providers_raw, list) or not providers_raw:
+        raise ConfigError("配置文件 'providers' 必须是非空列表")
+
+    seen: set[str] = set()
+    for index, item in enumerate(providers_raw):
+        public = _validate_provider(item, index, resolve_secret=False)
+        if public.name in seen:
+            raise ConfigError(f"Provider 名称重复: {public.name}")
+        seen.add(public.name)
+        if public.name == wanted:
+            return _validate_provider(item, index, resolve_secret=True)
+    raise ConfigError(
+        f"Provider '{wanted}' 不在 providers 列表中（可用: {', '.join(sorted(seen))}）"
+    )

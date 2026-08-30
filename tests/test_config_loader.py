@@ -5,10 +5,33 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tinyCode.config.constants import DEFAULT_NOTES_ENABLED
-from tinyCode.config.loader import ConfigError, load_config
+from tinyCode.config.loader import ConfigError, load_config, load_provider_config
 
 
 class ConfigLoaderTests(unittest.TestCase):
+    def test_load_named_provider_resolves_only_the_requested_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: executor\n"
+                "    protocol: openai\n"
+                "    model: executor-model\n"
+                "    api_key: executor-key\n"
+                "  - name: judge\n"
+                "    protocol: openai\n"
+                "    model: judge-model\n"
+                "    api_key_env: MISSING_JUDGE_KEY\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                executor = load_provider_config("executor")
+                with self.assertRaisesRegex(ConfigError, "MISSING_JUDGE_KEY"):
+                    load_provider_config("judge")
+
+        self.assertEqual("executor-key", executor.api_key)
+        self.assertEqual("executor-model", executor.model)
+
     def test_empty_providers_exits_with_readable_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / ".tinyCode.yaml"

@@ -1,0 +1,19 @@
+name: 修复 greeting 回归
+tags: [smoke, coding, regression]
+prompt: 修复 greeting.py 的 greet 函数，使其返回中文问候语；运行测试并说明结果。
+fixture: fixtures/greeting_bug
+assertions:
+  tests:
+    - command: python3 -m unittest
+      timeout_seconds: 30
+  file_contains:
+    - path: greeting.py
+      text: 'return f"你好，{name}"'
+  tools_used: [read_file]
+  tools_not_used: [delete_file]
+  no_errors: true
+budgets:
+  max_rounds: 10
+  max_model_requests: 14
+  max_tokens: 60000
+  max_duration_seconds: 180
