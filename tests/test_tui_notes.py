@@ -29,7 +29,7 @@ from tinyCode.security.models import HITLDecision
 from tinyCode.security.models import SecurityLevel
 from tinyCode.providers.base import CacheUsage, TokenUsage, ToolCall
 from tinyCode.tools.base import ToolResult
-from tinyCode.tui.app import TinyCodeTUI
+from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
 from tinyCode.config.models import TracingConfig
 from tinyCode.tracing.recorder import TraceRecorder
 
@@ -633,15 +633,17 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
         rendered = output.getvalue()
         completion_index = rendered.index("✓ 本轮已正常完成")
-        metrics_index = rendered.index("本轮统计")
+        metrics_index = rendered.index("本轮统计 · Turn 1")
         self.assertLess(completion_index, metrics_index)
-        self.assertIn("Turn: 1", rendered)
-        self.assertIn("模型请求: 2 次", rendered)
-        self.assertIn("消耗 Token: 125", rendered)
-        self.assertIn("耗时: 2.35 秒", rendered)
-        self.assertIn("工具调用: 3 次", rendered)
-        self.assertIn("成功率: 66.7%", rendered)
-        self.assertIn("cache 命中 80 Token (80%) · 写入 20", rendered)
+        self.assertIn("本轮统计 · Turn 1", rendered)
+        self.assertIn("请求 2", rendered)
+        self.assertIn("Token 125", rendered)
+        self.assertIn("2.35 秒", rendered)
+        self.assertIn("工具 3（66.7%）", rendered)
+        self.assertIn(
+            "           Token 125 · Cache 命中 80（80%） · 写入 20",
+            rendered,
+        )
 
     async def test_completion_lists_all_workspace_file_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -658,12 +660,11 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("+ created.py", rendered)
         self.assertIn("~ changed.py", rendered)
         self.assertIn("- deleted.py", rendered)
-        self.assertIn("\n\n文件变更", rendered)
-        self.assertIn("- deleted.py\n\n✓ 本轮已正常完成", rendered)
+        self.assertIn("- deleted.py", rendered)
         self.assertLess(rendered.index("TinyCode: done"), rendered.index("文件变更"))
         self.assertLess(rendered.index("文件变更"), rendered.index("✓ 本轮已正常完成"))
-        self.assertLess(rendered.index("✓ 本轮已正常完成"), rendered.index("本轮统计"))
-        self.assertLess(rendered.index("本轮统计"), rendered.index("上下文   ·"))
+        self.assertLess(rendered.index("✓ 本轮已正常完成"), rendered.index("Turn "))
+        self.assertLess(rendered.index("Turn "), rendered.index("上下文   ·"))
 
     async def test_read_only_tool_skips_workspace_scan(self):
         tui, _output = self._make_tui(ReadOnlyAgentLoop())
@@ -680,9 +681,9 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         await tui._on_user_input("work")
 
         rendered = output.getvalue()
-        self.assertLess(rendered.index("本轮统计"), rendered.index("上下文   ·"))
-        self.assertIn("≈58 / 200（29%）", rendered)
-        self.assertIn("剩余 ≈142", rendered)
+        self.assertLess(rendered.index("Turn "), rendered.index("上下文   ·"))
+        self.assertIn("[███░░░░░░░░░] 29% · 已用 ≈58 / 总计 200", rendered)
+        self.assertNotIn("剩余", rendered)
 
     async def test_context_snapshot_prefers_last_provider_usage(self):
         loop = FakeAgentLoop("done")
@@ -699,8 +700,16 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         await tui._on_user_input("work")
 
         rendered = output.getvalue()
-        self.assertIn("≈100 / 200（50%）", rendered)
-        self.assertIn("剩余 ≈100", rendered)
+        self.assertIn("[██████░░░░░░] 50% · 已用 ≈100 / 总计 200", rendered)
+
+    async def test_context_snapshot_keeps_small_nonzero_percentage(self):
+        tui, output = self._make_tui(FakeAgentLoop("done"))
+        tui._history.estimated_tokens = 4_100
+        tui._compressor.context_window = 2_600_000
+
+        await tui._on_user_input("work")
+
+        self.assertIn("0.2% · 已用 ≈4.1k / 总计 2.6m", output.getvalue())
 
     async def test_context_snapshot_does_not_underreport_retained_history(self):
         loop = FakeAgentLoop("done")
@@ -716,7 +725,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
         await tui._on_user_input("work")
 
-        self.assertIn("≈120 / 200（60%）", output.getvalue())
+        self.assertIn("[███████░░░░░] 60% · 已用 ≈120 / 总计 200", output.getvalue())
 
     async def test_stream_is_continuous_and_each_chunk_is_printed_once(self):
         tui, output = self._make_tui(LineStreamingAgentLoop())
@@ -724,11 +733,54 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         await tui._on_user_input("输出归并排序")
 
         rendered = output.getvalue()
-        code = "```python\ndef merge_sort(values):\n    return values\n```"
+        code = "╭─ python\n│ def merge_sort(values):\n│     return values\n╰─"
         self.assertIn(code, rendered)
         self.assertEqual(1, rendered.count("def merge_sort(values):"))
         self.assertNotIn("模型正在输出", rendered)
         self.assertNotIn("等待模型", rendered)
+
+    def test_streaming_markdown_renderer_preserves_text_and_adds_styles(self):
+        output = io.StringIO()
+        console = Console(
+            file=output,
+            record=True,
+            force_terminal=True,
+            color_system="standard",
+            width=120,
+        )
+        renderer = _StreamingMarkdownRenderer(console)
+
+        self.assertTrue(renderer.write("普通正文"))
+        for chunk in (
+            "\n# 标题\n",
+            "- 条目\n1. 步骤\n",
+            "> 引用\n```python\n",
+            "print('ok')\n",
+            "```",
+        ):
+            renderer.write(chunk)
+        renderer.close_line()
+
+        styled = console.export_text(styles=True, clear=False)
+        plain = console.export_text()
+        expected = (
+            "普通正文\n# 标题\n- 条目\n1. 步骤\n> 引用\n"
+            "╭─ python\n│ print('ok')\n╰─\n"
+        )
+        self.assertEqual(expected, plain)
+        self.assertIn("\x1b[", styled)
+
+    def test_streaming_markdown_renderer_styles_inline_markdown(self):
+        source = "**加粗**、*斜体*、~~删除~~、`代码`、[链接](https://example.com)"
+
+        styled = _StreamingMarkdownRenderer._style_inline(source)
+
+        self.assertEqual(source, styled.plain)
+        styles = {span.style for span in styled.spans}
+        self.assertTrue(
+            {"bold", "italic", "strike", "bold cyan", "underline blue"}
+            .issubset(styles)
+        )
 
     async def test_escaped_newlines_are_normalized_before_output_and_recording(self):
         loop = FakeAgentLoop("```java\\nclass QuickSort {}\\n```")
@@ -737,7 +789,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         await tui._on_user_input("show code")
 
         rendered = output.getvalue()
-        self.assertIn("```java\nclass QuickSort {}\n```", rendered)
+        self.assertIn("╭─ java\n│ class QuickSort {}\n╰─", rendered)
         self.assertNotIn("\\nclass", rendered)
         self.assertEqual(
             [("show code", "```java\nclass QuickSort {}\n```")],

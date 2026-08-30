@@ -13,6 +13,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
+from rich.panel import Panel
 from rich.status import Status
 from rich.text import Text
 
@@ -84,6 +85,274 @@ class _StreamTextNormalizer:
         if not self._escaped:
             return text
         return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+
+
+class _StreamingMarkdownRenderer:
+    """Apply small Markdown affordances without redrawing streamed content.
+
+    Normal prose is written as soon as it arrives.  Only a line that could be
+    structural Markdown is held until its newline, which lets us style a
+    heading, list marker, quote, or code fence exactly once.  This deliberately
+    avoids a full Markdown render pass: re-rendering earlier output would make
+    terminal scrollback jump and duplicate streamed text.
+    """
+
+    _FENCE_RE = re.compile(
+        r"^[ \t]*```(?P<language>[A-Za-z0-9_.+-]*)[ \t]*$"
+    )
+    _HEADING_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
+    _BULLET_RE = re.compile(r"^(\s*)([-*+])(\s+)(.*)$")
+    _ORDERED_LIST_RE = re.compile(r"^(\s*)(\d+[.)])(\s+)(.*)$")
+    _QUOTE_RE = re.compile(r"^(\s*)(>)(\s?)(.*)$")
+    _INLINE_RE = re.compile(
+        r"(?P<code>`(?P<code_text>[^`\n]+)`)|"
+        r"(?P<link>\[(?P<link_text>[^\]\n]+)\]\((?P<link_url>[^)\s]+)\))|"
+        r"(?P<bold>\*\*(?P<bold_text>[^*\n]+)\*\*|__(?P<bold_underscore>[^_\n]+)__)|"
+        r"(?P<strike>~~(?P<strike_text>[^~\n]+)~~)|"
+        r"(?P<italic>\*(?P<italic_star>[^*\n]+)\*|_(?P<italic_underscore>[^_\n]+)_)",
+    )
+    _POSSIBLE_MARKDOWN_START = frozenset("#-*+>`0123456789 \t")
+    _INLINE_START = frozenset("`[*_~")
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._pending_line = ""
+        self._mode = "undecided"
+        self._in_code_block = False
+        self._line_open = False
+
+    def write(self, text: str) -> bool:
+        """Write one delta and return whether the visible line is open."""
+        while text:
+            if self._in_code_block:
+                text = self._collect_structured_line(text)
+                continue
+
+            if self._mode == "plain":
+                newline = text.find("\n")
+                inline_start = self._find_inline_start(text, newline)
+                if inline_start >= 0:
+                    if inline_start:
+                        self._emit(text[:inline_start])
+                    text = text[inline_start:]
+                    self._mode = "inline"
+                    continue
+                if newline < 0:
+                    self._emit(text)
+                    return self._line_open
+                self._emit(text[: newline + 1])
+                text = text[newline + 1 :]
+                self._mode = "undecided"
+                continue
+
+            if self._mode == "inline":
+                newline = text.find("\n")
+                if newline < 0:
+                    self._pending_line += text
+                    return True
+                self._pending_line += text[: newline + 1]
+                text = text[newline + 1 :]
+                self._render_pending_line()
+                continue
+
+            # At the start of a line, wait only when its first character might
+            # introduce Markdown. Chinese and ordinary prose stay fully
+            # streaming, including very long chunks without a newline.
+            if not self._pending_line and text[0] not in self._POSSIBLE_MARKDOWN_START:
+                self._mode = "plain"
+                continue
+
+            newline = text.find("\n")
+            if newline < 0:
+                self._pending_line += text
+                if not self._awaits_markdown_decision():
+                    self._emit(self._pending_line)
+                    self._pending_line = ""
+                    self._mode = "plain"
+                return bool(self._pending_line) or self._line_open
+            self._pending_line += text[: newline + 1]
+            text = text[newline + 1 :]
+            self._render_pending_line()
+
+        return self._line_open
+
+    def flush(self) -> bool:
+        """Render a partial line before a non-text UI event is displayed."""
+        if self._pending_line:
+            self._render_pending_line()
+        return self._line_open
+
+    def close_line(self) -> bool:
+        """Flush output, then close the terminal line at a UI boundary."""
+        self.flush()
+        if self._line_open:
+            self._console.print()
+        self._line_open = False
+        self._mode = "code" if self._in_code_block else "undecided"
+        return False
+
+    def _collect_structured_line(self, text: str) -> str:
+        """Keep code lines together so a closing fence can be recognized."""
+        newline = text.find("\n")
+        if newline < 0:
+            self._pending_line += text
+            return ""
+        self._pending_line += text[: newline + 1]
+        self._render_pending_line()
+        return text[newline + 1 :]
+
+    def _render_pending_line(self) -> None:
+        line = self._pending_line
+        self._pending_line = ""
+        mode = self._mode
+        self._mode = "undecided"
+
+        body, ending = self._split_line_ending(line)
+        if mode == "inline":
+            styled = self._style_inline(body)
+            styled.append(ending)
+            self._emit(styled)
+            return
+
+        fence = self._FENCE_RE.fullmatch(body)
+        if self._in_code_block:
+            if fence:
+                self._emit("╰─" + ending, "dim cyan")
+                self._in_code_block = False
+            else:
+                self._emit_code_line(body, ending)
+            return
+
+        if fence:
+            language = fence.group("language") or "code"
+            self._emit(f"╭─ {language}" + ending, "dim cyan")
+            self._in_code_block = True
+            return
+
+        self._emit(self._style_markdown_line(body, ending))
+
+    def _emit_code_line(self, body: str, ending: str) -> None:
+        line = Text()
+        line.append("│ ", style="dim cyan")
+        line.append(body, style="cyan")
+        line.append(ending)
+        self._emit(line)
+
+    @classmethod
+    def _find_inline_start(cls, text: str, newline: int) -> int:
+        """Find markup that needs a short look-ahead before it is printed."""
+        limit = len(text) if newline < 0 else newline
+        for index, char in enumerate(text[:limit]):
+            if char in cls._INLINE_START and (index == 0 or text[index - 1] != "\\"):
+                return index
+        return -1
+
+    def _awaits_markdown_decision(self) -> bool:
+        """Whether a partial line can still become structural Markdown."""
+        candidate = self._pending_line.lstrip(" \t")
+        if not candidate:
+            return True
+        first = candidate[0]
+        if first in "#-*+>`":
+            return len(candidate) == 1 or candidate[1].isspace() or first == "`"
+        if not first.isdigit():
+            return False
+
+        index = 0
+        while index < len(candidate) and candidate[index].isdigit():
+            index += 1
+        if index == len(candidate):
+            return True
+        if candidate[index] not in ".)":
+            return False
+        return index + 1 == len(candidate) or candidate[index + 1].isspace()
+
+    @classmethod
+    def _style_markdown_line(cls, body: str, ending: str) -> Text:
+        for pattern, marker_style, content_style in (
+            (cls._HEADING_RE, "bold cyan", "bold cyan"),
+            (cls._BULLET_RE, "bold green", ""),
+            (cls._ORDERED_LIST_RE, "bold green", ""),
+            (cls._QUOTE_RE, "dim", "italic dim"),
+        ):
+            match = pattern.fullmatch(body)
+            if match is None:
+                continue
+            line = Text()
+            line.append(match.group(1))
+            line.append(match.group(2), style=marker_style)
+            line.append(match.group(3), style=marker_style)
+            line.append_text(cls._style_inline(match.group(4), content_style))
+            line.append(ending)
+            return line
+        line = cls._style_inline(body)
+        line.append(ending)
+        return line
+
+    @classmethod
+    def _style_inline(cls, text: str, base_style: str = "") -> Text:
+        """Style common inline Markdown while retaining its source delimiters."""
+        line = Text()
+        position = 0
+        for match in cls._INLINE_RE.finditer(text):
+            line.append(text[position:match.start()], style=base_style or None)
+            kind = match.lastgroup
+            if kind == "code":
+                cls._append_marked(
+                    line, "`", match.group("code_text"), "`", "dim", "bold cyan"
+                )
+            elif kind == "link":
+                line.append("[", style="dim")
+                line.append(match.group("link_text"), style="underline blue")
+                line.append("](", style="dim")
+                line.append(match.group("link_url"), style="dim blue")
+                line.append(")", style="dim")
+            elif kind == "bold":
+                content = match.group("bold_text") or match.group("bold_underscore")
+                marker = "**" if match.group("bold_text") is not None else "__"
+                cls._append_marked(line, marker, content, marker, "dim", "bold")
+            elif kind == "strike":
+                cls._append_marked(
+                    line, "~~", match.group("strike_text"), "~~", "dim", "strike"
+                )
+            else:
+                content = match.group("italic_star") or match.group("italic_underscore")
+                marker = "*" if match.group("italic_star") is not None else "_"
+                cls._append_marked(line, marker, content, marker, "dim", "italic")
+            position = match.end()
+        line.append(text[position:], style=base_style or None)
+        return line
+
+    @staticmethod
+    def _append_marked(
+        line: Text,
+        opening: str,
+        content: str,
+        closing: str,
+        marker_style: str,
+        content_style: str,
+    ) -> None:
+        line.append(opening, style=marker_style)
+        line.append(content, style=content_style)
+        line.append(closing, style=marker_style)
+
+    @staticmethod
+    def _split_line_ending(line: str) -> tuple[str, str]:
+        if line.endswith("\r\n"):
+            return line[:-2], "\r\n"
+        if line.endswith("\n"):
+            return line[:-1], "\n"
+        return line, ""
+
+    def _emit(self, content: str | Text, style: str | None = None) -> None:
+        if not content:
+            return
+        renderable = Text(content, style=style) if isinstance(content, str) else content
+        self._console.print(
+            renderable, end="", markup=False, highlight=False, soft_wrap=True
+        )
+        plain = renderable.plain
+        self._line_open = not plain.endswith("\n")
 
 
 @dataclass
@@ -590,10 +859,10 @@ class TinyCodeTUI(UIControl):
         trace_status = "error"
         trace_error = ""
         response_started = False
-        stream_line_open = False
         current_response = ""
         round_recorded = False
         stream_normalizer = _StreamTextNormalizer()
+        stream_renderer = _StreamingMarkdownRenderer(self._console)
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
@@ -629,9 +898,7 @@ class TinyCodeTUI(UIControl):
                         self._print_ai_prefix()
                     normalized = stream_normalizer.normalize(event.text)
                     current_response += normalized
-                    self._print_stream(normalized)
-                    if normalized:
-                        stream_line_open = not normalized.endswith("\n")
+                    stream_renderer.write(normalized)
 
                 elif isinstance(event, ThinkingEvent):
                     self._start_progress(event.label)
@@ -667,7 +934,7 @@ class TinyCodeTUI(UIControl):
                                     "files": len(workspace_snapshot.files),
                                 })
                     metrics.record_tool_call()
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     self._start_progress(f"执行工具 {event.tool_call.name}")
 
                 elif isinstance(event, ToolResultEvent):
@@ -731,7 +998,7 @@ class TinyCodeTUI(UIControl):
                         self._print_warning(f"上下文压缩未完成：{event.error}")
 
                 elif isinstance(event, HITLRequestEvent):
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     self._stop_progress()
                     self._print_warning(event.prompt)
                     trace_scope = (
@@ -751,7 +1018,7 @@ class TinyCodeTUI(UIControl):
                     self._start_progress("已确认 · 继续执行")
 
                 elif isinstance(event, RoundLimitReachedEvent):
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     self._stop_progress()
                     if event.stalled:
                         self._print_warning(
@@ -831,7 +1098,7 @@ class TinyCodeTUI(UIControl):
                             "message_count": event.message_count,
                             "continued": event.continued,
                         })
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     self._save_checkpoint()
                     if event.continued:
                         self._print_info(
@@ -845,7 +1112,7 @@ class TinyCodeTUI(UIControl):
                         )
 
                 elif isinstance(event, TaskStalledEvent):
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     self._stop_progress()
                     labels = {
                         "stalled": "没有有效进展",
@@ -888,7 +1155,7 @@ class TinyCodeTUI(UIControl):
                 elif isinstance(event, AgentDoneEvent):
                     trace_status = event.reason
                     self._stop_progress()
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     await self._print_workspace_changes(workspace_snapshot)
                     if event.reason in {"max_rounds", "round_budget_stopped"}:
                         self._status_text = "就绪 · 任务因轮次预算暂停"
@@ -912,9 +1179,8 @@ class TinyCodeTUI(UIControl):
                         self._print_info("本轮已取消")
                     else:
                         self._status_text = "就绪 · 上一轮已正常完成"
-                        cache = self._format_cache_summary()
                         self._console.print(
-                            f"✓ 本轮已正常完成{cache}", style="bold green", highlight=False
+                            "✓ 本轮已正常完成", style="bold green", highlight=False
                         )
                     self._print_turn_metrics(
                         metrics=metrics,
@@ -922,7 +1188,6 @@ class TinyCodeTUI(UIControl):
                             self._agent_loop, "turn_model_requests", 0
                         ),
                     )
-                    self._print_context_snapshot()
                     if current_response:
                         self._agent_loop.record_round(text, current_response)
                         round_recorded = True
@@ -934,7 +1199,7 @@ class TinyCodeTUI(UIControl):
                     trace_status = "error"
                     trace_error = event.message
                     self._stop_progress()
-                    stream_line_open = self._close_stream_line(stream_line_open)
+                    stream_renderer.close_line()
                     await self._print_workspace_changes(workspace_snapshot)
                     self._status_text = "就绪 · 上一轮失败"
                     self._print_error(event.message)
@@ -944,12 +1209,12 @@ class TinyCodeTUI(UIControl):
                             self._agent_loop, "turn_model_requests", 0
                         ),
                     )
-                    self._print_context_snapshot()
                     break
 
         except asyncio.CancelledError:
             trace_status = "cancelled"
             self._stop_progress()
+            stream_renderer.close_line()
             self._status_text = "就绪 · 本轮已取消"
             await self._print_workspace_changes(workspace_snapshot)
             raise
@@ -958,7 +1223,7 @@ class TinyCodeTUI(UIControl):
             trace_error = f"{type(exc).__name__}: {exc}"
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
-            stream_line_open = self._close_stream_line(stream_line_open)
+            stream_renderer.close_line()
             await self._print_workspace_changes(workspace_snapshot)
             self._status_text = "就绪 · 上一轮失败"
             self._print_error(f"对话执行失败: {type(exc).__name__}: {exc}")
@@ -1132,20 +1397,32 @@ class TinyCodeTUI(UIControl):
         self._console.print()
         self._console.print("TinyCode: ", style="bold blue", end="", highlight=False)
 
-    def _print_stream(self, text: str) -> None:
-        if text:
-            self._console.print(
-                text, end="", markup=False, highlight=False, soft_wrap=True
-            )
-
     def _print_info(self, text: str) -> None:
         self._console.print(text, style="dim", markup=False, highlight=False)
 
     def _print_warning(self, text: str) -> None:
-        self._console.print(f"⚠ {text}", style="bold yellow", markup=False, highlight=False)
+        self._console.print(
+            Panel(
+                Text(text, style="bold yellow"),
+                title="提示",
+                border_style="yellow",
+                padding=(0, 1),
+                expand=False,
+            ),
+            highlight=False,
+        )
 
     def _print_error(self, text: str) -> None:
-        self._console.print(f"Error: {text}", style="bold red", markup=False, highlight=False)
+        self._console.print(
+            Panel(
+                Text(text, style="bold red"),
+                title="错误",
+                border_style="red",
+                padding=(0, 1),
+                expand=False,
+            ),
+            highlight=False,
+        )
 
     def _print_turn_metrics(
         self,
@@ -1159,15 +1436,32 @@ class TinyCodeTUI(UIControl):
         else:
             token_text = "不可用"
 
-        self._console.print(
-            "本轮统计 · "
-            f"Turn: {metrics.turns} · "
-            f"模型请求: {max(0, model_requests)} 次 · "
-            f"消耗 Token: {token_text} · "
-            f"耗时: {metrics.elapsed_seconds:.2f} 秒 · "
-            f"工具调用: {metrics.tool_calls} 次 · "
-            f"成功率: {metrics.success_rate_text}",
+        metrics_prefix = "本轮统计 · "
+        content = Text(
+            f"{metrics_prefix}Turn {metrics.turns} · "
+            f"请求 {max(0, model_requests)} · "
+            f"{metrics.elapsed_seconds:.2f} 秒 · "
+            f"工具 {metrics.tool_calls}（{metrics.success_rate_text}）",
             style="dim",
+        )
+        resource_parts = [f"Token {token_text}"]
+        cache = self._format_cache_summary()
+        if cache:
+            resource_parts.append(cache)
+        content.append("\n")
+        content.append(
+            self._terminal_indent(metrics_prefix) + " · ".join(resource_parts),
+            style="dim",
+        )
+        content.append("\n")
+        content.append_text(self._build_context_snapshot())
+        self._console.print(
+            Panel(
+                content,
+                border_style="bright_black",
+                padding=(0, 1),
+                expand=False,
+            ),
             highlight=False,
         )
 
@@ -1180,10 +1474,10 @@ class TinyCodeTUI(UIControl):
         write = max(0, int(getattr(usage, "write_tokens", 0)))
         total = read + miss
         rate = f"{read / total:.0%}" if total else "—"
-        parts = [f"cache 命中 {read:,} Token ({rate})"]
+        parts = [f"Cache 命中 {read:,}（{rate}）"]
         if write:
             parts.append(f"写入 {write:,}")
-        return " · " + " · ".join(parts)
+        return " · ".join(parts)
 
     async def _print_workspace_changes(
         self,
@@ -1230,27 +1524,27 @@ class TinyCodeTUI(UIControl):
             counts.append(f"修改 {len(changes.modified)}")
         if changes.deleted:
             counts.append(f"删除 {len(changes.deleted)}")
-        self._console.print()
-        self._console.print(
-            "文件变更 · " + " · ".join(counts),
-            style="dim",
-            highlight=False,
-        )
+        content = Text("文件变更 · " + " · ".join(counts), style="dim")
         for paths, marker, style in (
             (changes.added, "+", "green"),
             (changes.modified, "~", "yellow"),
             (changes.deleted, "-", "red"),
         ):
             for path in paths:
-                self._console.print(
-                    f"  {marker} {path}",
-                    style=style,
-                    markup=False,
-                    highlight=False,
-                )
+                content.append(f"\n{marker} {path}", style=style)
+        self._console.print()
+        self._console.print(
+            Panel(
+                content,
+                border_style="bright_black",
+                padding=(0, 1),
+                expand=False,
+            ),
+            highlight=False,
+        )
         self._console.print()
 
-    def _print_context_snapshot(self) -> None:
+    def _build_context_snapshot(self) -> Text:
         # The last provider request already includes system instructions, tool
         # schemas and conversation history, so its real usage is the best
         # snapshot. Retained history can be larger after an intentionally
@@ -1267,7 +1561,6 @@ class TinyCodeTUI(UIControl):
         )
         used = max(0, used)
         window = max(1, int(self._compressor.context_window))
-        remaining = max(0, window - used)
         percentage = used / window * 100
         if percentage >= 90:
             style = "bold red"
@@ -1280,18 +1573,39 @@ class TinyCodeTUI(UIControl):
             self._trace_recorder.record("context_snapshot", attributes={
                 "used_tokens": used,
                 "context_window": window,
-                "remaining_tokens": remaining,
+                "remaining_tokens": max(0, window - used),
                 "percentage": percentage,
             })
 
-        self._console.print(
-            "上下文   · "
-            f"≈{self._format_compact_tokens(used)} / "
-            f"{self._format_compact_tokens(window)}（{percentage:.0f}%）· "
-            f"剩余 ≈{self._format_compact_tokens(remaining)}",
+        width = 12
+        filled = min(width, round(percentage / 100 * width))
+        if percentage > 0 and filled == 0:
+            filled = 1
+        bar = "[" + "█" * filled + "░" * (width - filled) + "]"
+        line = Text()
+        line.append("上下文   · ", style="dim")
+        line.append(bar, style=style)
+        line.append(
+            f" {self._format_context_percentage(percentage)} · "
+            f"已用 ≈{self._format_compact_tokens(used)}"
+            f" / 总计 {self._format_compact_tokens(window)}",
             style=style,
-            highlight=False,
         )
+        return line
+
+    @staticmethod
+    def _format_context_percentage(percentage: float) -> str:
+        """Keep low but non-zero context usage visible in the status line."""
+        percentage = max(0.0, percentage)
+        if percentage == 0:
+            return "0%"
+        if percentage < 0.01:
+            return "<0.01%"
+        if percentage < 0.1:
+            return f"{percentage:.2f}%"
+        if percentage < 1:
+            return f"{percentage:.1f}%"
+        return f"{percentage:.0f}%"
 
     @staticmethod
     def _format_compact_tokens(value: int) -> str:
@@ -1302,10 +1616,16 @@ class TinyCodeTUI(UIControl):
             return f"{value / 1_000:.1f}k"
         return str(value)
 
-    def _close_stream_line(self, line_open: bool) -> bool:
-        if line_open:
-            self._console.print()
-        return False
+    @staticmethod
+    def _terminal_indent(text: str) -> str:
+        """Return spaces matching the display width of a short CJK label."""
+        import unicodedata
+
+        width = sum(
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+            for char in text
+        )
+        return " " * width
 
     def _start_progress(self, text: str) -> None:
         self._progress_text = text
