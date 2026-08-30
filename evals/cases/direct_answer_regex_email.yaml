@@ -1,0 +1,8 @@
+name: 直接回答：邮箱正则
+tags: [direct-answer]
+prompt: 直接给出一个用于基础邮箱格式校验的 Python 正则示例，并说明它不是完整 RFC 校验。不要使用工具。
+assertions:
+  final_text_contains: [re., RFC]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

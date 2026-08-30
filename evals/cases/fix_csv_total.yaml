@@ -1,0 +1,10 @@
+name: 小修复：CSV 总额解析
+tags: [small-fix]
+prompt: 修复 totals.py：忽略空行和空 amount，正确累计 CSV 文本中的金额；运行测试。
+fixture: fixtures/fix_csv_total
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: totals.py, text: 'if'}
+  no_errors: true
+budgets: {max_rounds: 9, max_model_requests: 13, max_tokens: 60000, max_duration_seconds: 180}

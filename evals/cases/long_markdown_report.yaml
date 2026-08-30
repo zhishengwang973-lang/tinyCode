@@ -1,0 +1,12 @@
+name: 长任务：Markdown 报表生成
+tags: [long-task]
+prompt: 完成 report.py 的 render_report：按分数降序生成 Markdown 表格，空列表返回“暂无数据”，并在 README 写入一个示例；运行测试。
+fixture: fixtures/long_markdown_report
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: report.py, text: '暂无数据'}
+    - {path: README.md, text: '| 名称 | 分数 |'}
+  tools_used: [read_file]
+  no_errors: true
+budgets: {max_rounds: 18, max_model_requests: 28, max_tokens: 120000, max_duration_seconds: 300}

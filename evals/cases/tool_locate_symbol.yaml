@@ -1,0 +1,10 @@
+name: 工具路由：定位符号定义
+tags: [tool-routing]
+prompt: 查看项目，告诉我 PaymentService 类定义在哪个文件以及它有哪些公开方法。不要修改文件。
+fixture: fixtures/tool_locate_symbol
+assertions:
+  final_text_contains: [PaymentService, src/payment.py]
+  tools_used: [grep]
+  tools_not_used: [write_file, edit_file, delete_file]
+  no_errors: true
+budgets: {max_rounds: 5, max_model_requests: 7, max_tokens: 30000, max_duration_seconds: 120}

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from collections import Counter
 from io import StringIO
 from pathlib import Path
 
@@ -184,6 +185,26 @@ class EvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("0%", output)
         self.assertIn("25%", output)
         self.assertIn("第一项", output)
+
+    def test_repository_eval_suite_has_the_agreed_30_case_baseline(self):
+        cases_dir = Path(__file__).resolve().parents[1] / "evals" / "cases"
+        cases = _load_cases(cases_dir, set())
+        categories = Counter(
+            tag for case in cases for tag in case.tags
+            if tag in {
+                "direct-answer", "tool-routing", "small-fix",
+                "long-task", "safety-recovery",
+            }
+        )
+
+        self.assertEqual(30, len(cases))
+        self.assertEqual({
+            "direct-answer": 8,
+            "tool-routing": 8,
+            "small-fix": 6,
+            "long-task": 4,
+            "safety-recovery": 4,
+        }, dict(categories))
 
 
 if __name__ == "__main__":

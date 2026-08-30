@@ -1,0 +1,10 @@
+name: 工具路由：发现测试文件
+tags: [tool-routing]
+prompt: 列出项目中所有以 test_ 开头的 Python 测试文件，且不要修改文件。
+fixture: fixtures/tool_discover_tests
+assertions:
+  final_text_contains: [tests/test_math.py, tests/test_string.py]
+  tools_used: [glob]
+  tools_not_used: [write_file, edit_file, delete_file]
+  no_errors: true
+budgets: {max_rounds: 5, max_model_requests: 7, max_tokens: 30000, max_duration_seconds: 120}

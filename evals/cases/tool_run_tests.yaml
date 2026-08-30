@@ -1,0 +1,11 @@
+name: 工具路由：运行失败测试后修复
+tags: [tool-routing]
+prompt: 先运行项目测试定位问题，再修复 calc.py 中 add 的实现并再次运行测试。
+fixture: fixtures/tool_run_tests
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: calc.py, text: 'return left + right'}
+  tools_used: [run_command]
+  no_errors: true
+budgets: {max_rounds: 9, max_model_requests: 13, max_tokens: 60000, max_duration_seconds: 180}

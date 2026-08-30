@@ -1,0 +1,11 @@
+name: 工具路由：搜索重复配置
+tags: [tool-routing]
+prompt: 搜索项目中 DEBUG = True 出现的位置，改为 False，并说明修改了哪些文件。
+fixture: fixtures/tool_find_duplicate
+assertions:
+  file_contains:
+    - {path: config/dev.py, text: 'DEBUG = False'}
+    - {path: config/test.py, text: 'DEBUG = False'}
+  tools_used: [grep]
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 55000, max_duration_seconds: 180}

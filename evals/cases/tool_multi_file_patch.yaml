@@ -1,0 +1,11 @@
+name: 工具路由：跨文件补丁
+tags: [tool-routing]
+prompt: 将 settings.py 中的默认端口改为 9000，并同步更新 README.md 的运行示例；使用一个 apply_patch 完成修改。
+fixture: fixtures/tool_multi_file_patch
+assertions:
+  file_contains:
+    - {path: settings.py, text: 'PORT = 9000'}
+    - {path: README.md, text: 'localhost:9000'}
+  tools_used: [apply_patch]
+  no_errors: true
+budgets: {max_rounds: 6, max_model_requests: 9, max_tokens: 45000, max_duration_seconds: 150}

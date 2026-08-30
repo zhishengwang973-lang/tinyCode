@@ -1,0 +1,8 @@
+name: 直接回答：SQL 聚合
+tags: [direct-answer]
+prompt: 直接写一条 SQL：按 customer_id 汇总 orders 表的订单数和总金额，只保留订单数不少于 3 的客户。不要使用工具。
+assertions:
+  final_text_contains: [GROUP BY, HAVING]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

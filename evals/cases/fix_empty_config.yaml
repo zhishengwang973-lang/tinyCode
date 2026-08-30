@@ -1,0 +1,10 @@
+name: 小修复：空配置默认值
+tags: [small-fix]
+prompt: 修复 config.py：环境变量 TIMEOUT 为空字符串时应使用默认值 30，而不是抛异常；运行测试。
+fixture: fixtures/fix_empty_config
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: config.py, text: 'or "30"'}
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 50000, max_duration_seconds: 180}

@@ -1,0 +1,12 @@
+name: 长任务：库存服务重构
+tags: [long-task]
+prompt: 完成库存服务重构：修复库存不足时出现负数的问题；新增 remove 方法；更新 README 的 API 示例；运行全部测试并说明改动。
+fixture: fixtures/long_inventory_refactor
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: inventory.py, text: 'def remove'}
+    - {path: README.md, text: 'remove'}
+  tools_used: [run_command]
+  no_errors: true
+budgets: {max_rounds: 18, max_model_requests: 28, max_tokens: 120000, max_duration_seconds: 300}

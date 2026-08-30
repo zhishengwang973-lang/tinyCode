@@ -1,0 +1,12 @@
+name: 长任务：待办事项持久化
+tags: [long-task]
+prompt: 为 todo.py 实现 JSON 持久化：TodoStore(path) 应支持 add、list 和 complete；数据要写入传入路径，读取损坏 JSON 时视为空列表。补全实现并运行测试。
+fixture: fixtures/long_todo_persistence
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: todo.py, text: 'json'}
+    - {path: todo.py, text: 'def complete'}
+  tools_used: [read_file]
+  no_errors: true
+budgets: {max_rounds: 20, max_model_requests: 30, max_tokens: 140000, max_duration_seconds: 300}

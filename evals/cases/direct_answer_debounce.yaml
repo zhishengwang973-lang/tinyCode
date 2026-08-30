@@ -1,0 +1,8 @@
+name: 直接回答：JavaScript 防抖
+tags: [direct-answer]
+prompt: 直接输出一个 JavaScript debounce 函数实现，不要读写项目文件。
+assertions:
+  final_text_contains: [function, debounce]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

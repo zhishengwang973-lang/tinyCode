@@ -1,0 +1,12 @@
+name: 长任务：HTTP 客户端重试策略
+tags: [long-task]
+prompt: 完成 client.py：实现 HttpClient.request 的重试逻辑。遇到 RetryableError 时最多重试 retries 次，成功立即返回，最后一次失败应抛出原异常；更新 README 示例并运行测试。
+fixture: fixtures/long_http_client
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: client.py, text: 'RetryableError'}
+    - {path: README.md, text: 'retries'}
+  tools_used: [run_command]
+  no_errors: true
+budgets: {max_rounds: 18, max_model_requests: 28, max_tokens: 120000, max_duration_seconds: 300}

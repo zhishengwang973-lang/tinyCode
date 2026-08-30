@@ -1,5 +1,5 @@
 name: 修复 greeting 回归
-tags: [smoke, coding, regression]
+tags: [smoke, coding, regression, small-fix]
 prompt: 修复 greeting.py 的 greet 函数，使其返回中文问候语；运行测试并说明结果。
 fixture: fixtures/greeting_bug
 assertions:

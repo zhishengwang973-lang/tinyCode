@@ -104,7 +104,13 @@ def _load_cases(target: Path, tags: set[str]):
     if resolved.is_file():
         paths = [resolved]
     elif resolved.is_dir():
-        paths = sorted(resolved.rglob("*.yaml")) + sorted(resolved.rglob("*.yml"))
+        paths = [
+            path
+            for path in (
+                sorted(resolved.rglob("*.yaml")) + sorted(resolved.rglob("*.yml"))
+            )
+            if "fixtures" not in path.relative_to(resolved).parts
+        ]
     else:
         raise EvalConfigError(f"用例路径不存在: {target}")
     cases = [load_case(path) for path in paths]

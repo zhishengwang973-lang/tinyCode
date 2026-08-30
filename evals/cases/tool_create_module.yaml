@@ -1,0 +1,11 @@
+name: 工具路由：创建新模块
+tags: [tool-routing]
+prompt: 新增 formatter.py，实现 format_name(name)，去掉首尾空白并将每个单词首字母大写；运行测试并说明结果。
+fixture: fixtures/tool_create_module
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: formatter.py, text: 'def format_name'}
+  tools_used: [write_file]
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 50000, max_duration_seconds: 180}

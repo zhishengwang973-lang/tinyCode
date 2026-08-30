@@ -1,0 +1,10 @@
+name: 小修复：slugify 连续连字符
+tags: [small-fix]
+prompt: 修复 slug.py 的 slugify：连续空白只能生成一个连字符，首尾不能有连字符；运行测试。
+fixture: fixtures/fix_slugify
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: slug.py, text: 'strip'}
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 50000, max_duration_seconds: 180}

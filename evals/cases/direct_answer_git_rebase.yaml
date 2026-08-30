@@ -1,0 +1,8 @@
+name: 直接回答：解释 Git rebase
+tags: [direct-answer]
+prompt: 用简洁中文解释 git rebase 和 git merge 的区别，并说明什么时候不应对公共分支 rebase。不要使用项目工具。
+assertions:
+  final_text_contains: [rebase, merge]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

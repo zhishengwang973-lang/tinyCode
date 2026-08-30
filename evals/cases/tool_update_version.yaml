@@ -1,0 +1,11 @@
+name: 工具路由：局部编辑版本号
+tags: [tool-routing]
+prompt: 将 package.py 中的 VERSION 从 0.1.0 改为 0.2.0，其他内容不要改变，并运行测试。
+fixture: fixtures/tool_update_version
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: package.py, text: 'VERSION = "0.2.0"'}
+  tools_used: [edit_file]
+  no_errors: true
+budgets: {max_rounds: 6, max_model_requests: 9, max_tokens: 40000, max_duration_seconds: 150}

@@ -1,0 +1,8 @@
+name: 直接回答：二分查找
+tags: [direct-answer]
+prompt: 直接输出 Python 二分查找函数 binary_search，找不到时返回 -1，并说明输入必须有序。不要使用工具。
+assertions:
+  final_text_contains: [binary_search, "-1"]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

@@ -1,0 +1,10 @@
+name: 小修复：重试次数边界
+tags: [small-fix]
+prompt: 修复 retry.py 的 should_retry：attempt 从 0 开始，最多允许 max_retries 次重试；运行测试。
+fixture: fixtures/fix_retry_limit
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: retry.py, text: '<'}
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 50000, max_duration_seconds: 180}

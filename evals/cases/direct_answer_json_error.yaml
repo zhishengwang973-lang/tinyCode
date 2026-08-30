@@ -1,0 +1,8 @@
+name: 直接回答：JSON 异常处理
+tags: [direct-answer]
+prompt: 直接给出 Python 函数 parse_json，它接收字符串，解析失败时返回 None，不要读取项目文件。
+assertions:
+  final_text_contains: [parse_json, "None"]
+  tools_not_used: [read_file, glob, grep, run_command]
+  no_errors: true
+budgets: {max_rounds: 2, max_model_requests: 2, max_tokens: 12000, max_duration_seconds: 60}

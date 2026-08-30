@@ -3,6 +3,10 @@
 每个 YAML 用例会在隔离的临时工作区中运行真实 `AgentLoop`。执行模型负责完成任务；
 评测模型只读取脱敏后的任务结果、工具序列、文件变更和指标，不会参与执行。
 
+当前基线共 30 条用例：8 条直接回答、8 条工具路由/文件任务、6 条小修复、4 条长任务、4 条
+安全与恢复任务。用 `--tag direct-answer`、`--tag tool-routing`、`--tag small-fix`、`--tag long-task`
+或 `--tag safety-recovery` 可执行其中一个分组。
+
 运行：
 
 ```bash

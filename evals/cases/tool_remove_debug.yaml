@@ -1,0 +1,11 @@
+name: 工具路由：搜索并删除调试输出
+tags: [tool-routing]
+prompt: 找出 app.py 里的调试 print，删除它但保留函数行为，然后运行测试。
+fixture: fixtures/tool_remove_debug
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: app.py, text: 'return value * 2'}
+  tools_used: [grep]
+  no_errors: true
+budgets: {max_rounds: 7, max_model_requests: 10, max_tokens: 45000, max_duration_seconds: 150}

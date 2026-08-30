@@ -1,0 +1,10 @@
+name: 小修复：邮箱规范化
+tags: [small-fix]
+prompt: 修复 users.py 的 normalize_email：应该去掉首尾空白并把域名转为小写，但保留本地部分大小写；运行测试。
+fixture: fixtures/fix_email_normalize
+assertions:
+  tests: [python3 -m unittest]
+  file_contains:
+    - {path: users.py, text: 'split'}
+  no_errors: true
+budgets: {max_rounds: 8, max_model_requests: 12, max_tokens: 50000, max_duration_seconds: 180}
