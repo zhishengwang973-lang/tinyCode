@@ -42,6 +42,7 @@ from tinyCode.tools import (
     WebSearchTool,
     WebFetchTool,
 )
+from tinyCode.tui import create_tui, fullscreen_supported
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tracing import TraceRecorder
 
@@ -377,8 +378,15 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         security_guard.set_level(level)
         agent_loop.set_security_level(level)
 
-    # 11. Launch TUI
-    tui = TinyCodeTUI(
+    # 11. Launch the configured TUI. Fullscreen rendering requires a real
+    # terminal; IDE consoles and redirected stdin retain the proven stream UI.
+    if app_config.ui_mode == "fullscreen" and not fullscreen_supported():
+        print(
+            "全屏 UI 需要真实终端，已自动降级为 stream 模式",
+            file=sys.stderr,
+        )
+    tui = create_tui(
+        ui_mode=app_config.ui_mode,
         agent_loop=agent_loop,
         history=history,
         compressor=compressor,

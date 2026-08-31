@@ -538,7 +538,7 @@ class TinyCodeTUI(UIControl):
         self._history.clear()
         if self._skill_registry:
             self._skill_registry.clear_activated()
-        self._console.clear()
+        self._clear_display()
         self._do_save()
 
     async def trigger_compress(self) -> str:
@@ -573,13 +573,13 @@ class TinyCodeTUI(UIControl):
             return f"会话 {session_id[:8]} 不存在"
         restored_history, _provider, _model = restored
         self._history.replace_messages(restored_history.get_messages())
-        self._console.clear()
+        self._clear_display()
         return f"已加载会话 {session_id[:8]} ({len(restored_history)} 条消息)"
 
     def new_session(self) -> str:
         sid = self._session_store.new_session()
         self._history.clear()
-        self._console.clear()
+        self._clear_display()
         return f"新会话已创建: {sid}"
 
     def delete_session(self, session_id: str) -> str:
@@ -862,7 +862,7 @@ class TinyCodeTUI(UIControl):
         current_response = ""
         round_recorded = False
         stream_normalizer = _StreamTextNormalizer()
-        stream_renderer = _StreamingMarkdownRenderer(self._console)
+        stream_renderer = self._create_stream_renderer()
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
@@ -904,6 +904,7 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(event.label)
 
                 elif isinstance(event, ToolCallEvent):
+                    self._before_tool_call()
                     may_modify = getattr(
                         self._agent_loop, "tool_may_modify_workspace", None,
                     )
@@ -1000,7 +1001,7 @@ class TinyCodeTUI(UIControl):
                 elif isinstance(event, HITLRequestEvent):
                     stream_renderer.close_line()
                     self._stop_progress()
-                    self._print_warning(event.prompt)
+                    self._print_approval(event.prompt)
                     trace_scope = (
                         self._trace_recorder.span(
                             event.tool_name,
@@ -1156,6 +1157,7 @@ class TinyCodeTUI(UIControl):
                     trace_status = event.reason
                     self._stop_progress()
                     stream_renderer.close_line()
+                    self._finalize_response(current_response)
                     await self._print_workspace_changes(workspace_snapshot)
                     if event.reason in {"max_rounds", "round_budget_stopped"}:
                         self._status_text = "就绪 · 任务因轮次预算暂停"
@@ -1179,9 +1181,7 @@ class TinyCodeTUI(UIControl):
                         self._print_info("本轮已取消")
                     else:
                         self._status_text = "就绪 · 上一轮已正常完成"
-                        self._console.print(
-                            "✓ 本轮已正常完成", style="bold green", highlight=False
-                        )
+                        self._print_success()
                     self._print_turn_metrics(
                         metrics=metrics,
                         model_requests=getattr(
@@ -1397,8 +1397,23 @@ class TinyCodeTUI(UIControl):
         self._console.print()
         self._console.print("TinyCode: ", style="bold blue", end="", highlight=False)
 
+    def _create_stream_renderer(self) -> _StreamingMarkdownRenderer:
+        return _StreamingMarkdownRenderer(self._console)
+
+    def _before_tool_call(self) -> None:
+        """Allow alternate renderers to reclassify a pre-tool text draft."""
+
+    def _finalize_response(self, response: str) -> None:
+        """Allow alternate renderers to guarantee a visible final response."""
+
+    def _print_success(self) -> None:
+        self._console.print("✓ 本轮已正常完成", style="bold green", highlight=False)
+
     def _print_info(self, text: str) -> None:
         self._console.print(text, style="dim", markup=False, highlight=False)
+
+    def _clear_display(self) -> None:
+        self._console.clear()
 
     def _print_warning(self, text: str) -> None:
         self._console.print(
@@ -1411,6 +1426,10 @@ class TinyCodeTUI(UIControl):
             ),
             highlight=False,
         )
+
+    def _print_approval(self, text: str) -> None:
+        """Render a user decision request; richer UIs may use a distinct card."""
+        self._print_warning(text)
 
     def _print_error(self, text: str) -> None:
         self._console.print(

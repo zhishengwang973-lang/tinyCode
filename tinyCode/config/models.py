@@ -9,6 +9,7 @@ from tinyCode.config.constants import (
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_UI_MODE,
 )
 
 
@@ -42,5 +43,6 @@ class AppConfig(BaseModel):
     hard_max_rounds: int = DEFAULT_HARD_MAX_ROUNDS
     round_limit_action: str = DEFAULT_ROUND_LIMIT_ACTION
     security_level: str = DEFAULT_SECURITY_LEVEL
+    ui_mode: str = DEFAULT_UI_MODE
     notes_enabled: bool = DEFAULT_NOTES_ENABLED
     tracing: TracingConfig = Field(default_factory=TracingConfig)

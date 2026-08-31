@@ -49,6 +49,10 @@ round_limit_action: ask
 # 可在单次启动时用 tinyCode --mode <等级> 覆盖
 security_level: normal
 
+# 终端界面：stream（兼容的行式输出）/ fullscreen（滚动会话与固定输入栏）
+# fullscreen 仅在真实终端中启用；IDE 控制台会自动降级到 stream。
+ui_mode: stream
+
 # 是否启用持久笔记（自动更新、读取及上下文注入）
 # 仅在全局 ~/.tinyCode/config.yaml 中生效，项目配置不能覆盖
 notes_enabled: true

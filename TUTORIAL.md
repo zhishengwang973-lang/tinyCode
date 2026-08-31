@@ -154,6 +154,7 @@ round_extension: 10        # 每次续跑增加的轮数
 hard_max_rounds: 100       # 单个任务的绝对硬上限，范围 1-100
 round_limit_action: ask    # ask / auto / stop
 security_level: normal     # strict / normal / permissive
+ui_mode: stream            # stream / fullscreen
 notes_enabled: true        # 持久笔记开关，仅在全局配置中生效
 ```
 
@@ -172,6 +173,12 @@ notes_enabled: true        # 持久笔记开关，仅在全局配置中生效
 提高全局安全等级，但不能把显式的全局 `security_level` 降级；需要临时降级时必须由用户
 亲自传入 `--mode`。`notes_enabled` 只接受 `true` 或 `false`，并且只从全局
 `~/.tinyCode/config.yaml` 读取，项目 `.tinyCode.yaml` 不能启用或关闭用户的持久笔记。
+
+**终端界面**：`ui_mode: stream` 是兼容 IDE 控制台的行式输出；`ui_mode: fullscreen`
+启用组件化全屏会话界面。每轮用户输入、执行过程、Markdown 回答、文件变更和统计信息
+作为独立消息保留在滚动历史中，输入框固定在底部。全屏模式需要真实 TTY；在 IDE 输出窗
+或重定向环境会自动回退到 `stream`。可使用鼠标滚轮或 `PgUp` 查看历史，`PgDn` 回到最新
+消息，`Ctrl-E` 展开或收起最近一轮的执行过程。
 
 **Claude Extended Thinking**：在代码中通过 `provider.enable_thinking(budget_tokens=8192)` 开启。推理期间 TUI 使用临时进度提示，不把推理状态插入回答正文。
 

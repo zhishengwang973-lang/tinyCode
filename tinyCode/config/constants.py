@@ -9,3 +9,5 @@ SUPPORTED_ROUND_LIMIT_ACTIONS = {"ask", "auto", "stop"}
 DEFAULT_SECURITY_LEVEL = "normal"
 SUPPORTED_SECURITY_LEVELS = {"strict", "normal", "permissive"}
 DEFAULT_NOTES_ENABLED = False
+DEFAULT_UI_MODE = "stream"
+SUPPORTED_UI_MODES = {"stream", "fullscreen"}

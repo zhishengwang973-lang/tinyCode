@@ -73,6 +73,7 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual(100, config.hard_max_rounds)
             self.assertEqual("ask", config.round_limit_action)
             self.assertEqual("normal", config.security_level)
+            self.assertEqual("stream", config.ui_mode)
             self.assertEqual(DEFAULT_NOTES_ENABLED, config.notes_enabled)
             self.assertTrue(config.tracing.enabled)
             self.assertFalse(config.tracing.capture_payloads)
@@ -193,6 +194,34 @@ class ConfigLoaderTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ConfigError, "security_level 必须是 strict、normal 或 permissive",
                 ):
+                    load_config()
+
+    def test_ui_mode_is_configurable_and_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "ui_mode: FULLSCREEN\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                self.assertEqual("fullscreen", load_config().ui_mode)
+
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "ui_mode: graphical\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "ui_mode 必须是 stream 或 fullscreen"):
                     load_config()
 
     def test_max_rounds_is_configurable_and_bounded(self):

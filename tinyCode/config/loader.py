@@ -15,9 +15,11 @@ from tinyCode.config.constants import (
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_UI_MODE,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_ROUND_LIMIT_ACTIONS,
     SUPPORTED_SECURITY_LEVELS,
+    SUPPORTED_UI_MODES,
 )
 
 
@@ -334,6 +336,13 @@ def load_config() -> AppConfig:
     if security_level not in SUPPORTED_SECURITY_LEVELS:
         raise ConfigError("security_level 必须是 strict、normal 或 permissive")
 
+    ui_mode = raw.get("ui_mode", DEFAULT_UI_MODE)
+    if not isinstance(ui_mode, str):
+        raise ConfigError("ui_mode 必须是 stream 或 fullscreen")
+    ui_mode = ui_mode.strip().lower()
+    if ui_mode not in SUPPORTED_UI_MODES:
+        raise ConfigError("ui_mode 必须是 stream 或 fullscreen")
+
     notes_enabled = raw.get("notes_enabled", DEFAULT_NOTES_ENABLED)
     if not isinstance(notes_enabled, bool):
         raise ConfigError("notes_enabled 必须是 true 或 false")
@@ -369,6 +378,7 @@ def load_config() -> AppConfig:
         hard_max_rounds=hard_max_rounds,
         round_limit_action=round_limit_action,
         security_level=security_level,
+        ui_mode=ui_mode,
         notes_enabled=notes_enabled,
         tracing=TracingConfig(
             enabled=tracing_enabled,

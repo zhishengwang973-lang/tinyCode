@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from prompt_toolkit.document import Document
 from rich.console import Console
+from textual.containers import VerticalScroll
+from textual.widgets import Input
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
@@ -30,6 +32,13 @@ from tinyCode.security.models import SecurityLevel
 from tinyCode.providers.base import CacheUsage, TokenUsage, ToolCall
 from tinyCode.tools.base import ToolResult
 from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
+from tinyCode.tui.factory import create_tui
+from tinyCode.tui.fullscreen_textual import (
+    FullscreenTinyCodeTUI,
+    _TinyCodeFullscreenApp,
+    _TurnView,
+)
+from tinyCode.tui.workspace_changes import WorkspaceChanges
 from tinyCode.config.models import TracingConfig
 from tinyCode.tracing.recorder import TraceRecorder
 
@@ -781,6 +790,328 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             {"bold", "italic", "strike", "bold cyan", "underline blue"}
             .issubset(styles)
         )
+
+    def test_fullscreen_reclassifies_pre_tool_draft_and_keeps_final_text(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        tui._print_user("完成任务")
+        sink = tui._create_stream_renderer()
+        sink.write("我先检查项目。")
+        tui._before_tool_call()
+        sink.write("最终答案。")
+        tui._print_success()
+
+        self.assertIn("模型前置说明：\n我先检查项目。", tui._process_lines)
+        self.assertNotIn("我先检查项目。", tui._assistant_draft)
+        self.assertEqual("最终答案。", tui._assistant_draft)
+        self.assertTrue(tui._process_collapsed)
+
+    async def test_fullscreen_chat_feed_uses_independent_message_widgets(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("修复问题")
+            tui._append_process("· 正在检查文件")
+            tui._append_assistant_text("# 修复完成\n说明文本")
+            tui._set_process_collapsed(True)
+            tui._render_workspace_changes(WorkspaceChanges(
+                added=("new.py",), modified=("app.py",),
+            ))
+            await pilot.pause()
+
+            views = list(app.query(_TurnView))
+            self.assertEqual(1, len(views))
+            view = views[0]
+            self.assertEqual("修复问题", view.user.renderable)
+            self.assertTrue(view.process.collapsed)
+            self.assertIn("# 修复完成", view.turn.answer)
+            self.assertIn("已编辑 2 个文件", view.turn.workspace_summary)
+
+    async def test_fullscreen_keeps_each_completed_turn_in_chat_history(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("第一件事")
+            tui._append_assistant_text("第一份回答")
+            tui._print_success()
+            tui._print_user("第二件事")
+            tui._append_assistant_text("第二份回答")
+            await pilot.pause()
+
+            views = list(app.query(_TurnView))
+            self.assertEqual(2, len(views))
+            self.assertEqual("第一件事", views[0].turn.user_text)
+            self.assertEqual("第一份回答", views[0].turn.answer)
+            self.assertEqual("第二件事", views[1].turn.user_text)
+            self.assertEqual("第二份回答", views[1].turn.answer)
+
+    async def test_fullscreen_history_scroll_pauses_and_resumes_tail_follow(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(80, 18)) as pilot:
+            for index in range(8):
+                tui._print_user(f"任务 {index}")
+                tui._append_assistant_text((f"回答 {index}\n") * 5)
+                tui._print_success()
+            await pilot.pause()
+
+            scroll = app.query_one("#chat-scroll", VerticalScroll)
+            self.assertGreater(scroll.max_scroll_y, 0)
+            app.action_history_up()
+            await pilot.pause()
+            self.assertFalse(app.follow_tail)
+            app.action_history_down()
+            await pilot.pause()
+            self.assertTrue(app.follow_tail)
+
+            scroll.scroll_to(y=0, animate=False, force=True)
+            await pilot.pause()
+            tui._append_assistant_text("新的流式内容")
+            await pilot.pause()
+            self.assertFalse(app.follow_tail)
+            self.assertLess(scroll.scroll_y, scroll.max_scroll_y)
+            self.assertTrue(app.query_one("#new-output").display)
+            await pilot.click("#new-output")
+            await pilot.pause()
+            self.assertTrue(app.follow_tail)
+            self.assertFalse(app.query_one("#new-output").display)
+
+    def test_tui_factory_keeps_stream_default_and_selects_fullscreen(self):
+        kwargs = {
+            "agent_loop": FakeAgentLoop(),
+            "history": FakeHistory(),
+            "compressor": FakeCompressor(),
+            "session_store": FakeSessionStore(),
+            "note_manager": None,
+            "provider_name": "fake",
+            "model": "fake",
+        }
+        self.assertIsInstance(create_tui(ui_mode="stream", **kwargs), TinyCodeTUI)
+        with patch("tinyCode.tui.factory.FullscreenTinyCodeTUI.supported", return_value=True):
+            self.assertIsInstance(
+                create_tui(ui_mode="fullscreen", **kwargs), FullscreenTinyCodeTUI,
+            )
+
+    async def test_fullscreen_moves_pre_tool_text_to_process_after_real_events(self):
+        class DraftThenToolLoop(FakeAgentLoop):
+            def tool_may_modify_workspace(self, _tool_name: str) -> bool:
+                return False
+
+            async def run(self, history):
+                yield TextDeltaEvent("我先读取配置。")
+                yield ToolCallEvent(ToolCall("call_1", "read_file", {"path": "x"}))
+                yield ToolResultEvent(
+                    tool_name="read_file",
+                    call_id="call_1",
+                    result=ToolResult(success=True, content="ok"),
+                )
+                yield TextDeltaEvent("最终结果。")
+                yield AgentDoneEvent("no_tool_call")
+
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=DraftThenToolLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+
+        await tui._on_user_input("执行任务")
+
+        self.assertIn("最终结果。", tui._assistant_draft)
+        self.assertNotIn("我先读取配置。", tui._assistant_draft)
+        self.assertTrue(any("我先读取配置。" in item for item in tui._process_lines))
+        self.assertTrue(tui._process_collapsed)
+
+    async def test_fullscreen_enter_submits_input_and_starts_a_turn(self):
+        loop = FakeAgentLoop("已收到")
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            app.query_one("#composer", Input).focus()
+            await pilot.press(*"测试输入", "enter")
+            await tui._wait_for_foreground()
+            await pilot.pause()
+
+        self.assertEqual(["测试输入"], tui._history.user_messages)
+        self.assertIn("已收到", tui._assistant_draft)
+
+    async def test_fullscreen_application_shows_streamed_final_answer(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop("全屏回答"),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.press(*"测试全屏", "enter")
+            await tui._wait_for_foreground()
+            await pilot.pause()
+            self.assertEqual(1, len(list(app.query(_TurnView))))
+
+        self.assertIn("全屏回答", tui._assistant_draft)
+
+    async def test_fullscreen_token_line_aligns_with_turn(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=MetricsAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+
+        await tui._on_user_input("统计任务")
+
+        lines = tui._metric_summary.splitlines()
+        self.assertTrue(lines[0].startswith("本轮统计 · Turn"))
+        self.assertTrue(
+            lines[1].startswith(tui._terminal_indent("本轮统计 · ") + "Token")
+        )
+
+    async def test_fullscreen_slash_menu_filters_and_tab_completes(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+            await pilot.press("/", "p", "r", "o")
+            await pilot.pause()
+
+            self.assertIn("/prompt", app.command_candidates)
+            self.assertTrue(app.query_one("#command-menu").display)
+            await pilot.press("tab")
+            await pilot.pause()
+
+            self.assertEqual("/prompt ", composer.value)
+            self.assertFalse(app.query_one("#command-menu").display)
+
+    async def test_fullscreen_only_suggests_cancel_while_task_is_active(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        self.assertTrue(tui._runtime.reserve())
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            app.query_one("#composer", Input).focus()
+            await pilot.press("/")
+            await pilot.pause()
+
+            self.assertEqual(["/cancel"], app.command_candidates)
+
+    async def test_fullscreen_slash_command_result_is_a_visible_message(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            await tui._submit_input("/help")
+            await pilot.pause()
+
+            views = list(app.query(_TurnView))
+            self.assertEqual(1, len(views))
+            self.assertTrue(views[0].turn.answer)
+            self.assertFalse(views[0].turn.user_text)
+            self.assertFalse(views[0].turn.answer_is_markdown)
+            self.assertEqual("command", views[0].turn.answer_kind)
+            self.assertFalse(views[0].answer.display)
+            self.assertTrue(views[0].plain_answer.display)
+            self.assertIn("\n", views[0].turn.answer)
+
+    async def test_fullscreen_classifies_warning_error_and_approval_cards(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("执行危险操作")
+            tui._print_warning("上下文接近上限")
+            tui._print_approval("即将执行写操作")
+            tui._print_error("工具执行失败")
+            await pilot.pause()
+
+            self.assertEqual(
+                ["warning", "approval", "error"],
+                [notice.kind for notice in tui._active_turn.notices],
+            )
+            view = list(app.query(_TurnView))[0]
+            self.assertEqual(3, len(list(view.notice_list.children)))
 
     async def test_escaped_newlines_are_normalized_before_output_and_recording(self):
         loop = FakeAgentLoop("```java\\nclass QuickSort {}\\n```")
