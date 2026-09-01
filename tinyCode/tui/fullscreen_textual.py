@@ -7,6 +7,7 @@ and the fixed composer.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import sys
 from dataclasses import dataclass, field
@@ -82,7 +83,10 @@ class _TurnView(Vertical):
             classes="process-block",
         )
         self.agent_label = Static("TinyCode", classes="agent-label")
-        self.answer = Markdown(turn.answer, classes="agent-answer")
+        # Stream through the cheap Static widget. Final Markdown rendering is
+        # run as an owned worker so Textual cancels it before unmount clears
+        # component styles such as ``code_inline``.
+        self.answer = Markdown("", classes="agent-answer")
         self.plain_answer = Static(
             turn.answer, classes="agent-plain-answer", markup=False,
         )
@@ -90,6 +94,8 @@ class _TurnView(Vertical):
         notice_widgets = [self._notice_widget(notice) for notice in turn.notices]
         self.notice_list = Vertical(*notice_widgets, classes="notice-list")
         self._rendered_notice_count = len(notice_widgets)
+        self._markdown_source = ""
+        self._markdown_rendered = ""
         self.workspace = Static("", classes="workspace-card", markup=False)
         self.metrics = Static("", classes="turn-metrics", markup=False)
 
@@ -114,12 +120,22 @@ class _TurnView(Vertical):
         self.process.collapsed = turn.process_collapsed
         self.process.display = bool(turn.process_lines)
         self.agent_label.display = bool(turn.answer)
-        self.answer.display = bool(turn.answer) and turn.answer_is_markdown
-        self.plain_answer.display = bool(turn.answer) and not turn.answer_is_markdown
-        if turn.answer and turn.answer_is_markdown:
-            self.answer.update(turn.answer)
-        elif turn.answer:
+        final_markdown = bool(
+            turn.answer and turn.answer_is_markdown and turn.finished
+        )
+        self.answer.display = final_markdown and self._markdown_rendered == turn.answer
+        self.plain_answer.display = bool(turn.answer) and not self.answer.display
+        if turn.answer:
             self.plain_answer.update(turn.answer)
+        if final_markdown and turn.answer != self._markdown_source:
+            self._markdown_source = turn.answer
+            self.run_worker(
+                self._render_final_markdown(turn.answer),
+                name="render-final-markdown",
+                group="markdown",
+                exclusive=True,
+                exit_on_error=False,
+            )
         if self.notice_list.is_mounted:
             for notice in turn.notices[self._rendered_notice_count:]:
                 self.notice_list.mount(self._notice_widget(notice))
@@ -142,6 +158,19 @@ class _TurnView(Vertical):
         self.workspace.update(workspace)
         self.metrics.display = bool(turn.metrics_summary)
         self.metrics.update(turn.metrics_summary)
+
+    async def _render_final_markdown(self, source: str) -> None:
+        """Render once at completion and never outlive this turn widget."""
+        try:
+            await self.answer.update(source)
+        except asyncio.CancelledError:
+            raise
+        if not self.is_mounted or source != self._markdown_source:
+            return
+        self._markdown_rendered = source
+        self.answer.display = True
+        self.plain_answer.display = False
+        self.refresh(layout=True)
 
     @staticmethod
     def _notice_widget(notice: _SystemNotice) -> Static:
@@ -314,6 +343,7 @@ class _TinyCodeFullscreenApp(App[None]):
         if self.owner._runtime.active:
             self.owner.cancel_active_turn()
         else:
+            self.owner.request_exit()
             self.exit()
 
     def action_toggle_process(self) -> None:
@@ -445,6 +475,40 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._metric_summary = ""
         self._workspace_summary = ""
         self._last_process_progress = ""
+        self._shutting_down = False
+        self._hydrate_saved_history()
+
+    def request_exit(self) -> None:
+        """Stop scheduling widget work before Textual prunes the screen."""
+        self._shutting_down = True
+        super().request_exit()
+
+    def _hydrate_saved_history(self) -> None:
+        """Rebuild readable user/assistant cards for a loaded session."""
+        get_messages = getattr(self._history, "get_messages", None)
+        if not callable(get_messages):
+            return
+        active: _ConversationTurn | None = None
+        for message in get_messages():
+            role = message.get("role")
+            content = message.get("content")
+            if role == "user" and isinstance(content, str) and content:
+                if active is not None:
+                    active.finished = True
+                active = _ConversationTurn(user_text=content)
+                self._turns.append(active)
+            elif role == "assistant" and isinstance(content, str) and content:
+                if active is None:
+                    active = _ConversationTurn(user_text="")
+                    self._turns.append(active)
+                active.answer = content
+                active.finished = True
+                active.process_collapsed = True
+        if active is not None:
+            self._active_turn = active
+            self._process_lines = active.process_lines
+            self._assistant_draft = active.answer
+            self._process_collapsed = active.process_collapsed
 
     def _print_user(self, text: str) -> None:
         if self._active_turn is not None:
@@ -487,10 +551,11 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._sync_active_view()
 
     def _print_success(self) -> None:
-        self._append_process("✓ 本轮已正常完成")
-        self._set_process_collapsed(True)
         if self._active_turn is not None:
             self._active_turn.finished = True
+        self._append_process("✓ 本轮已正常完成")
+        self._set_process_collapsed(True)
+        self._sync_active_view()
         self._refresh_chrome()
 
     def _print_info(self, text: str) -> None:
@@ -639,16 +704,21 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._app = app
         for turn in self._turns:
             app.call_later(self._mount_turn, turn)
+        if self._startup_recovery_prompt:
+            app.call_later(self._start_startup_recovery)
 
     def _mount_active_turn(self) -> None:
         if self._active_turn is not None:
             self._mount_turn(self._active_turn)
 
     def _mount_turn(self, turn: _ConversationTurn) -> None:
-        if self._app is None or not self._app.is_running:
+        if self._shutting_down or self._app is None or not self._app.is_running:
+            return
+        turn_list = self._app.query_one("#turn-list", Vertical)
+        if not turn_list.is_attached:
             return
         view = _TurnView(turn)
-        self._app.query_one("#turn-list", Vertical).mount(view)
+        turn_list.mount(view)
         if turn is self._active_turn:
             self._active_view = view
         self._app.scroll_to_latest()
@@ -666,6 +736,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._sync_active_view()
 
     def _append_system_answer(self, text: str, *, kind: str) -> None:
+        if self._shutting_down:
+            return
         if self._active_turn is not None:
             self._active_turn.finished = True
         turn = _ConversationTurn(
@@ -744,6 +816,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         try:
             await app.run_async(mouse=True)
         finally:
+            self._shutting_down = True
             self._input_loop_active = False
             if self._runtime.active:
                 self._runtime.cancel()

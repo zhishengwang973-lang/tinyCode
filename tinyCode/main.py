@@ -25,6 +25,7 @@ from tinyCode.prompts import (
 )
 from tinyCode.security import SecurityGuard, SecurityPolicy, PathSandbox, SecurityLevel
 from tinyCode.storage.sessions import SessionStore
+from tinyCode.storage.recovery import TaskRecoveryStore
 from tinyCode.tools import (
     ToolRegistry,
     ToolExecutor,
@@ -74,6 +75,40 @@ class _CleanupStack:
         self._steps.clear()
         if cancellation is not None:
             raise cancellation
+
+
+async def _choose_interrupted_task(
+    recovery_store: TaskRecoveryStore,
+    task: dict,
+) -> str:
+    """Return recover, abandon, or new after an explicit startup decision."""
+    print("\n检测到上次未正常结束的任务：", file=sys.stderr)
+    print(recovery_store.describe(task), file=sys.stderr)
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        print(
+            "当前不是交互终端，已保留中断记录但不会自动执行；"
+            "请在真实终端重新启动 TinyCode 进行恢复。",
+            file=sys.stderr,
+        )
+        return "new"
+    while True:
+        try:
+            choice = (
+                await asyncio.to_thread(
+                    input,
+                    "恢复任务 [C继续/V查看/A放弃] › ",
+                )
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "new"
+        if choice in {"c", "continue", "继续"}:
+            return "recover"
+        if choice in {"a", "abandon", "放弃"}:
+            return "abandon"
+        if choice in {"v", "view", "查看"}:
+            print("\n" + recovery_store.describe(task), file=sys.stderr)
+            continue
+        print("请输入 C、V 或 A", file=sys.stderr)
 
 
 def _create_tool_registry(
@@ -152,15 +187,8 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             f"旧会话迁移失败: {session_store.last_migration_error}",
             file=sys.stderr,
         )
-    try:
-        session_store.new_session()  # fresh session ID each startup
-    except OSError as exc:
-        print(
-            f"无法创建会话: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        return 2
-    # Old sessions are NOT auto-restored — use /session load <id> manually
+    # Session selection is delayed until after a possible worktree resume so
+    # interrupted tasks are matched against the actual execution workspace.
 
     # 4.5. Instructions
     instructions_loader = InstructionsLoader()
@@ -322,6 +350,53 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             else:
                 print(f"恢复 Worktree 失败: {resume_error}", file=sys.stderr)
 
+    # Durable foreground-task recovery. Model streams resume by issuing a new
+    # request at a protocol-safe boundary; they never pretend to resume from an
+    # exact token. Unknown in-flight tools must be reconciled first.
+    try:
+        recovery_store = TaskRecoveryStore()
+    except OSError as exc:
+        print(
+            f"无法初始化任务恢复存储: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    startup_recovery_prompt = ""
+    startup_recovery_task_id: str | None = None
+    interrupted = recovery_store.find_latest_interrupted(Path.cwd())
+    if interrupted is not None:
+        action = await _choose_interrupted_task(recovery_store, interrupted)
+        task_id = str(interrupted.get("task_id", ""))
+        if action == "recover":
+            restored = session_store.load(str(interrupted.get("session_id", "")))
+            prepared = recovery_store.prepare_recovery(task_id)
+            if restored is None or prepared is None:
+                print(
+                    "中断任务对应的会话或恢复记录不存在，已保留记录并创建新会话。",
+                    file=sys.stderr,
+                )
+            else:
+                restored_history, _provider, _model = restored
+                history.replace_messages(restored_history.get_messages())
+                history.restore_steering_messages(
+                    list(prepared.get("pending_steering", []))
+                )
+                startup_recovery_prompt = recovery_store.build_recovery_prompt(prepared)
+                startup_recovery_task_id = task_id
+                print("已加载中断会话，将在启动后先核对副作用再继续。", file=sys.stderr)
+        elif action == "abandon":
+            recovery_store.finish(task_id, "abandoned")
+
+    if session_store.current_id is None:
+        try:
+            session_store.new_session()
+        except OSError as exc:
+            print(
+                f"无法创建会话: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+
     agent_loop = AgentLoop(
         provider=provider,
         tool_registry=tool_registry,
@@ -342,6 +417,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         round_limit_action=app_config.round_limit_action,
         compressor=compressor,
         trace_recorder=trace_recorder,
+        recovery_store=recovery_store,
     )
 
     tui_ref: dict[str, TinyCodeTUI] = {}
@@ -401,6 +477,9 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         worktree_manager=worktree_manager,
         team_runner=team_runner,
         trace_recorder=trace_recorder,
+        recovery_store=recovery_store,
+        startup_recovery_prompt=startup_recovery_prompt,
+        startup_recovery_task_id=startup_recovery_task_id,
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui

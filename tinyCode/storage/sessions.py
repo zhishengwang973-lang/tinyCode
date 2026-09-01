@@ -18,6 +18,7 @@ from typing import Any
 
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.storage.journal import JSONLJournal, atomic_write_text as _atomic_write_text
+from tinyCode.time_utils import beijing_now_iso
 
 SESSIONS_DIR = Path.home() / ".tinyCode" / "sessions"
 TIME_GAP_MINUTES = 30  # inject reminder after this inactivity
@@ -57,7 +58,7 @@ class SessionStore:
             self.new_session()
         sid = self._current_id
         assert sid is not None
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = beijing_now_iso()
         JSONLJournal(self._path_for(sid)).append([{**message, "timestamp": timestamp}])
         self._persisted_messages.append(self._without_timestamp(message))
         self._persisted_timestamps.append(timestamp)
@@ -71,7 +72,7 @@ class SessionStore:
             self.new_session()
         sid = self._current_id
         assert sid is not None
-        ts = datetime.now(timezone.utc).isoformat()
+        ts = beijing_now_iso()
         JSONLJournal(self._path_for(sid)).append([
             {**message, "timestamp": ts} for message in messages
         ])
@@ -248,7 +249,7 @@ class SessionStore:
             model = data.get("model", "")
 
             sid = uuid.uuid4().hex[:12]
-            ts = datetime.now(timezone.utc).isoformat()
+            ts = beijing_now_iso()
             new_path = self._path_for(sid)
             JSONLJournal(new_path).replace([
                 {**message, "timestamp": ts} for message in messages
@@ -342,7 +343,7 @@ class SessionStore:
     def _write_meta(self, sid: str, **kwargs) -> None:
         meta_path = self._meta_path_for(sid)
         existing = self._read_meta(sid)
-        now = datetime.now(timezone.utc).isoformat()
+        now = beijing_now_iso()
         if kwargs.pop("created", False):
             existing["id"] = sid
             existing["created_at"] = now
@@ -356,7 +357,7 @@ class SessionStore:
 
     def _update_meta(self, sid: str, message_count_delta: int = 0) -> None:
         meta = self._read_meta(sid)
-        meta["last_active_at"] = datetime.now(timezone.utc).isoformat()
+        meta["last_active_at"] = beijing_now_iso()
         if message_count_delta:
             meta["message_count"] = self._message_count(meta) + message_count_delta
         _atomic_write_text(
@@ -632,7 +633,7 @@ class SessionStore:
         ):
             key = json.dumps(message, ensure_ascii=False, sort_keys=True)
             existing[key].append(timestamp)
-        now = datetime.now(timezone.utc).isoformat()
+        now = beijing_now_iso()
         timestamps: list[str] = []
         for message in messages:
             key = json.dumps(message, ensure_ascii=False, sort_keys=True)

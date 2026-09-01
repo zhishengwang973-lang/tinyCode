@@ -1,11 +1,10 @@
 """Environment info — collects system context for the first system message."""
 
 import platform
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tinyCode.time_utils import BEIJING_TIMEZONE, beijing_now
 
-BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def collect_environment() -> str:
@@ -27,7 +26,7 @@ def collect_environment() -> str:
 
 def collect_current_time() -> str:
     """Return a Beijing-time fact for a task that explicitly requests it."""
-    now = datetime.now(BEIJING_TIMEZONE).strftime(
+    now = beijing_now().strftime(
         "%Y-%m-%d %H:%M 北京时间 (UTC+8)"
     )
     return f"当前时间: {now}"

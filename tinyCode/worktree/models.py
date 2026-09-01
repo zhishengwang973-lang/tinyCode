@@ -1,7 +1,8 @@
 """Worktree data models."""
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+
+from tinyCode.time_utils import beijing_now_iso
 
 
 @dataclass
@@ -19,4 +20,4 @@ class WorktreeInfo:
 class WorktreeSession:
     active_worktree: str = ""      # name of the active worktree ("" = main)
     original_cwd: str = ""         # cwd before entering worktree
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_at: str = field(default_factory=beijing_now_iso)

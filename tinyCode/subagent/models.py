@@ -2,8 +2,9 @@
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
+
+from tinyCode.time_utils import beijing_now_iso
 
 
 class TaskStatus(Enum):
@@ -42,20 +43,20 @@ class SubAgentTask:
 
     def start(self) -> None:
         self.status = TaskStatus.RUNNING
-        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.started_at = beijing_now_iso()
 
     def complete(self, result: str, tokens: int = 0, rounds: int = 0) -> None:
         self.status = TaskStatus.COMPLETED
         self.result = result
         self.token_usage = tokens
         self.round_count = rounds
-        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at = beijing_now_iso()
 
     def fail(self, error: str) -> None:
         self.status = TaskStatus.FAILED
         self.result = error
-        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at = beijing_now_iso()
 
     def cancel(self) -> None:
         self.status = TaskStatus.CANCELLED
-        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at = beijing_now_iso()

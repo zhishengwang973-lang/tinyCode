@@ -1,6 +1,7 @@
 """Session command — list, load, new, delete."""
 
 from tinyCode.commands.types import CommandMeta, CommandType, UIControl
+from tinyCode.time_utils import format_beijing_time
 
 
 def create(ui: UIControl) -> CommandMeta:
@@ -29,7 +30,12 @@ def create(ui: UIControl) -> CommandMeta:
                 sid = _display_text(s.get("id"), "?")[:12]
                 title = _display_text(s.get("title"), "无标题")[:50]
                 count = _display_count(s.get("message_count"))
-                last = _display_text(s.get("last_active_at"), "")[:16]
+                last = format_beijing_time(
+                    _display_text(s.get("last_active_at"), ""),
+                    pattern="%Y-%m-%d %H:%M",
+                    default="—",
+                    label=True,
+                )
                 lines.append(f"  {sid}  {title}  ({count} 条消息, {last})")
             lines.append("\n/session load <ID> 加载 | /session delete <ID> 删除")
             return "\n".join(lines)

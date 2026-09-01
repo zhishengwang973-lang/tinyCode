@@ -65,6 +65,16 @@ class ConversationHistory:
     def steering_count(self) -> int:
         return len(self._steering_user_messages)
 
+    def pending_steering_messages(self) -> list[str]:
+        """Return a copy suitable for a durable runtime checkpoint."""
+        return list(self._steering_user_messages)
+
+    def restore_steering_messages(self, messages: list[str]) -> None:
+        """Restore queued steering after a restart without duplicating it."""
+        self._steering_user_messages = [
+            str(message) for message in messages if str(message).strip()
+        ]
+
     def discard_steering_messages(self) -> int:
         count = len(self._steering_user_messages)
         self._steering_user_messages.clear()

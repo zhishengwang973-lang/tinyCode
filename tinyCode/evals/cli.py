@@ -6,12 +6,12 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from tinyCode.config.loader import ConfigError, load_provider_config
 from tinyCode.evals.loader import EvalConfigError, load_case
 from tinyCode.evals.runner import EvalRunner
+from tinyCode.time_utils import beijing_filename_timestamp
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +48,7 @@ async def run_from_args(args: argparse.Namespace) -> int:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = beijing_filename_timestamp()
     reports = []
     progress = _TerminalProgress(sys.stdout, len(cases))
     for index, case in enumerate(cases, start=1):

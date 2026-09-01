@@ -1,9 +1,9 @@
 """Background task manager — track, notify, manage sub-agent tasks."""
 
 import asyncio
-from datetime import datetime, timezone
 
 from tinyCode.subagent.models import SubAgentTask, TaskStatus
+from tinyCode.time_utils import timestamp_sort_key
 
 
 class BackgroundTaskManager:
@@ -85,7 +85,11 @@ class BackgroundTaskManager:
         if not self._tasks:
             return "没有后台任务"
         lines = ["后台任务:"]
-        for t in sorted(self._tasks.values(), key=lambda x: x.started_at or "", reverse=True):
+        for t in sorted(
+            self._tasks.values(),
+            key=lambda item: timestamp_sort_key(item.started_at),
+            reverse=True,
+        ):
             status_icon = {
                 TaskStatus.QUEUED: "⏳", TaskStatus.RUNNING: "🔄",
                 TaskStatus.COMPLETED: "✅", TaskStatus.FAILED: "❌",

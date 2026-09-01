@@ -2,8 +2,9 @@
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
+
+from tinyCode.time_utils import beijing_now_iso
 
 
 class MemberStatus(Enum):
@@ -38,7 +39,7 @@ class TeamTask:
     depends_on: list[str] = field(default_factory=list)  # task IDs
     status: TaskStatus = TaskStatus.PENDING
     result: str = ""
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_at: str = field(default_factory=beijing_now_iso)
     updated_at: str = ""
 
 
@@ -50,7 +51,7 @@ class TeamMessage:
     msg_type: MessageType = MessageType.TEXT
     content: str = ""
     summary: str = ""             # optional one-line summary
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(default_factory=beijing_now_iso)
 
 
 @dataclass

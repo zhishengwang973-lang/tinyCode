@@ -7,10 +7,10 @@ all tool results in a single conversation round.
 import re
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from tinyCode.providers.base import Message
+from tinyCode.time_utils import beijing_filename_timestamp
 
 TOOL_RESULT_STORAGE_SUBDIR = Path(".tinyCode") / "tool_results"
 # Keep ordinary tool observations compact enough to be repeated across a few
@@ -145,7 +145,7 @@ class ToolResultTruncator:
     def _truncate_tool_msg_with_path(self, msg: Message) -> tuple[Message, str]:
         """Truncate and return (message, file_path)."""
         content = self._tool_result_content(msg) or ""
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        ts = beijing_filename_timestamp(microseconds=True)
         tool_name = self._tool_name(msg)
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", tool_name)
         digest = hashlib.sha256(content.encode("utf-8", errors="surrogatepass")).hexdigest()

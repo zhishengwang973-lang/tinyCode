@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from tinyCode.notes.manager import AutoNoteManager
     from tinyCode.skills.registry import SkillRegistry
     from tinyCode.storage.sessions import SessionStore
+    from tinyCode.storage.recovery import TaskRecoveryStore
 
 
 class _StreamTextNormalizer:
@@ -417,6 +418,9 @@ class TinyCodeTUI(UIControl):
         worktree_manager=None,
         team_runner=None,
         trace_recorder: TraceRecorder | None = None,
+        recovery_store: "TaskRecoveryStore | None" = None,
+        startup_recovery_prompt: str = "",
+        startup_recovery_task_id: str | None = None,
         console: Console | None = None,
         prompt_session: Any | None = None,
     ) -> None:
@@ -431,6 +435,10 @@ class TinyCodeTUI(UIControl):
         self._model = model
         self._mcp_server_count = mcp_server_count
         self._trace_recorder = trace_recorder
+        self._recovery_store = recovery_store
+        self._startup_recovery_prompt = startup_recovery_prompt
+        self._resume_recovery_task_id = startup_recovery_task_id
+        self._active_recovery_task_id: str | None = None
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -487,6 +495,12 @@ class TinyCodeTUI(UIControl):
         self, question: str, options: list[str],
     ) -> str | None:
         """Collect one model-requested answer without creating a new turn."""
+        if self._recovery_store is not None and self._active_recovery_task_id:
+            self._recovery_store.update(
+                self._active_recovery_task_id,
+                state="waiting_user_input",
+                waiting={"kind": "model_question", "option_count": len(options)},
+            )
         self._stop_progress()
         self._console.print()
         self._console.print(f"需要你确认：{question}", style="bold cyan", highlight=False)
@@ -513,6 +527,10 @@ class TinyCodeTUI(UIControl):
                     self._print_warning(f"请输入 1–{len(options)} 的序号，或直接输入答案")
                     continue
             self._start_progress("已收到回答 · 继续执行")
+            if self._recovery_store is not None and self._active_recovery_task_id:
+                self._recovery_store.update(
+                    self._active_recovery_task_id, state="running", waiting={},
+                )
             return answer
 
     def send_to_conversation(self, text: str) -> None:
@@ -826,6 +844,17 @@ class TinyCodeTUI(UIControl):
             return
         self._history.queue_steering_message(text)
         count = getattr(self._history, "steering_count", 1)
+        if self._recovery_store is not None and self._active_recovery_task_id:
+            try:
+                self._recovery_store.update(
+                    self._active_recovery_task_id,
+                    pending_steering=self._history.pending_steering_messages(),
+                    last_safe_checkpoint="steering_queued",
+                )
+            except Exception as exc:
+                self._print_warning(
+                    f"追加指令恢复检查点保存失败: {type(exc).__name__}: {exc}"
+                )
         if self._trace_recorder is not None:
             self._trace_recorder.record(
                 "steering_queued",
@@ -863,6 +892,7 @@ class TinyCodeTUI(UIControl):
         round_recorded = False
         stream_normalizer = _StreamTextNormalizer()
         stream_renderer = self._create_stream_renderer()
+        recovery_terminal_state = "failed"
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
@@ -875,11 +905,42 @@ class TinyCodeTUI(UIControl):
                     model=self._model,
                     context_window=int(self._compressor.context_window),
                 )
+            if self._recovery_store is not None:
+                recovery_task_id = self._resume_recovery_task_id
+                self._resume_recovery_task_id = None
+                if recovery_task_id:
+                    self._recovery_store.update(
+                        recovery_task_id,
+                        state="running",
+                        waiting={},
+                        pending_steering=self._history.pending_steering_messages(),
+                        last_safe_checkpoint="recovery_model_request",
+                    )
+                else:
+                    snapshot = self._runtime.snapshot()
+                    recovery_task = self._recovery_store.start_task(
+                        session_id=str(self._session_store.current_id or ""),
+                        user_task=text,
+                        workspace=Path.cwd(),
+                        turn_id=snapshot.turn_id,
+                        max_rounds=self._agent_loop.max_rounds,
+                        hard_max_rounds=self._agent_loop.hard_max_rounds,
+                    )
+                    recovery_task_id = str(recovery_task["task_id"])
+                self._active_recovery_task_id = recovery_task_id
+                self._agent_loop.set_recovery_task(recovery_task_id)
             if display_user:
                 self._print_user(text)
             self._history.flush_deferred()
             self._history.add_user_message(text)
             self._save_checkpoint()
+            if self._recovery_store is not None and self._active_recovery_task_id:
+                self._recovery_store.checkpoint(
+                    self._active_recovery_task_id,
+                    "user_message_persisted",
+                    state="running",
+                    pending_steering=self._history.pending_steering_messages(),
+                )
             self._start_progress("准备本轮任务")
 
             async for event in self._runtime.run(self._history):
@@ -888,6 +949,15 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(
                         f"第 {event.round_number}/{event.max_rounds} 轮 · 等待模型"
                     )
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="running",
+                            current_round=event.round_number,
+                            current_limit=event.max_rounds,
+                            waiting={},
+                            pending_steering=self._history.pending_steering_messages(),
+                        )
 
                 elif isinstance(event, TextDeltaEvent):
                     # A spinner is useful while waiting, but must never split the
@@ -899,6 +969,10 @@ class TinyCodeTUI(UIControl):
                     normalized = stream_normalizer.normalize(event.text)
                     current_response += normalized
                     stream_renderer.write(normalized)
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.checkpoint_draft(
+                            self._active_recovery_task_id, current_response,
+                        )
 
                 elif isinstance(event, ThinkingEvent):
                     self._start_progress(event.label)
@@ -935,6 +1009,14 @@ class TinyCodeTUI(UIControl):
                                     "files": len(workspace_snapshot.files),
                                 })
                     metrics.record_tool_call()
+                    # The assistant tool-call message is already in history at
+                    # this boundary. Persist it before any side effect begins.
+                    self._save_checkpoint()
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.checkpoint(
+                            self._active_recovery_task_id,
+                            "assistant_tool_call_persisted",
+                        )
                     stream_renderer.close_line()
                     self._start_progress(f"执行工具 {event.tool_call.name}")
 
@@ -954,6 +1036,16 @@ class TinyCodeTUI(UIControl):
                             },
                         )
                     self._save_checkpoint()
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.checkpoint(
+                            self._active_recovery_task_id,
+                            "tool_result_and_session_persisted",
+                            state="running",
+                            waiting={},
+                            inflight_tools=self._recovery_store.unresolved_tools(
+                                self._active_recovery_task_id
+                            ),
+                        )
                     state = "已返回" if event.result.success else "失败，交给模型处理"
                     self._start_progress(f"工具 {event.tool_name} {state}")
 
@@ -1002,6 +1094,15 @@ class TinyCodeTUI(UIControl):
                     stream_renderer.close_line()
                     self._stop_progress()
                     self._print_approval(event.prompt)
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="waiting_approval",
+                            waiting={
+                                "kind": "security_approval",
+                                "tool": event.tool_name,
+                            },
+                        )
                     trace_scope = (
                         self._trace_recorder.span(
                             event.tool_name,
@@ -1016,6 +1117,10 @@ class TinyCodeTUI(UIControl):
                         if trace_span is not None:
                             trace_span.finish("ok", {"decision": decision.value})
                     self._resolve_hitl(decision)
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id, state="running", waiting={},
+                        )
                     self._start_progress("已确认 · 继续执行")
 
                 elif isinstance(event, RoundLimitReachedEvent):
@@ -1030,6 +1135,15 @@ class TinyCodeTUI(UIControl):
                         f"{event.round_number}/{event.current_limit}"
                         f"（硬上限 {event.hard_limit}）"
                     )
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="waiting_round_limit",
+                            current_round=event.round_number,
+                            current_limit=event.current_limit,
+                            hard_limit=event.hard_limit,
+                            waiting={"kind": "round_limit"},
+                        )
                     trace_scope = (
                         self._trace_recorder.span(
                             "round_limit",
@@ -1051,6 +1165,10 @@ class TinyCodeTUI(UIControl):
                                 "requested_limit": decision.requested_limit,
                             })
                     self._runtime.resolve_round_limit(decision)
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id, state="running", waiting={},
+                        )
                     if decision.action == RoundLimitDecisionAction.STOP:
                         self._start_progress("正在暂停任务")
                     else:
@@ -1069,6 +1187,14 @@ class TinyCodeTUI(UIControl):
                         f"轮次预算已扩展：{event.previous_limit} → "
                         f"{event.new_limit}（{mode} · 硬上限 {event.hard_limit}）"
                     )
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="running",
+                            current_limit=event.new_limit,
+                            hard_limit=event.hard_limit,
+                            waiting={},
+                        )
                     self._start_progress(
                         f"预算 {event.new_limit} 轮 · 继续执行"
                     )
@@ -1101,6 +1227,12 @@ class TinyCodeTUI(UIControl):
                         })
                     stream_renderer.close_line()
                     self._save_checkpoint()
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.checkpoint(
+                            self._active_recovery_task_id,
+                            "steering_persisted",
+                            pending_steering=self._history.pending_steering_messages(),
+                        )
                     if event.continued:
                         self._print_info(
                             f"↪ 已注入 {event.message_count} 条追加指令，继续当前任务"
@@ -1125,6 +1257,14 @@ class TinyCodeTUI(UIControl):
                     )
                     for reason in event.reasons:
                         self._print_info(f"  - {reason}")
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="waiting_progress",
+                            current_round=event.round_number,
+                            hard_limit=event.hard_limit,
+                            waiting={"kind": "task_stalled", "reasons": event.reasons},
+                        )
                     trace_scope = (
                         self._trace_recorder.span(
                             "stalled_task",
@@ -1146,6 +1286,10 @@ class TinyCodeTUI(UIControl):
                                 "continue_rounds": decision.continue_rounds,
                             })
                     self._runtime.resolve_progress(decision)
+                    if self._recovery_store is not None and self._active_recovery_task_id:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id, state="running", waiting={},
+                        )
                     if decision.action == TaskStalledDecisionAction.STOP:
                         self._start_progress("正在暂停任务")
                     elif decision.action == TaskStalledDecisionAction.STRATEGY:
@@ -1155,6 +1299,13 @@ class TinyCodeTUI(UIControl):
 
                 elif isinstance(event, AgentDoneEvent):
                     trace_status = event.reason
+                    recovery_terminal_state = (
+                        "completed"
+                        if event.reason == "no_tool_call"
+                        else "cancelled"
+                        if event.reason == "cancelled"
+                        else "paused"
+                    )
                     self._stop_progress()
                     stream_renderer.close_line()
                     self._finalize_response(current_response)
@@ -1198,6 +1349,9 @@ class TinyCodeTUI(UIControl):
                 elif isinstance(event, ErrorEvent):
                     trace_status = "error"
                     trace_error = event.message
+                    recovery_terminal_state = (
+                        "interrupted" if event.retryable else "failed"
+                    )
                     self._stop_progress()
                     stream_renderer.close_line()
                     await self._print_workspace_changes(workspace_snapshot)
@@ -1213,6 +1367,7 @@ class TinyCodeTUI(UIControl):
 
         except asyncio.CancelledError:
             trace_status = "cancelled"
+            recovery_terminal_state = "cancelled"
             self._stop_progress()
             stream_renderer.close_line()
             self._status_text = "就绪 · 本轮已取消"
@@ -1221,6 +1376,7 @@ class TinyCodeTUI(UIControl):
         except Exception as exc:
             trace_status = "error"
             trace_error = f"{type(exc).__name__}: {exc}"
+            recovery_terminal_state = "failed"
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
             stream_renderer.close_line()
@@ -1245,10 +1401,35 @@ class TinyCodeTUI(UIControl):
                     },
                 )
             self._runtime.release()
+            session_saved = False
             try:
                 self._do_save()
+                session_saved = True
             except Exception as exc:
                 self._print_warning(f"会话保存失败: {type(exc).__name__}: {exc}")
+                trace_error = trace_error or f"会话保存失败: {type(exc).__name__}: {exc}"
+            if self._recovery_store is not None and self._active_recovery_task_id:
+                try:
+                    if session_saved:
+                        self._recovery_store.finish(
+                            self._active_recovery_task_id,
+                            recovery_terminal_state,
+                            error=trace_error,
+                        )
+                    else:
+                        self._recovery_store.update(
+                            self._active_recovery_task_id,
+                            state="recovery_pending",
+                            error=trace_error,
+                            last_safe_checkpoint="session_save_failed",
+                        )
+                except Exception as exc:
+                    self._print_warning(
+                        f"任务恢复状态保存失败: {type(exc).__name__}: {exc}"
+                    )
+                finally:
+                    self._agent_loop.set_recovery_task(None)
+                    self._active_recovery_task_id = None
 
     async def _prompt_for_approval(self) -> HITLDecision:
         choices = {
@@ -1784,6 +1965,14 @@ class TinyCodeTUI(UIControl):
         except Exception as exc:
             self._print_warning(f"会话检查点保存失败: {type(exc).__name__}: {exc}")
 
+    def _start_startup_recovery(self) -> None:
+        prompt = self._startup_recovery_prompt
+        if not prompt:
+            return
+        self._startup_recovery_prompt = ""
+        self._print_user("继续上次中断的任务（先核对实际状态）")
+        self._start_user_input(prompt, display_user=False)
+
     # -- run ---------------------------------------------------------------
 
     def run(self) -> None:
@@ -1799,6 +1988,7 @@ class TinyCodeTUI(UIControl):
         output_context = patch_stdout(raw=True) if self._uses_prompt_toolkit else nullcontext()
         self._input_loop_active = True
         with output_context:
+            self._start_startup_recovery()
             while not self._exit_requested:
                 try:
                     text = (

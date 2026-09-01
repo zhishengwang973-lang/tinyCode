@@ -1,11 +1,11 @@
 """Shared task list — create, view, list, update with dependency support."""
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 from tinyCode.teams.models import TaskStatus, TeamTask
 from tinyCode.storage.sessions import _atomic_write_text
+from tinyCode.time_utils import beijing_now_iso, timestamp_sort_key
 
 
 class SharedTaskList:
@@ -43,7 +43,7 @@ class SharedTaskList:
         tasks = list(self._tasks.values())
         if status:
             tasks = [t for t in tasks if t.status == status]
-        return sorted(tasks, key=lambda t: t.created_at)
+        return sorted(tasks, key=lambda t: timestamp_sort_key(t.created_at))
 
     def list_for_run(self, run_id: str) -> list[TeamTask]:
         return [task for task in self.list_all() if task.run_id == run_id]
@@ -65,7 +65,7 @@ class SharedTaskList:
                 isinstance(dep, str) for dep in value
             ):
                 task.depends_on = value
-        task.updated_at = datetime.now(timezone.utc).isoformat()
+        task.updated_at = beijing_now_iso()
         self._save()
         return task
 

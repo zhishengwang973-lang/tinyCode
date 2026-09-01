@@ -12,12 +12,13 @@ import uuid
 import webbrowser
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from time import monotonic_ns, time_ns
 from typing import Any
 
 from tinyCode.config.models import TracingConfig
+from tinyCode.time_utils import BEIJING_TIMEZONE, beijing_now, beijing_now_iso
 
 
 TRACE_SCHEMA_VERSION = 1
@@ -188,7 +189,7 @@ class TraceRecorder:
             storage_dir.mkdir(parents=True, exist_ok=True)
             storage_dir = self._validated_storage_dir()
             self._prune()
-            now = datetime.now().astimezone()
+            now = beijing_now()
             trace_id = uuid.uuid4().hex[:12]
             path = storage_dir / f"{now:%Y%m%d_%H%M%S}_{trace_id}.jsonl"
             handle = TraceHandle(
@@ -284,7 +285,7 @@ class TraceRecorder:
                     "schema_version": TRACE_SCHEMA_VERSION,
                     "trace_id": handle.trace_id,
                     "sequence": handle.sequence,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": beijing_now_iso(),
                     "elapsed_ms": max(
                         0.0,
                         (monotonic_ns() - handle.started_monotonic_ns) / 1_000_000,
@@ -441,10 +442,10 @@ class TraceRecorder:
                 key=lambda path: path.stat().st_mtime_ns,
                 reverse=True,
             )
-            cutoff = datetime.now(timezone.utc) - timedelta(days=self._config.retention_days)
+            cutoff = beijing_now() - timedelta(days=self._config.retention_days)
             keep: list[Path] = []
             for path in paths:
-                modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                modified = datetime.fromtimestamp(path.stat().st_mtime, BEIJING_TIMEZONE)
                 if modified < cutoff:
                     self._remove_trace_pair(path)
                 else:

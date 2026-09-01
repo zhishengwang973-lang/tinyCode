@@ -2,6 +2,7 @@
 
 from tinyCode.commands.types import CommandMeta, CommandType
 from tinyCode.subagent.manager import BackgroundTaskManager
+from tinyCode.time_utils import format_beijing_time
 
 
 def create(task_manager: BackgroundTaskManager) -> CommandMeta:
@@ -22,8 +23,8 @@ def create(task_manager: BackgroundTaskManager) -> CommandMeta:
                 f"状态: {task.status.value}\n"
                 f"任务: {task.task}\n"
                 f"轮次: {task.round_count}\n"
-                f"开始: {task.started_at}\n"
-                f"结束: {task.finished_at or '—'}\n"
+                f"开始: {format_beijing_time(task.started_at)}\n"
+                f"结束: {format_beijing_time(task.finished_at)}\n"
                 f"后台: {'是' if task.background else '否'}\n\n"
                 f"结果:\n{task.result[:2000] if task.result else '(无)'}"
             )

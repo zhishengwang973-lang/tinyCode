@@ -979,7 +979,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fullscreen_application_shows_streamed_final_answer(self):
         tui = FullscreenTinyCodeTUI(
-            agent_loop=FakeAgentLoop("全屏回答"),
+            agent_loop=FakeAgentLoop("全屏 `回答`"),
             history=FakeHistory(),
             compressor=FakeCompressor(),
             session_store=FakeSessionStore(),
@@ -991,10 +991,34 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(100, 36)) as pilot:
             await pilot.press(*"测试全屏", "enter")
             await tui._wait_for_foreground()
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            self.assertEqual(1, len(list(app.query(_TurnView))))
+            views = list(app.query(_TurnView))
+            self.assertEqual(1, len(views))
+            self.assertTrue(views[0].answer.display)
+            self.assertFalse(views[0].plain_answer.display)
 
-        self.assertIn("全屏回答", tui._assistant_draft)
+        self.assertIn("全屏 `回答`", tui._assistant_draft)
+
+    async def test_fullscreen_exit_does_not_mount_command_card_during_unmount(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop("使用 `inline code` 完成。"),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)):
+            await tui._submit_input("生成带行内代码的回答")
+            await tui._wait_for_foreground()
+            await tui._submit_input("/exit")
+
+        self.assertTrue(tui._shutting_down)
+        self.assertTrue(tui._exit_requested)
 
     async def test_fullscreen_token_line_aligns_with_turn(self):
         tui = FullscreenTinyCodeTUI(

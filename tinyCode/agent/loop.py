@@ -64,6 +64,7 @@ from tinyCode.prompts.builder import PromptBuilder
 from tinyCode.prompts.injector import PromptInjector
 from tinyCode.security.guard import SecurityGuard
 from tinyCode.security.models import HITLDecision, SecurityLevel
+from tinyCode.storage.recovery import TaskRecoveryStore
 from tinyCode.tools.base import ToolResult
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
@@ -119,6 +120,7 @@ class AgentLoop:
         max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
         compressor: ContextCompressor | None = None,
         trace_recorder: TraceRecorder | None = None,
+        recovery_store: TaskRecoveryStore | None = None,
     ) -> None:
         self._provider = provider
         self._tool_registry = tool_registry
@@ -152,6 +154,8 @@ class AgentLoop:
         self._max_response_chars = max(1, max_response_chars)
         self._compressor = compressor
         self._trace_recorder = trace_recorder
+        self._recovery_store = recovery_store
+        self._recovery_task_id: str | None = None
         self._context_assembler = PromptContextAssembler(
             protocol=provider.config.protocol,
             prompt_builder=prompt_builder,
@@ -184,6 +188,10 @@ class AgentLoop:
     @property
     def provider(self) -> BaseProvider:
         return self._provider
+
+    def set_recovery_task(self, task_id: str | None) -> None:
+        """Bind tool WAL writes to the active foreground task."""
+        self._recovery_task_id = task_id
 
     @property
     def plan_only(self) -> bool:
@@ -688,7 +696,6 @@ class AgentLoop:
                             name=raw.name,
                             attributes=attributes,
                         )
-                    yield ToolCallEvent(tool_call=raw)
                 else:
                     message = (
                         "Provider 输出事件必须是字符串或 ToolCall，"
@@ -783,6 +790,11 @@ class AgentLoop:
             text_prefix = "".join(text_parts)
             tc_msg = self._provider.make_tool_calls_message(tool_calls, text_prefix=text_prefix)
             history.add_raw_message(tc_msg)
+            # Publish calls only after the complete assistant tool-call batch
+            # exists in history. The TUI checkpoints on these events before
+            # execution, so a hard crash can never leave an invisible write.
+            for tool_call in tool_calls:
+                yield ToolCallEvent(tool_call=tool_call)
 
             # --- 6. 工具分批执行（含安全检查） ---
             reads, writes = self._partition_tools(tool_calls)
@@ -1618,6 +1630,31 @@ class AgentLoop:
             else nullcontext(None)
         )
         with trace_scope as trace_span:
+            tool = self._tool_registry.get(tc.name)
+            may_modify = tool is None or tool.category.value != "read"
+            if self._recovery_store is not None and self._recovery_task_id:
+                try:
+                    self._recovery_store.record_tool_intent(
+                        self._recovery_task_id,
+                        call_id=tc.id,
+                        tool_name=tc.name,
+                        arguments=tc.input,
+                        round_number=self._active_round,
+                        may_modify=may_modify,
+                    )
+                except Exception as exc:
+                    # A write without a durable intent cannot be reconciled
+                    # safely after a power loss, so fail closed for write tools.
+                    if may_modify:
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error=(
+                                "工具恢复日志写入失败，已阻止可能产生副作用的执行: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        )
+
             intercept_reason: str | None = None
             if self._hook_engine:
                 intercept_reason = await self._hook_engine.fire(
@@ -1628,7 +1665,6 @@ class AgentLoop:
             if intercept_reason:
                 result = ToolResult(success=False, content="", error=intercept_reason)
             else:
-                tool = self._tool_registry.get(tc.name)
                 if tool is None:
                     result = ToolResult(
                         success=False, content="", error=f"未知工具: {tc.name}",
@@ -1641,6 +1677,16 @@ class AgentLoop:
                     "tool_name": tc.name, "params": tc.input,
                     "success": result.success,
                 })
+
+            if self._recovery_store is not None and self._recovery_task_id:
+                self._recovery_store.record_tool_result(
+                    self._recovery_task_id,
+                    call_id=tc.id,
+                    tool_name=tc.name,
+                    success=result.success,
+                    error=result.error,
+                    content=result.content,
+                )
 
             if trace_span is not None:
                 trace_span.finish("ok" if result.success else "error", {
