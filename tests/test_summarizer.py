@@ -6,6 +6,7 @@ from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.summarizer import (
     MAX_SUMMARY_OUTPUT_CHARS,
     StructuredSummarizer,
+    _BOUNDARY_MSG,
     _format_for_summary,
 )
 from tinyCode.providers.base import BaseProvider, ToolCall
@@ -137,6 +138,32 @@ class StructuredSummarizerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.model_request_made)
         self.assertTrue(result.was_compressed)
+
+    async def test_manual_force_bypasses_automatic_threshold(self):
+        provider = FakeProvider(
+            ProviderConfig(
+                name="fake", protocol="openai", model="gpt-test",
+                api_key="test-key", context_window=128_000,
+            ),
+            response="## 主要请求\n手动压缩完成",
+        )
+        compressor = ContextCompressor(model="gpt-test", provider=provider)
+        history = ConversationHistory()
+        for index in range(8):
+            history.add_raw_message({
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"short-{index}",
+            })
+
+        automatic = await compressor.check_and_compress(history, provider)
+        forced = await compressor.check_and_compress(
+            history, provider, force=True,
+        )
+
+        self.assertFalse(automatic.model_request_made)
+        self.assertTrue(forced.model_request_made)
+        self.assertTrue(forced.was_compressed)
+        self.assertEqual(1, len(provider.prompts))
 
     async def test_open_circuit_blocks_request_once_context_reaches_hard_window(self):
         provider = FailingSummaryProvider(
@@ -280,6 +307,94 @@ class StructuredSummarizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("## 文件与代码", result.summary_text)
         self.assertIn("```python", result.summary_text)
         self.assertIn('print("hi")', result.summary_text)
+
+    async def test_second_compression_explicitly_merges_summary_with_increment(self):
+        provider = FakeProvider(
+            ProviderConfig(
+                name="fake", protocol="openai", model="gpt-test",
+                api_key="test-key",
+            ),
+            response="## 主要请求\n合并后的新摘要",
+        )
+        summarizer = StructuredSummarizer(provider, model="gpt-3.5-turbo")
+        messages = [
+            {
+                "role": "system",
+                "content": "[结构化摘要]\n## 主要请求\n旧摘要中的重要约束",
+            },
+            {"role": "system", "content": _BOUNDARY_MSG},
+            {"role": "user", "content": "边界后的新增要求"},
+            {"role": "assistant", "content": "已经修改 alpha.py"},
+            {"role": "user", "content": "recent 1"},
+            {"role": "assistant", "content": "recent 2"},
+            {"role": "user", "content": "recent 3"},
+            {"role": "assistant", "content": "recent 4"},
+        ]
+
+        new_messages, result = await summarizer.summarize(messages)
+
+        self.assertGreater(result.messages_compressed, 0)
+        prompt = provider.prompts[0]
+        self.assertIn("已有结构化摘要（事实基线）", prompt)
+        self.assertIn("旧摘要中的重要约束", prompt)
+        self.assertIn("本次新增历史（压缩边界之后）", prompt)
+        self.assertIn("边界后的新增要求", prompt)
+        self.assertIn("已经修改 alpha.py", prompt)
+        self.assertNotIn(_BOUNDARY_MSG, prompt)
+        self.assertEqual(1, sum(
+            str(message.get("content", "")).startswith("[结构化摘要]")
+            for message in new_messages
+        ))
+        self.assertEqual(_BOUNDARY_MSG, new_messages[1]["content"])
+        self.assertEqual(messages[-4:], new_messages[-4:])
+
+    async def test_repeated_compression_keeps_only_one_rolling_summary(self):
+        provider = FakeProvider(
+            ProviderConfig(
+                name="fake", protocol="openai", model="gpt-test",
+                api_key="test-key",
+            ),
+            response="## 主要请求\n第二代摘要",
+        )
+        summarizer = StructuredSummarizer(provider, model="gpt-3.5-turbo")
+        first_generation = [
+            {"role": "system", "content": "[结构化摘要]\n第一代摘要"},
+            {"role": "system", "content": _BOUNDARY_MSG},
+            {"role": "user", "content": "new 1"},
+            {"role": "assistant", "content": "new 2"},
+            {"role": "user", "content": "recent 1"},
+            {"role": "assistant", "content": "recent 2"},
+            {"role": "user", "content": "recent 3"},
+            {"role": "assistant", "content": "recent 4"},
+        ]
+
+        second_generation, _ = await summarizer.summarize(first_generation)
+
+        contents = [str(message.get("content", "")) for message in second_generation]
+        self.assertEqual(1, sum(text.startswith("[结构化摘要]") for text in contents))
+        self.assertNotIn("[结构化摘要]\n第一代摘要", contents)
+        self.assertEqual("[结构化摘要]\n## 主要请求\n第二代摘要", contents[0])
+
+    async def test_compression_never_splits_existing_summary_from_boundary(self):
+        provider = FakeProvider(
+            ProviderConfig(
+                name="fake", protocol="openai", model="gpt-test",
+                api_key="test-key",
+            )
+        )
+        summarizer = StructuredSummarizer(provider, model="gpt-3.5-turbo")
+        messages = [
+            {"role": "system", "content": "[结构化摘要]\n旧摘要"},
+            {"role": "system", "content": _BOUNDARY_MSG},
+            {"role": "assistant", "content": "尚无新的用户边界"},
+        ]
+
+        new_messages, result = await summarizer.summarize(messages)
+
+        self.assertEqual(messages, new_messages)
+        self.assertEqual(0, result.messages_compressed)
+        self.assertIn("压缩边界", result.error)
+        self.assertEqual([], provider.prompts)
 
     async def test_summarize_does_not_split_openai_tool_exchange(self):
         provider = FakeProvider(

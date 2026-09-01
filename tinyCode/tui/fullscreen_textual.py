@@ -19,7 +19,8 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Collapsible, Input, Markdown, Static
+from textual.message import Message
+from textual.widgets import Collapsible, Markdown, Static, TextArea
 
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tui.metrics import TurnMetrics
@@ -199,6 +200,49 @@ class _ChatScroll(VerticalScroll):
                 app._hide_new_output()
 
 
+class _Composer(TextArea):
+    """Multiline task composer with explicit submit/newline semantics."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("enter", "submit", "发送", show=False, priority=True),
+        Binding("shift+enter", "newline", "换行", show=False, priority=True),
+        Binding("alt+enter", "newline", "换行", show=False, priority=True),
+        Binding("ctrl+j", "newline", "换行", show=False, priority=True),
+        Binding("up", "composer_up", show=False, priority=True),
+        Binding("down", "composer_down", show=False, priority=True),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, composer: "_Composer", value: str) -> None:
+            super().__init__()
+            self.composer = composer
+            self.value = value
+
+        @property
+        def control(self) -> "_Composer":
+            return self.composer
+
+    def action_submit(self) -> None:
+        self.post_message(self.Submitted(self, self.text))
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def action_composer_up(self) -> None:
+        app = self.app
+        if isinstance(app, _TinyCodeFullscreenApp) and app.command_candidates:
+            app.action_previous_command()
+        else:
+            self.action_cursor_up()
+
+    def action_composer_down(self) -> None:
+        app = self.app
+        if isinstance(app, _TinyCodeFullscreenApp) and app.command_candidates:
+            app.action_next_command()
+        else:
+            self.action_cursor_down()
+
+
 class _TinyCodeFullscreenApp(App[None]):
     """Textual shell; all task decisions stay in the owner TUI."""
 
@@ -209,8 +253,6 @@ class _TinyCodeFullscreenApp(App[None]):
         Binding("pageup", "history_up", "历史上翻", priority=True),
         Binding("pagedown", "history_down", "回到最新", priority=True),
         Binding("tab", "complete_command", show=False, priority=True),
-        Binding("up", "previous_command", show=False, priority=True),
-        Binding("down", "next_command", show=False, priority=True),
         Binding("escape", "dismiss_commands", show=False, priority=True),
     ]
 
@@ -279,6 +321,14 @@ class _TinyCodeFullscreenApp(App[None]):
     #composer-shell {
         height: auto; min-height: 3; padding: 0 1 1 1; background: $background;
     }
+    #composer-frame {
+        width: 100%; height: auto; min-height: 4; max-height: 10;
+        border: round $panel-lighten-2; background: $background;
+    }
+    #composer-hint {
+        width: 100%; height: 1; padding: 0 1;
+        color: $text-disabled; background: transparent;
+    }
     #command-menu {
         display: none; width: 100%; height: auto; max-height: 10;
         margin: 0 0 1 0; padding: 0 1;
@@ -290,7 +340,10 @@ class _TinyCodeFullscreenApp(App[None]):
         color: $primary; text-align: center; text-style: bold;
         background: $surface;
     }
-    #composer { width: 100%; border: round $panel-lighten-2; }
+    #composer {
+        width: 100%; height: 1; min-height: 1; max-height: 7;
+        padding: 0 1; border: none; background: transparent;
+    }
     #helpbar { height: 1; padding: 0 2; color: $text-disabled; }
     """
 
@@ -312,28 +365,38 @@ class _TinyCodeFullscreenApp(App[None]):
                 id="new-output",
                 markup=False,
             )
-            yield Input(placeholder=self.owner._input_placeholder(), id="composer")
+            with Vertical(id="composer-frame"):
+                yield Static(
+                    self.owner._input_placeholder(), id="composer-hint", markup=False,
+                )
+                yield _Composer(
+                    id="composer", soft_wrap=True, show_line_numbers=False,
+                )
         yield Static(
-            "PgUp/PgDn 历史 · Ctrl-E 过程 · Ctrl-C 取消/退出",
+            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · PgUp/PgDn 历史 · Ctrl-E 过程 · Ctrl-C 取消/退出",
             id="helpbar",
             markup=False,
         )
 
     def on_mount(self) -> None:
         self.owner._textual_ready(self)
-        self.query_one("#composer", Input).focus()
+        self.query_one("#composer", _Composer).focus()
 
-    @on(Input.Submitted, "#composer")
-    def _on_submit(self, event: Input.Submitted) -> None:
+    @on(_Composer.Submitted, "#composer")
+    def _on_submit(self, event: _Composer.Submitted) -> None:
         text = event.value.strip()
-        event.input.value = ""
+        event.composer.clear()
         self._hide_command_menu()
+        self._resize_composer(event.composer)
         if text:
             self.run_worker(self.owner._submit_input(text), exclusive=False)
 
-    @on(Input.Changed, "#composer")
-    def _on_input_changed(self, event: Input.Changed) -> None:
-        self._update_command_menu(event.value)
+    @on(TextArea.Changed, "#composer")
+    def _on_input_changed(self, event: TextArea.Changed) -> None:
+        composer = event.text_area
+        self._update_command_menu(composer.text)
+        if isinstance(composer, _Composer):
+            self._resize_composer(composer)
 
     @on(events.Click, "#new-output")
     def _on_new_output_clicked(self) -> None:
@@ -363,9 +426,10 @@ class _TinyCodeFullscreenApp(App[None]):
             return
         command = self.command_candidates[self.command_index]
         meta = self.owner._cmd_registry.lookup(command.removeprefix("/"))
-        composer = self.query_one("#composer", Input)
-        composer.value = command + (" " if meta is not None and meta.params else "")
-        composer.cursor_position = len(composer.value)
+        composer = self.query_one("#composer", _Composer)
+        value = command + (" " if meta is not None and meta.params else "")
+        composer.load_text(value)
+        composer.move_cursor((0, len(value)))
         self._hide_command_menu()
 
     def action_previous_command(self) -> None:
@@ -395,7 +459,14 @@ class _TinyCodeFullscreenApp(App[None]):
         self.query_one("#topbar", Static).update(self.owner._header_text())
 
     def refresh_composer(self) -> None:
-        self.query_one("#composer", Input).placeholder = self.owner._input_placeholder()
+        self.query_one("#composer-hint", Static).update(
+            self.owner._input_placeholder()
+        )
+
+    @staticmethod
+    def _resize_composer(composer: _Composer) -> None:
+        visual_lines = max(1, composer.text.count("\n") + 1)
+        composer.styles.height = min(7, visual_lines)
 
     def _update_command_menu(self, value: str) -> None:
         if not value.startswith("/") or any(char.isspace() for char in value):

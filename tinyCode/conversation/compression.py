@@ -63,12 +63,14 @@ class ContextCompressor:
 
     async def check_and_compress(
         self, history: ConversationHistory, provider: BaseProvider,
-        *, extra_tokens: int = 0,
+        *, extra_tokens: int = 0, force: bool = False,
     ) -> CompressionResult:
         """Layer 2: generate structured summary if near context limit.
 
         Returns a ``CompressionResult``.  The history is mutated in-place
-        if compression occurred.
+        if compression occurred. ``force`` bypasses only the automatic token
+        threshold; protocol-safe boundaries and all output safety checks still
+        apply.
         """
         result = CompressionResult()
 
@@ -95,8 +97,9 @@ class ContextCompressor:
                 )
             return result
 
-        # Only compress if actually needed
-        if estimated < self._summarizer.trigger_threshold:
+        # Automatic compression is threshold-driven. An explicit /compress is
+        # user intent and therefore bypasses only this policy gate.
+        if not force and estimated < self._summarizer.trigger_threshold:
             return result
 
         result.model_request_made = True

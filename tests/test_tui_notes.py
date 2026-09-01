@@ -10,7 +10,7 @@ from unittest.mock import patch
 from prompt_toolkit.document import Document
 from rich.console import Console
 from textual.containers import VerticalScroll
-from textual.widgets import Input
+from textual.widgets import TextArea
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
@@ -35,6 +35,7 @@ from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
 from tinyCode.tui.factory import create_tui
 from tinyCode.tui.fullscreen_textual import (
     FullscreenTinyCodeTUI,
+    _Composer,
     _TinyCodeFullscreenApp,
     _TurnView,
 )
@@ -95,8 +96,28 @@ class FakeCompressor:
     warning_threshold = 100
     context_window = 200
 
-    async def check_and_compress(self, history, provider) -> CompressionResult:
-        return CompressionResult()
+    def __init__(self) -> None:
+        self.force_values: list[bool] = []
+
+    def reset_circuit(self) -> None:
+        pass
+
+    def reset_warning(self) -> None:
+        pass
+
+    @property
+    def circuit_open(self) -> bool:
+        return False
+
+    async def check_and_compress(
+        self, history, provider, *, force: bool = False,
+    ) -> CompressionResult:
+        self.force_values.append(force)
+        return CompressionResult(
+            was_compressed=force,
+            estimated_tokens_before=20,
+            estimated_tokens_after=10,
+        )
 
 
 class FakeSessionStore:
@@ -419,6 +440,14 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             prompt_session=FakePromptSession(answers),
         )
         return tui, output
+
+    async def test_manual_compress_command_bypasses_threshold(self):
+        tui, _ = self._make_tui()
+
+        result = await tui.trigger_compress()
+
+        self.assertEqual([True], tui._compressor.force_values)
+        self.assertIn("上下文已压缩", result)
 
     async def test_prompt_command_prints_snapshot_without_starting_turn(self):
         tui, output = self._make_tui(answers=["/prompt base", "/exit"])
@@ -969,13 +998,40 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         )
         app = _TinyCodeFullscreenApp(tui)
         async with app.run_test(size=(100, 36)) as pilot:
-            app.query_one("#composer", Input).focus()
+            app.query_one("#composer", TextArea).focus()
             await pilot.press(*"测试输入", "enter")
             await tui._wait_for_foreground()
             await pilot.pause()
 
         self.assertEqual(["测试输入"], tui._history.user_messages)
         self.assertIn("已收到", tui._assistant_draft)
+
+    async def test_fullscreen_shift_enter_inserts_newline_before_submit(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop("已收到多行输入"),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            composer = app.query_one("#composer", _Composer)
+            composer.focus()
+            await pilot.press(*"第一行", "shift+enter", *"第二行")
+            await pilot.pause()
+
+            self.assertEqual("第一行\n第二行", composer.text)
+            self.assertEqual([], tui._history.user_messages)
+
+            await pilot.press("enter")
+            await tui._wait_for_foreground()
+            await pilot.pause()
+
+        self.assertEqual(["第一行\n第二行"], tui._history.user_messages)
+        self.assertIn("已收到多行输入", tui._assistant_draft)
 
     async def test_fullscreen_application_shows_streamed_final_answer(self):
         tui = FullscreenTinyCodeTUI(
@@ -1052,7 +1108,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         app = _TinyCodeFullscreenApp(tui)
 
         async with app.run_test(size=(100, 36)) as pilot:
-            composer = app.query_one("#composer", Input)
+            composer = app.query_one("#composer", TextArea)
             composer.focus()
             await pilot.press("/", "p", "r", "o")
             await pilot.pause()
@@ -1062,7 +1118,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("tab")
             await pilot.pause()
 
-            self.assertEqual("/prompt ", composer.value)
+            self.assertEqual("/prompt ", composer.text)
             self.assertFalse(app.query_one("#command-menu").display)
 
     async def test_fullscreen_only_suggests_cancel_while_task_is_active(self):
@@ -1079,7 +1135,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         app = _TinyCodeFullscreenApp(tui)
 
         async with app.run_test(size=(100, 36)) as pilot:
-            app.query_one("#composer", Input).focus()
+            app.query_one("#composer", TextArea).focus()
             await pilot.press("/")
             await pilot.pause()
 

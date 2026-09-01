@@ -563,9 +563,13 @@ class TinyCodeTUI(UIControl):
         self._compressor.reset_circuit()
         self._compressor.reset_warning()
         result = await self._compressor.check_and_compress(
-            self._history, self._agent_loop.provider,
+            self._history, self._agent_loop.provider, force=True,
         )
         if result.was_compressed:
+            # /compress mutates the canonical conversation outside a normal
+            # agent turn, so persist it immediately instead of waiting for a
+            # later user message or graceful shutdown.
+            self._do_save()
             released = max(
                 0,
                 result.estimated_tokens_before - result.estimated_tokens_after,
@@ -580,7 +584,7 @@ class TinyCodeTUI(UIControl):
             return f"上下文压缩失败：{result.error}"
         if self._compressor.circuit_open:
             return "压缩熔断——已停止自动压缩"
-        return "当前无需压缩"
+        return "当前没有可安全压缩的较早对话"
 
     def get_session_list(self) -> list[dict]:
         return self._session_store.list_sessions()
