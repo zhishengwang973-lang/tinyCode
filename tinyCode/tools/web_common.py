@@ -19,6 +19,7 @@ MAX_WEB_BYTES = 512_000
 MAX_WEB_TEXT_CHARS = 32_000
 MAX_REDIRECTS = 5
 WEB_TIMEOUT_SECONDS = 20.0
+DNS_TIMEOUT_SECONDS = 5.0
 _ALLOWED_PORTS = {None, 80, 443}
 _BLOCKED_HOST_SUFFIXES = (
     ".localhost", ".local", ".internal", ".home.arpa",
@@ -77,12 +78,19 @@ async def validate_public_url(url: object) -> str:
 
     lookup_port = port or (443 if parsed.scheme == "https" else 80)
     try:
-        addresses = await asyncio.to_thread(
-            socket.getaddrinfo,
-            hostname,
-            lookup_port,
-            type=socket.SOCK_STREAM,
+        addresses = await asyncio.wait_for(
+            asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                lookup_port,
+                type=socket.SOCK_STREAM,
+            ),
+            timeout=DNS_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(
+            f"DNS 解析超时（{DNS_TIMEOUT_SECONDS:g} 秒）: {hostname}"
+        ) from exc
     except OSError as exc:
         raise ValueError(f"无法解析网页主机: {hostname}: {exc}") from exc
     if not addresses:

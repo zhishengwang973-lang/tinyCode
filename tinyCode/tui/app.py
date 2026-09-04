@@ -1050,8 +1050,16 @@ class TinyCodeTUI(UIControl):
                                 self._active_recovery_task_id
                             ),
                         )
-                    state = "已返回" if event.result.success else "失败，交给模型处理"
-                    self._start_progress(f"工具 {event.tool_name} {state}")
+                    if event.result.success:
+                        self._start_progress(f"工具 {event.tool_name} 已返回")
+                    else:
+                        error = " ".join(event.result.error.split()) or "未提供错误详情"
+                        error = re.sub(
+                            r"[\x00-\x08\x0b-\x1f\x7f]", "", error,
+                        )[:500]
+                        self._start_progress(
+                            f"工具 {event.tool_name} 失败：{error}"
+                        )
 
                 elif isinstance(event, ToolBlockedEvent):
                     self._save_checkpoint()

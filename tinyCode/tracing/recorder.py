@@ -61,11 +61,14 @@ class TraceSpan:
         name: str,
         kind: str,
         attributes: dict[str, Any] | None,
+        *,
+        activate: bool = True,
     ) -> None:
         self._recorder = recorder
         self._name = name
         self._kind = kind
         self._attributes = attributes or {}
+        self._activate = activate
         self._span_id = uuid.uuid4().hex[:16]
         self._parent_span_id = _ACTIVE_SPAN.get()
         self._started_monotonic_ns = 0
@@ -86,7 +89,8 @@ class TraceSpan:
             parent_span_id=self._parent_span_id,
             attributes=self._attributes,
         )
-        self._token = _ACTIVE_SPAN.set(self._span_id)
+        if self._activate:
+            self._token = _ACTIVE_SPAN.set(self._span_id)
         return self
 
     def event(self, name: str, attributes: dict[str, Any] | None = None) -> None:
@@ -135,7 +139,17 @@ class TraceSpan:
                 }
             self.finish(status, attributes)
         if self._token is not None:
-            _ACTIVE_SPAN.reset(self._token)
+            try:
+                _ACTIVE_SPAN.reset(self._token)
+            except ValueError as reset_error:
+                # Tracing must never crash task cancellation. Long-lived
+                # async-generator spans should use ``activate=False``; this
+                # guard also protects unexpected third-party context switches.
+                self._recorder.last_error = (
+                    f"Trace span context reset failed: {reset_error}"
+                )
+            finally:
+                self._token = None
         return False
 
 
@@ -252,8 +266,12 @@ class TraceRecorder:
         name: str,
         kind: str,
         attributes: dict[str, Any] | None = None,
+        *,
+        activate: bool = True,
     ) -> TraceSpan:
-        return TraceSpan(self, name, kind, attributes)
+        return TraceSpan(
+            self, name, kind, attributes, activate=activate,
+        )
 
     def record(
         self,

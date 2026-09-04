@@ -1307,6 +1307,10 @@ class AgentLoop:
                         **token_budget,
                         **cache_shape,
                     },
+                    # This scope intentionally survives async-generator
+                    # yields. Cancellation may finalize the generator from a
+                    # different Context, so it must not own a ContextVar token.
+                    activate=False,
                 )
                 if self._trace_recorder is not None
                 else nullcontext(None)

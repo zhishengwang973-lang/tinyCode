@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar
@@ -20,7 +21,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Markdown, Static, TextArea
+from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tui.metrics import TurnMetrics
@@ -247,8 +248,12 @@ class _TinyCodeFullscreenApp(App[None]):
     """Textual shell; all task decisions stay in the owner TUI."""
 
     TITLE = "TinyCode"
+    # Textual 8+ supports arbitrary selection across Static, Markdown, and
+    # container boundaries while preserving normal mouse interaction.
+    ALLOW_SELECT = True
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "cancel_or_exit", "取消/退出", priority=True),
+        Binding("super+c", "copy_selection", "复制", priority=True),
         Binding("ctrl+e", "toggle_process", "执行过程", priority=True),
         Binding("pageup", "history_up", "历史上翻", priority=True),
         Binding("pagedown", "history_down", "回到最新", priority=True),
@@ -329,6 +334,9 @@ class _TinyCodeFullscreenApp(App[None]):
         width: 100%; height: 1; padding: 0 1;
         color: $text-disabled; background: transparent;
     }
+    #composer-row {
+        width: 100%; height: auto; align-vertical: bottom;
+    }
     #command-menu {
         display: none; width: 100%; height: auto; max-height: 10;
         margin: 0 0 1 0; padding: 0 1;
@@ -341,8 +349,20 @@ class _TinyCodeFullscreenApp(App[None]):
         background: $surface;
     }
     #composer {
-        width: 100%; height: 1; min-height: 1; max-height: 7;
+        width: 1fr; height: 1; min-height: 1; max-height: 7;
         padding: 0 1; border: none; background: transparent;
+    }
+    #stop-button {
+        display: none; width: 5; min-width: 5; height: 3;
+        margin: 0 1 0 0; padding: 0;
+        color: #000000; background: #ffffff; border: round #ffffff;
+        text-style: bold;
+    }
+    #stop-button:hover, #stop-button:focus {
+        color: #000000; background: #e8e8e8; border: round #e8e8e8;
+    }
+    #stop-button:disabled {
+        color: #666666; background: #c8c8c8; border: round #c8c8c8;
     }
     #helpbar { height: 1; padding: 0 2; color: $text-disabled; }
     """
@@ -369,17 +389,24 @@ class _TinyCodeFullscreenApp(App[None]):
                 yield Static(
                     self.owner._input_placeholder(), id="composer-hint", markup=False,
                 )
-                yield _Composer(
-                    id="composer", soft_wrap=True, show_line_numbers=False,
-                )
+                with Horizontal(id="composer-row"):
+                    yield _Composer(
+                        id="composer", soft_wrap=True, show_line_numbers=False,
+                    )
+                    yield Button(
+                        "■",
+                        id="stop-button",
+                        tooltip="中断当前任务",
+                    )
         yield Static(
-            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · PgUp/PgDn 历史 · Ctrl-E 过程 · Ctrl-C 取消/退出",
+            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · 拖拽选择/⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程 · Ctrl-C 取消/退出",
             id="helpbar",
             markup=False,
         )
 
     def on_mount(self) -> None:
         self.owner._textual_ready(self)
+        self.refresh_composer()
         self.query_one("#composer", _Composer).focus()
 
     @on(_Composer.Submitted, "#composer")
@@ -398,9 +425,56 @@ class _TinyCodeFullscreenApp(App[None]):
         if isinstance(composer, _Composer):
             self._resize_composer(composer)
 
+    @on(TextArea.SelectionChanged, "#composer")
+    def _on_composer_selection_changed(
+        self, event: TextArea.SelectionChanged,
+    ) -> None:
+        # macOS Terminal may consume Command-C before Textual sees it.
+        selected_text = event.text_area.selected_text
+        if selected_text:
+            self.copy_to_clipboard(selected_text)
+
     @on(events.Click, "#new-output")
     def _on_new_output_clicked(self) -> None:
         self.action_history_down()
+
+    @on(Button.Pressed, "#stop-button")
+    def _on_stop_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if self.owner.cancel_active_turn():
+            self.refresh_composer()
+        self.query_one("#composer", _Composer).focus()
+
+    @on(events.TextSelected)
+    def _on_text_selected(self) -> None:
+        """Prime the native clipboard when macOS Terminal swallows Command-C."""
+        selected_text = self.screen.get_selected_text()
+        if selected_text:
+            self.copy_to_clipboard(selected_text)
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy through Textual and use the native macOS clipboard as fallback."""
+        super().copy_to_clipboard(text)
+        if sys.platform != "darwin":
+            return
+        try:
+            subprocess.run(
+                ["/usr/bin/pbcopy"],
+                input=text,
+                text=True,
+                check=True,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # OSC52 above may still work in terminals that support it.
+            pass
+
+    def action_copy_selection(self) -> None:
+        selected_text = self.screen.get_selected_text()
+        if not selected_text and isinstance(self.focused, TextArea):
+            selected_text = self.focused.selected_text
+        if selected_text:
+            self.copy_to_clipboard(selected_text)
 
     def action_cancel_or_exit(self) -> None:
         if self.owner._runtime.active:
@@ -462,6 +536,12 @@ class _TinyCodeFullscreenApp(App[None]):
         self.query_one("#composer-hint", Static).update(
             self.owner._input_placeholder()
         )
+        stop_button = self.query_one("#stop-button", Button)
+        task_active = self.owner._runtime.active
+        cancelling = self.owner._status_text == "正在取消当前任务"
+        stop_button.display = task_active
+        stop_button.disabled = not task_active or cancelling
+        stop_button.label = "…" if cancelling else "■"
 
     @staticmethod
     def _resize_composer(composer: _Composer) -> None:

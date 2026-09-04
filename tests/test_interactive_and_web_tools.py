@@ -84,6 +84,18 @@ class RequestUserInputToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_url_guard_has_bounded_dns_lookup(self):
+        async def timeout_wait_for(awaitable, timeout):
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with patch(
+            "tinyCode.tools.web_common.asyncio.wait_for",
+            side_effect=timeout_wait_for,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "DNS 解析超时"):
+                await validate_public_url("https://example.com/docs")
+
     async def test_public_url_guard_rejects_local_targets_and_credentials(self):
         for url in (
             "http://127.0.0.1/",
@@ -185,6 +197,58 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("First", result.content)
         self.assertIn("https://docs.example.com/a", result.content)
         self.assertNotIn("Second", result.content)
+
+    async def test_web_search_retries_then_uses_brave_fallback(self):
+        brave_html = b"""
+        <div class="snippet" data-type="web">
+          <a href="https://www.bosch.com.cn/careers/">
+            <div class="title search-snippet-title">Join Bosch</div>
+          </a>
+          <div class="snippet-description">Official careers site</div>
+        </div>
+        """
+        brave_response = WebResponse(
+            url="https://search.brave.com/search?q=bosch",
+            status_code=200,
+            content_type="text/html",
+            body=brave_html,
+            truncated=False,
+        )
+        fetch = AsyncMock(side_effect=[
+            asyncio.TimeoutError(),
+            RuntimeError("temporary connection failure"),
+            brave_response,
+        ])
+        with patch(
+            "tinyCode.tools.web_search.fetch_public_url", fetch,
+        ), patch(
+            "tinyCode.tools.web_search.asyncio.sleep", AsyncMock(),
+        ):
+            result = await WebSearchTool().execute("Bosch careers", max_results=3)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(3, fetch.await_count)
+        self.assertIn("Brave Search 备用源", result.content)
+        self.assertIn("https://www.bosch.com.cn/careers/", result.content)
+        self.assertIn("Official careers site", result.content)
+
+    async def test_web_search_reports_every_failed_source(self):
+        fetch = AsyncMock(side_effect=[
+            RuntimeError("primary unavailable"),
+            RuntimeError("retry unavailable"),
+            RuntimeError("fallback unavailable"),
+        ])
+        with patch(
+            "tinyCode.tools.web_search.fetch_public_url", fetch,
+        ), patch(
+            "tinyCode.tools.web_search.asyncio.sleep", AsyncMock(),
+        ):
+            result = await WebSearchTool().execute("test")
+
+        self.assertFalse(result.success)
+        self.assertIn("DuckDuckGo: RuntimeError: primary unavailable", result.error)
+        self.assertIn("DuckDuckGo 重试", result.error)
+        self.assertIn("Brave Search 备用源", result.error)
 
     def test_duckduckgo_redirect_is_unwrapped(self):
         self.assertEqual(

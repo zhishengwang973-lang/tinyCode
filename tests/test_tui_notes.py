@@ -9,8 +9,10 @@ from unittest.mock import patch
 
 from prompt_toolkit.document import Document
 from rich.console import Console
+from textual import events
 from textual.containers import VerticalScroll
-from textual.widgets import TextArea
+from textual.selection import SELECT_ALL
+from textual.widgets import Button, TextArea
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
@@ -312,6 +314,21 @@ class PausingAgentLoop(FakeAgentLoop):
         self.chunk_sent.set()
         await self.release.wait()
         yield AgentDoneEvent("no_tool_call")
+
+
+class CancellableAgentLoop(FakeAgentLoop):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.cancel_called = False
+
+    async def run(self, history):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield AgentDoneEvent("no_tool_call")
+
+    def cancel(self) -> None:
+        self.cancel_called = True
 
 
 class LineStreamingAgentLoop(FakeAgentLoop):
@@ -866,10 +883,49 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             views = list(app.query(_TurnView))
             self.assertEqual(1, len(views))
             view = views[0]
-            self.assertEqual("修复问题", view.user.renderable)
+            self.assertEqual("修复问题", view.user.content)
             self.assertTrue(view.process.collapsed)
             self.assertIn("# 修复完成", view.turn.answer)
             self.assertIn("已编辑 2 个文件", view.turn.workspace_summary)
+
+    async def test_fullscreen_mouse_selection_copies_without_mode_switch(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("可直接复制")
+            await pilot.pause()
+            view = app.query_one(_TurnView)
+            app.screen.selections = {view.user: SELECT_ALL}
+            await pilot.pause()
+
+            with patch.object(app, "copy_to_clipboard") as copy:
+                app.post_message(events.TextSelected())
+                await pilot.pause()
+                copy.assert_called_once_with("可直接复制")
+
+                copy.reset_mock()
+                await pilot.press("super+c")
+                copy.assert_called_once_with("可直接复制")
+
+            app.screen.clear_selection()
+            composer = app.query_one("#composer", _Composer)
+            with patch.object(app, "copy_to_clipboard") as copy:
+                composer.text = "输入框文本"
+                composer.select_all()
+                await pilot.pause()
+                copy.assert_called_with("输入框文本")
+
+                copy.reset_mock()
+                await pilot.press("super+c")
+                copy.assert_called_once_with("输入框文本")
 
     async def test_fullscreen_keeps_each_completed_turn_in_chat_history(self):
         tui = FullscreenTinyCodeTUI(
@@ -1033,6 +1089,37 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["第一行\n第二行"], tui._history.user_messages)
         self.assertIn("已收到多行输入", tui._assistant_draft)
 
+    async def test_fullscreen_stop_button_tracks_and_cancels_active_task(self):
+        loop = CancellableAgentLoop()
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            stop_button = app.query_one("#stop-button", Button)
+            self.assertFalse(stop_button.display)
+
+            await pilot.press(*"执行长任务", "enter")
+            await loop.started.wait()
+            await pilot.pause()
+            self.assertTrue(stop_button.display)
+            self.assertFalse(stop_button.disabled)
+
+            await pilot.click("#stop-button")
+            await tui._wait_for_foreground()
+            await pilot.pause()
+
+            self.assertTrue(loop.cancel_called)
+            self.assertFalse(stop_button.display)
+            self.assertEqual("cancelled", tui._runtime.snapshot().last_outcome.value)
+
     async def test_fullscreen_application_shows_streamed_final_answer(self):
         tui = FullscreenTinyCodeTUI(
             agent_loop=FakeAgentLoop("全屏 `回答`"),
@@ -1090,6 +1177,10 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         await tui._on_user_input("统计任务")
 
         lines = tui._metric_summary.splitlines()
+        self.assertTrue(any(
+            "工具 shared_tool 失败：failed" in line
+            for line in tui._process_lines
+        ))
         self.assertTrue(lines[0].startswith("本轮统计 · Turn"))
         self.assertTrue(
             lines[1].startswith(tui._terminal_indent("本轮统计 · ") + "Token")

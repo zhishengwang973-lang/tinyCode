@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextvars import Context
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,28 @@ from tinyCode.tracing.render import render_html, render_text
 
 
 class TraceRecorderTests(unittest.TestCase):
+    def test_detached_span_can_finish_from_another_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = TraceRecorder(TracingConfig(), Path(tmp))
+            handle = recorder.begin_task("work")
+            assert handle is not None
+            span = recorder.span(
+                "request #1", "model_request", activate=False,
+            )
+            span.__enter__()
+
+            Context().run(span.__exit__, None, None, None)
+            recorder.finish_task(handle, status="cancelled")
+
+            rows = [
+                json.loads(line)
+                for line in handle.path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual("span_start", rows[1]["event"])
+            self.assertEqual("span_end", rows[2]["event"])
+            self.assertEqual("ok", rows[2]["status"])
+            self.assertEqual("", recorder.last_error)
+
     def test_records_spans_redacts_secrets_and_renders_both_views(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
