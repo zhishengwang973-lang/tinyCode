@@ -520,6 +520,84 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         errors = [event for event in events if isinstance(event, ErrorEvent)]
         self.assertEqual("unadvertised_tool_call", errors[0].code)
 
+    async def test_inspect_mode_advertises_only_read_tools(self):
+        provider = ToolCaptureProvider()
+        registry = ToolRegistry()
+        registry.register(ReadFixtureTool())
+        registry.register(WriteFixtureTool())
+        loop = AgentLoop(
+            provider=provider,
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=1,
+        )
+        history = ConversationHistory()
+        history.add_user_message("检查当前项目有哪些问题，先不要修改")
+
+        _ = [event async for event in loop.run(history)]
+
+        names = self._openai_tool_names(provider.received_tools[0])
+        self.assertEqual({"read_fixture"}, names)
+        request_text = "\n".join(
+            str(message.get("content", ""))
+            for message in provider.received_messages[0]
+        )
+        self.assertIn("TinyCode Task Mode: inspect", request_text)
+
+    async def test_inspect_mode_blocks_unadvertised_write_at_runtime(self):
+        write_tool = WriteFixtureTool()
+        registry = ToolRegistry()
+        registry.register(ReadFixtureTool())
+        registry.register(write_tool)
+        loop = AgentLoop(
+            provider=WriteToolProvider(),
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=1,
+        )
+        history = ConversationHistory()
+        history.add_user_message("只审查当前项目，不要改动文件")
+
+        events = [event async for event in loop.run(history)]
+
+        blocked = [event for event in events if isinstance(event, ToolBlockedEvent)]
+        self.assertEqual(1, len(blocked))
+        self.assertIn("inspect 只读模式", blocked[0].reason)
+        self.assertFalse(write_tool.executed)
+        tool_messages = [
+            message for message in history.get_messages()
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(1, len(tool_messages))
+        self.assertIn("inspect 只读模式", tool_messages[0]["content"])
+
+    async def test_modify_mode_advertises_and_executes_write_tools(self):
+        write_tool = WriteFixtureTool()
+        registry = ToolRegistry()
+        registry.register(ReadFixtureTool())
+        registry.register(write_tool)
+        loop = AgentLoop(
+            provider=WriteToolProvider(),
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=1,
+        )
+        history = ConversationHistory()
+        history.add_user_message("修改当前项目里的 README.md")
+
+        events = [event async for event in loop.run(history)]
+
+        self.assertTrue(write_tool.executed)
+        self.assertFalse(any(
+            isinstance(event, ToolBlockedEvent) for event in events
+        ))
+
     async def test_direct_answer_omits_project_context_but_keeps_safe_prompt(self):
         class NoteManager:
             def context_text(self, *, query=""):
@@ -1131,7 +1209,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             max_rounds=1,
         )
         history = ConversationHistory()
-        history.add_user_message("try malformed params")
+        history.add_user_message("modify the current project with malformed params")
 
         events = [event async for event in loop.run(history)]
         tool_results = [event for event in events if isinstance(event, ToolResultEvent)]
@@ -1172,7 +1250,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             max_rounds=1,
         )
         history = ConversationHistory()
-        history.add_user_message("provider emits malformed tool id")
+        history.add_user_message("modify the current project with a malformed tool id")
 
         events = [event async for event in loop.run(history)]
         errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -1192,7 +1270,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             max_rounds=1,
         )
         history = ConversationHistory()
-        history.add_user_message("provider emits malformed tool name")
+        history.add_user_message("modify the current project with a malformed tool name")
 
         events = [event async for event in loop.run(history)]
         errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -1369,7 +1447,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             round_limit_action="auto",
         )
         history = ConversationHistory()
-        history.add_user_message("finish without interactive prompts")
+        history.add_user_message(
+            "modify the current project until finished without interactive prompts"
+        )
 
         events = [event async for event in loop.run(history)]
 
@@ -1389,7 +1469,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             round_limit_action="ask",
         )
         history = ConversationHistory()
-        history.add_user_message("keep working until finished")
+        history.add_user_message("keep modifying the current project until finished")
         events = []
 
         async for event in loop.run(history):
@@ -1509,6 +1589,132 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual("no_tool_call", events[-1].reason)
 
+    async def test_user_steering_can_escalate_inspect_to_modify(self):
+        class InspectThenWriteProvider(UnknownToolProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.received_tools = []
+
+            async def chat_stream(self, messages, tools=None, system_blocks=None):
+                self.calls += 1
+                self.received_tools.append(tools)
+                if self.calls == 1:
+                    yield ToolCall(
+                        id="read-before-steering",
+                        name="read_fixture",
+                        input={"path": "README.md"},
+                    )
+                else:
+                    yield ToolCall(
+                        id="write-after-steering",
+                        name="write_fixture",
+                        input={"path": "README.md"},
+                    )
+
+        provider = InspectThenWriteProvider()
+        read_tool = ReadFixtureTool()
+        write_tool = WriteFixtureTool()
+        registry = ToolRegistry()
+        registry.register(read_tool)
+        registry.register(write_tool)
+        loop = AgentLoop(
+            provider=provider,
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=2,
+            hard_max_rounds=2,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("只检查当前项目，不要修改")
+        steered = False
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if (
+                isinstance(event, ToolCallEvent)
+                and event.tool_call.name == "read_fixture"
+                and not steered
+            ):
+                history.queue_steering_message("按这个方案实现")
+                steered = True
+
+        first_names = self._openai_tool_names(provider.received_tools[0])
+        second_names = self._openai_tool_names(provider.received_tools[1])
+        self.assertEqual({"read_fixture"}, first_names)
+        self.assertEqual({"read_fixture", "write_fixture"}, second_names)
+        self.assertTrue(read_tool.executed)
+        self.assertTrue(write_tool.executed)
+        self.assertTrue(any(
+            isinstance(event, SteeringAppliedEvent) for event in events
+        ))
+
+    async def test_user_steering_can_restrict_modify_to_inspect(self):
+        class ReadThenForcedWriteProvider(UnknownToolProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.received_tools = []
+
+            async def chat_stream(self, messages, tools=None, system_blocks=None):
+                self.calls += 1
+                self.received_tools.append(tools)
+                if self.calls == 1:
+                    yield ToolCall(
+                        id="initial-read",
+                        name="read_fixture",
+                        input={"path": "README.md"},
+                    )
+                else:
+                    yield ToolCall(
+                        id="forbidden-write",
+                        name="write_fixture",
+                        input={"path": "README.md"},
+                    )
+
+        provider = ReadThenForcedWriteProvider()
+        read_tool = ReadFixtureTool()
+        write_tool = WriteFixtureTool()
+        registry = ToolRegistry()
+        registry.register(read_tool)
+        registry.register(write_tool)
+        loop = AgentLoop(
+            provider=provider,
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            max_rounds=2,
+            hard_max_rounds=2,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("修复当前项目")
+        steered = False
+        events = []
+
+        async for event in loop.run(history):
+            events.append(event)
+            if (
+                isinstance(event, ToolCallEvent)
+                and event.tool_call.name == "read_fixture"
+                and not steered
+            ):
+                history.queue_steering_message("先不要修改，只分析原因")
+                steered = True
+
+        second_names = self._openai_tool_names(provider.received_tools[1])
+        self.assertEqual({"read_fixture"}, second_names)
+        self.assertTrue(read_tool.executed)
+        self.assertFalse(write_tool.executed)
+        blocked = [event for event in events if isinstance(event, ToolBlockedEvent)]
+        self.assertEqual(1, len(blocked))
+        self.assertIn("inspect 只读模式", blocked[0].reason)
+
     async def test_runtime_max_rounds_change_updates_active_task_budget(self):
         loop = self._make_loop(
             UnknownToolProvider(),
@@ -1612,6 +1818,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("estimated_system_tokens", starts[0]["attributes"])
             self.assertIn("estimated_conversation_tokens", starts[0]["attributes"])
             self.assertIn("estimated_tool_schema_tokens", starts[0]["attributes"])
+            self.assertEqual("direct", starts[0]["attributes"]["task_mode"])
             self.assertIn("cache_read_tokens", ends[0]["attributes"])
             self.assertIn("cache_miss_tokens", ends[0]["attributes"])
             self.assertTrue(any(row["event"] == "round_start" for row in rows))

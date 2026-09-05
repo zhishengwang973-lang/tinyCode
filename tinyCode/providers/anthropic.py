@@ -17,6 +17,7 @@ from tinyCode.providers.base import (
     build_api_url,
     normalize_usage,
     normalize_tool_call_index,
+    provider_stream,
     read_error_detail,
 )
 from tinyCode.providers.sse import SSEDecoder
@@ -32,18 +33,12 @@ class AnthropicProvider(BaseProvider):
         self._thinking_enabled = False
         self._thinking_budget_tokens = 4096
         self.last_usage: dict[str, int] = {}
-        self._client: httpx.AsyncClient | None = None
 
-    def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
-        return self._client
+    async def _get_client(self):
+        return await self._get_or_create_http_client(httpx.AsyncClient)
 
     async def close(self) -> None:
-        client = self._client
-        self._client = None
-        if client is not None and hasattr(client, "aclose"):
-            await client.aclose()
+        await self._close_http_clients()
 
     # -- thinking control ----------------------------------------------------
 
@@ -111,9 +106,16 @@ class AnthropicProvider(BaseProvider):
 
         self.last_usage = {}
 
-        client = self._get_client()
+        client, proxy_route = await self._get_client()
         if client is not None:
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
+            async with provider_stream(
+                client,
+                "POST",
+                url,
+                proxy_route=proxy_route,
+                json=body,
+                headers=headers,
+            ) as resp:
                 if resp.status_code != 200:
                     raise ProviderHTTPError(
                         resp.status_code,

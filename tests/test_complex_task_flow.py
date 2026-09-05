@@ -84,7 +84,7 @@ class ComplexTaskFlowTests(unittest.IsolatedAsyncioTestCase):
             prompt_injector=PromptInjector(),
         )
         history = ConversationHistory()
-        history.add_user_message("complete a long task")
+        history.add_user_message("modify the current project through all task steps")
 
         events = [event async for event in loop.run(history)]
 

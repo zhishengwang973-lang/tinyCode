@@ -3,15 +3,20 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from tinyCode.config.models import ProviderConfig
 from tinyCode.providers.anthropic import AnthropicProvider
 from tinyCode.providers.base import (
     ProviderError,
     ProviderHTTPError,
     CacheUsage,
+    ProxyRouteDecision,
     TokenUsage,
     ToolCall,
     build_api_url,
+    detect_proxy_route,
+    provider_stream,
 )
 from tinyCode.providers.deepseek import DeepSeekProvider
 from tinyCode.providers.openai import OpenAIProvider
@@ -83,6 +88,65 @@ class ProviderUrlTests(unittest.TestCase):
         endpoint = "https://gateway.example/v1/chat/completions"
         self.assertEqual(endpoint, build_api_url(endpoint, "/v1/chat/completions"))
 
+    def test_unavailable_local_proxy_is_bypassed(self):
+        with (
+            patch(
+                "tinyCode.providers.base.getproxies",
+                return_value={"https": "http://127.0.0.1:12334"},
+            ),
+            patch("tinyCode.providers.base.proxy_bypass", return_value=False),
+            patch(
+                "tinyCode.providers.base.socket.create_connection",
+                side_effect=ConnectionRefusedError,
+            ),
+        ):
+            route = detect_proxy_route("https://api.deepseek.com")
+
+        self.assertFalse(route.trust_env)
+        self.assertTrue(route.bypassed_unavailable_proxy)
+        self.assertEqual("127.0.0.1:12334", route.proxy_address)
+
+    def test_available_local_proxy_remains_enabled(self):
+        class Connection:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = Connection()
+        with (
+            patch(
+                "tinyCode.providers.base.getproxies",
+                return_value={"https": "http://localhost:12334"},
+            ),
+            patch("tinyCode.providers.base.proxy_bypass", return_value=False),
+            patch(
+                "tinyCode.providers.base.socket.create_connection",
+                return_value=connection,
+            ),
+        ):
+            route = detect_proxy_route("https://api.deepseek.com")
+
+        self.assertTrue(route.trust_env)
+        self.assertFalse(route.bypassed_unavailable_proxy)
+        self.assertEqual("localhost:12334", route.proxy_address)
+        self.assertTrue(connection.closed)
+
+    def test_no_proxy_target_skips_local_proxy_probe(self):
+        with (
+            patch(
+                "tinyCode.providers.base.getproxies",
+                return_value={"https": "http://127.0.0.1:12334"},
+            ),
+            patch("tinyCode.providers.base.proxy_bypass", return_value=True),
+            patch("tinyCode.providers.base.socket.create_connection") as connect,
+        ):
+            route = detect_proxy_route("https://api.deepseek.com")
+
+        self.assertTrue(route.trust_env)
+        self.assertIsNone(route.proxy_address)
+        connect.assert_not_called()
+
     def test_oversized_sse_event_is_rejected_before_json_decode(self):
         with patch("tinyCode.providers.sse.MAX_SSE_EVENT_CHARS", 16):
             with self.assertRaises(ProviderError) as raised:
@@ -102,6 +166,84 @@ class ProviderUrlTests(unittest.TestCase):
 
 
 class ProviderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_error_reports_failed_proxy_fallback(self):
+        class FailedClient:
+            def stream(self, *args, **kwargs):
+                raise httpx.ConnectError("all attempts failed")
+
+        route = ProxyRouteDecision(
+            trust_env=False,
+            proxy_url="http://127.0.0.1:12334",
+            proxy_address="127.0.0.1:12334",
+            bypassed_unavailable_proxy=True,
+        )
+
+        with self.assertRaises(ProviderError) as raised:
+            async with provider_stream(
+                FailedClient(),
+                "POST",
+                "https://api.deepseek.com/v1/chat/completions",
+                proxy_route=route,
+            ):
+                pass
+
+        self.assertEqual("connection_failed", raised.exception.code)
+        self.assertTrue(raised.exception.retryable)
+        self.assertIn("本地代理 127.0.0.1:12334 不可用", str(raised.exception))
+        self.assertIn("已自动改为直连", str(raised.exception))
+
+    async def test_provider_rebuilds_client_when_proxy_state_changes(self):
+        routes = [
+            ProxyRouteDecision(
+                trust_env=False,
+                proxy_url="http://127.0.0.1:12334",
+                proxy_address="127.0.0.1:12334",
+                bypassed_unavailable_proxy=True,
+            ),
+            ProxyRouteDecision(
+                trust_env=True,
+                proxy_url="http://127.0.0.1:12334",
+                proxy_address="127.0.0.1:12334",
+            ),
+        ]
+
+        class CapturingClient:
+            instances: list["CapturingClient"] = []
+
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                self.closed = False
+                self.instances.append(self)
+
+            async def aclose(self):
+                self.closed = True
+
+        provider = OpenAIProvider(
+            ProviderConfig(
+                name="openai", protocol="openai", model="gpt-test",
+                base_url="https://api.openai.com", api_key="test-key",
+            )
+        )
+        with (
+            patch(
+                "tinyCode.providers.base.detect_proxy_route",
+                side_effect=routes,
+            ),
+            patch(
+                "tinyCode.providers.openai.httpx.AsyncClient",
+                CapturingClient,
+            ),
+        ):
+            first, _ = await provider._get_client()
+            second, _ = await provider._get_client()
+            await provider.close()
+
+        self.assertIsNot(first, second)
+        self.assertFalse(first.kwargs["trust_env"])
+        self.assertTrue(second.kwargs["trust_env"])
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+
     async def test_http_error_body_is_streamed_with_a_memory_bound(self):
         class ErrorResponse:
             status_code = 502

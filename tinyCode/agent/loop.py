@@ -35,7 +35,11 @@ from tinyCode.agent.events import (
 )
 from tinyCode.agent.context import PromptContextAssembler
 from tinyCode.agent.progress import ProgressState, ProgressWatchdog
-from tinyCode.agent.tool_routing import should_enable_tools
+from tinyCode.agent.tool_routing import (
+    TaskMode,
+    classify_task_mode,
+    task_mode_instruction,
+)
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator
 from tinyCode.config.constants import (
@@ -65,7 +69,7 @@ from tinyCode.prompts.injector import PromptInjector
 from tinyCode.security.guard import SecurityGuard
 from tinyCode.security.models import HITLDecision, SecurityLevel
 from tinyCode.storage.recovery import TaskRecoveryStore
-from tinyCode.tools.base import ToolResult
+from tinyCode.tools.base import ToolCategory, ToolResult
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.registry import ToolRegistry
 from tinyCode.tracing.recorder import TraceRecorder
@@ -179,6 +183,8 @@ class AgentLoop:
         self._task_skill_instructions: str | None = None
         self._task_injection: str | None = None
         self._task_tool_defs: list[dict] | None = None
+        self._task_mode = TaskMode.DIRECT
+        self._task_snapshot_version = 0
         self._task_is_direct_answer = False
         self._task_needs_time = False
         self._previous_request_cache_shape: dict[str, object] | None = None
@@ -335,6 +341,7 @@ class AgentLoop:
         history.flush_deferred()
         start_index = len(history.get_messages())
         self._begin_task_prompt_snapshot(history)
+        task_snapshot_version = self._task_snapshot_version
         try:
             async for event in self._run_impl(history):
                 yield event
@@ -364,7 +371,7 @@ class AgentLoop:
             )
         finally:
             self._active_budget = None
-            self._clear_task_prompt_snapshot()
+            self._clear_task_prompt_snapshot(task_snapshot_version)
 
     async def _run_impl(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         self.reset_cancel()
@@ -374,11 +381,14 @@ class AgentLoop:
         self.turn_model_requests = 0
         self._previous_request_cache_shape = None
         response_chars = 0
-        tools_enabled = should_enable_tools(history.get_messages())
+        task_mode = self._task_mode
+        tools_enabled = task_mode.tools_enabled
         # Skill activation and large-result persistence used to rebuild this
         # list between ReAct rounds.  Freeze the advertised schema for one
         # task; execution-time policy checks remain authoritative.
-        self._task_tool_defs = self._build_tool_defs() if tools_enabled else None
+        self._task_tool_defs = (
+            self._build_tool_defs(task_mode=task_mode) if tools_enabled else None
+        )
         request_history = self._request_history(history, tools_enabled)
         budget = _TurnRoundBudget(
             current_limit=self._max_rounds,
@@ -812,6 +822,16 @@ class AgentLoop:
                     )
                     continue
 
+                if not self._tool_allowed_for_task(tc.name):
+                    blocked = await self._block_tool(tc)
+                    blocked_result = ToolResult(
+                        success=False, content="", error=blocked.reason,
+                    )
+                    self._append_tool_result(history, tc, blocked_result)
+                    round_observations.append((tc, blocked_result))
+                    yield blocked
+                    continue
+
                 allowed, reason, hitl_future = self._precheck_tool(tc)
                 if hitl_future is not None:
                     guard = self._security_guard
@@ -869,7 +889,7 @@ class AgentLoop:
                     )
                     continue
 
-                if self._plan_only and tc.name not in _PLAN_MODE_ALLOWED:
+                if not self._tool_allowed_for_task(tc.name):
                     blocked = await self._block_tool(tc)
                     blocked_result = ToolResult(
                         success=False, content="", error=blocked.reason,
@@ -917,6 +937,8 @@ class AgentLoop:
 
             deferred_count = history.flush_steering()
             if deferred_count:
+                self._refresh_task_mode_after_steering(history)
+                tools_enabled = self._task_mode.tools_enabled
                 if request_history is not history:
                     request_history = history
                 can_continue = round_num < budget.hard_limit
@@ -1190,7 +1212,11 @@ class AgentLoop:
 
     def _begin_task_prompt_snapshot(self, history: ConversationHistory) -> None:
         """Freeze dynamic prefix inputs for the lifetime of one user task."""
-        self._task_is_direct_answer = not should_enable_tools(history.get_messages())
+        self._task_snapshot_version += 1
+        self._task_mode = classify_task_mode(history.get_messages())
+        if self._plan_only and self._task_mode is TaskMode.MODIFY:
+            self._task_mode = TaskMode.INSPECT
+        self._task_is_direct_answer = self._task_mode is TaskMode.DIRECT
         self._task_needs_time = self._task_needs_current_time(history)
         self._task_environment_text = self._current_environment_text()
         if self._task_needs_time and self._current_time_text:
@@ -1209,17 +1235,48 @@ class AgentLoop:
             if self._skill_registry is not None
             else ""
         )
-        self._task_injection = self._prompt_injector.build_task_injection() or ""
+        self._task_injection = "\n\n".join(filter(None, (
+            self._prompt_injector.build_task_injection() or "",
+            task_mode_instruction(self._task_mode),
+        )))
 
-    def _clear_task_prompt_snapshot(self) -> None:
+    def _clear_task_prompt_snapshot(self, task_snapshot_version: int) -> None:
+        if task_snapshot_version != self._task_snapshot_version:
+            return
         self._task_environment_text = None
         self._task_notes_text = None
         self._task_skill_instructions = None
         self._task_injection = None
         self._task_tool_defs = None
+        self._task_mode = TaskMode.DIRECT
         self._task_is_direct_answer = False
         self._task_needs_time = False
         self._previous_request_cache_shape = None
+
+    def _refresh_task_mode_after_steering(
+        self, history: ConversationHistory,
+    ) -> None:
+        """Apply an explicit mid-task capability escalation or restriction."""
+        candidate = classify_task_mode(history.get_messages())
+        if self._plan_only and candidate is TaskMode.MODIFY:
+            candidate = TaskMode.INSPECT
+        # A direct-answer steering message such as “also explain why” should
+        # not discard the active workspace context. Explicit read-only wording
+        # is classified as INSPECT and still restricts an active modify task.
+        if candidate is TaskMode.DIRECT or candidate is self._task_mode:
+            return
+
+        self._task_mode = candidate
+        self._task_is_direct_answer = False
+        self._task_tool_defs = self._build_tool_defs(task_mode=candidate)
+        if not self._task_notes_text:
+            self._task_notes_text = self._current_notes_text(
+                self._latest_user_text(history),
+            )
+        self._task_injection = "\n\n".join(filter(None, (
+            self._prompt_injector.build_task_injection() or "",
+            task_mode_instruction(candidate),
+        )))
 
     @staticmethod
     def _cache_fingerprint(value: object) -> str:
@@ -1304,6 +1361,7 @@ class AgentLoop:
                         "message_count": len(messages),
                         "tool_schema_count": len(tools or []),
                         "model": self._provider.config.model,
+                        "task_mode": self._task_mode.value,
                         **token_budget,
                         **cache_shape,
                     },
@@ -1507,7 +1565,10 @@ class AgentLoop:
             pass
 
     def _build_tool_defs(
-        self, *, include_tool_result_tools: bool = True,
+        self,
+        *,
+        include_tool_result_tools: bool = True,
+        task_mode: TaskMode = TaskMode.MODIFY,
     ) -> list[dict]:
         """Return a stable tool schema for every tool-enabled request.
 
@@ -1517,7 +1578,19 @@ class AgentLoop:
         ``include_tool_result_tools`` remains accepted for compatibility.
         """
         del include_tool_result_tools
-        return self._context_assembler.tool_definitions(self._tool_registry)
+        definitions = self._context_assembler.tool_definitions(self._tool_registry)
+        if task_mode is TaskMode.MODIFY and not self._plan_only:
+            return definitions
+        allowed_names = {
+            tool.name
+            for tool in self._tool_registry.list_tools()
+            if self._tool_allowed_in_mode(tool.name, task_mode)
+        }
+        return [
+            definition
+            for definition in definitions
+            if self._tool_definition_name(definition) in allowed_names
+        ]
 
     @classmethod
     def _tool_definition_names(cls, definitions: list[dict] | None) -> set[str]:
@@ -1538,7 +1611,6 @@ class AgentLoop:
     def _partition_tools(
         self, tool_calls: list[ToolCall],
     ) -> tuple[list[ToolCall], list[ToolCall]]:
-        from tinyCode.tools.base import ToolCategory
         reads: list[ToolCall] = []
         writes: list[ToolCall] = []
         for tc in tool_calls:
@@ -1548,6 +1620,21 @@ class AgentLoop:
             else:
                 writes.append(tc)
         return reads, writes
+
+    def _tool_allowed_in_mode(self, tool_name: str, mode: TaskMode) -> bool:
+        if self._plan_only:
+            return tool_name in _PLAN_MODE_ALLOWED
+        if mode is TaskMode.MODIFY:
+            return True
+        if mode is TaskMode.DIRECT:
+            return False
+        if tool_name == "request_user_input":
+            return True
+        tool = self._tool_registry.get(tool_name)
+        return tool is not None and tool.category is ToolCategory.READ
+
+    def _tool_allowed_for_task(self, tool_name: str) -> bool:
+        return self._tool_allowed_in_mode(tool_name, self._task_mode)
 
     def _validate_tool_call_identity(self, tc: ToolCall) -> str | None:
         if not isinstance(tc.id, str) or not tc.id:
@@ -1704,10 +1791,16 @@ class AgentLoop:
         return result
 
     async def _block_tool(self, tc: ToolCall) -> ToolBlockedEvent:
-        reason = (
-            f"Plan-only 模式已开启，'{tc.name}' 是写入类工具，已被拦截。"
-            f"请先关闭 plan-only 开关再执行修改操作。"
-        )
+        if self._plan_only:
+            reason = (
+                f"Plan-only 模式已开启，工具 '{tc.name}' 不在只读白名单中，已被拦截。"
+                "请先关闭 plan-only 开关再执行修改操作。"
+            )
+        else:
+            reason = (
+                f"当前任务处于 inspect 只读模式，工具 '{tc.name}' 可能产生副作用，"
+                "已被运行时拦截。只有用户明确要求实施修改或执行命令后才能使用该工具。"
+            )
         if self._trace_recorder is not None:
             self._trace_recorder.record("tool_blocked", status="blocked", attributes={
                 "round": self._active_round,

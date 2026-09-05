@@ -1,10 +1,18 @@
 """Abstract base provider, factory function, and shared types."""
 
+import asyncio
+import ipaddress
+import socket
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from contextvars import ContextVar
+from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass
+
+import httpx
 
 from tinyCode.config.models import ProviderConfig
 
@@ -14,6 +22,154 @@ Message = dict[str, Any]
 MAX_TOOL_ARGUMENT_CHARS = 1_000_000
 MAX_PARALLEL_TOOL_CALLS = 128
 MAX_ERROR_BODY_BYTES = 16_384
+LOCAL_PROXY_PROBE_TIMEOUT_SECONDS = 0.2
+
+
+@dataclass(frozen=True)
+class ProxyRouteDecision:
+    """Resolved environment-proxy route for one provider request."""
+
+    trust_env: bool = True
+    proxy_url: str | None = field(default=None, repr=False)
+    proxy_address: str | None = None
+    bypassed_unavailable_proxy: bool = False
+
+    @property
+    def cache_key(self) -> tuple[bool, str | None]:
+        """Key used to reuse a client only while its proxy route is unchanged."""
+        return self.trust_env, self.proxy_url
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _proxy_address(proxy_url: str) -> tuple[str, int, str] | None:
+    normalized = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    try:
+        parsed = urlsplit(normalized)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if port is None:
+        port = {
+            "http": 80,
+            "https": 443,
+            "socks": 1080,
+            "socks5": 1080,
+            "socks5h": 1080,
+        }.get(parsed.scheme.lower())
+    if port is None:
+        return None
+    display_host = f"[{host}]" if ":" in host else host
+    return host, port, f"{display_host}:{port}"
+
+
+def detect_proxy_route(target_url: str | None) -> ProxyRouteDecision:
+    """Ignore a stale local environment proxy while retaining valid proxies.
+
+    Only loopback proxies are actively probed. Remote proxies are left to
+    HTTPX so startup never adds an extra external network request.
+    """
+    try:
+        parsed_target = urlsplit(target_url or "")
+        target_host = parsed_target.hostname
+        target_scheme = parsed_target.scheme.lower()
+    except ValueError:
+        return ProxyRouteDecision()
+    if not target_host or target_scheme not in {"http", "https"}:
+        return ProxyRouteDecision()
+
+    try:
+        if proxy_bypass(target_host):
+            return ProxyRouteDecision()
+    except (OSError, ValueError):
+        pass
+
+    try:
+        proxies = getproxies()
+    except OSError:
+        return ProxyRouteDecision()
+    proxy_url = proxies.get(target_scheme) or proxies.get("all")
+    if not isinstance(proxy_url, str) or not proxy_url.strip():
+        return ProxyRouteDecision()
+    proxy_url = proxy_url.strip()
+    address = _proxy_address(proxy_url)
+    if address is None:
+        return ProxyRouteDecision(
+            trust_env=True,
+            proxy_url=proxy_url,
+        )
+
+    host, port, display = address
+    if not _is_loopback_host(host):
+        return ProxyRouteDecision(
+            trust_env=True,
+            proxy_url=proxy_url,
+            proxy_address=display,
+        )
+
+    try:
+        connection = socket.create_connection(
+            (host, port), timeout=LOCAL_PROXY_PROBE_TIMEOUT_SECONDS,
+        )
+    except OSError:
+        return ProxyRouteDecision(
+            trust_env=False,
+            proxy_url=proxy_url,
+            proxy_address=display,
+            bypassed_unavailable_proxy=True,
+        )
+    else:
+        connection.close()
+        return ProxyRouteDecision(
+            trust_env=True,
+            proxy_url=proxy_url,
+            proxy_address=display,
+        )
+
+
+@asynccontextmanager
+async def provider_stream(
+    client: Any,
+    method: str,
+    url: str,
+    *,
+    proxy_route: ProxyRouteDecision,
+    **kwargs: Any,
+) -> AsyncIterator[Any]:
+    """Open a provider stream and turn transport failures into clear errors."""
+    try:
+        async with client.stream(method, url, **kwargs) as response:
+            yield response
+    except (httpx.ConnectError, httpx.ProxyError) as exc:
+        target = urlsplit(url).hostname or url
+        if proxy_route.bypassed_unavailable_proxy:
+            message = (
+                f"模型服务连接失败：本地代理 {proxy_route.proxy_address} 不可用，"
+                f"已自动改为直连，但仍无法连接 {target}"
+            )
+        elif proxy_route.proxy_address:
+            message = (
+                f"模型服务连接失败：无法通过代理 "
+                f"{proxy_route.proxy_address} 连接 {target}"
+            )
+        else:
+            message = f"模型服务连接失败：无法直连 {target}"
+        raise ProviderError(
+            message,
+            code="connection_failed",
+            retryable=True,
+        ) from exc
 
 
 def normalize_tool_call_index(value: object) -> int | None:
@@ -247,6 +403,10 @@ class BaseProvider(ABC):
             f"tinycode_provider_usage_{id(self)}", default={}
         )
         self.last_stream_diagnostics: dict[str, int] = {}
+        self._client: Any | None = None
+        self._client_route_key: tuple[bool, str | None] | None = None
+        self._retired_clients: list[Any] = []
+        self._client_lock = asyncio.Lock()
 
     @property
     def last_usage(self) -> dict[str, Any]:
@@ -272,9 +432,51 @@ class BaseProvider(ABC):
     def cache_hit(self) -> bool:
         return self.cache_usage.read_tokens > 0
 
+    async def _get_or_create_http_client(
+        self,
+        client_factory: Any,
+    ) -> tuple[Any, ProxyRouteDecision]:
+        """Return a client matching the proxy state observed for this request."""
+        proxy_route = detect_proxy_route(self.config.base_url)
+        route_key = proxy_route.cache_key
+        async with self._client_lock:
+            # Tests and integrations may inject a fully constructed client.
+            if self._client is not None and self._client_route_key is None:
+                return self._client, proxy_route
+
+            if self._client is None or self._client_route_key != route_key:
+                if self._client is not None:
+                    # Keep an old client alive for any concurrent stream that
+                    # started before the proxy state changed.
+                    self._retired_clients.append(self._client)
+                self._client = client_factory(
+                    timeout=httpx.Timeout(60.0, connect=10.0),
+                    trust_env=proxy_route.trust_env,
+                )
+                self._client_route_key = route_key
+            return self._client, proxy_route
+
+    async def _close_http_clients(self) -> None:
+        async with self._client_lock:
+            clients = [*self._retired_clients]
+            if self._client is not None:
+                clients.append(self._client)
+            self._client = None
+            self._client_route_key = None
+            self._retired_clients = []
+
+        seen: set[int] = set()
+        for client in clients:
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
+
     async def close(self) -> None:
         """Release provider-owned network resources."""
-        return None
+        await self._close_http_clients()
 
     @abstractmethod
     def chat_stream(
