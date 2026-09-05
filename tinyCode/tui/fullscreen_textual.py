@@ -66,11 +66,15 @@ class _ConversationTurn:
     finished: bool = False
     answer_is_markdown: bool = True
     answer_kind: str = "assistant"
+    activity_text: str = ""
+    activity_active: bool = False
     notices: list[_SystemNotice] = field(default_factory=list)
 
 
 class _TurnView(Vertical):
     """A single user request and its matching agent response."""
+
+    _SPINNER_FRAMES: ClassVar[tuple[str, ...]] = ("◐", "◓", "◑", "◒")
 
     def __init__(self, turn: _ConversationTurn) -> None:
         super().__init__(classes="turn")
@@ -98,6 +102,9 @@ class _TurnView(Vertical):
         self._rendered_notice_count = len(notice_widgets)
         self._markdown_source = ""
         self._markdown_rendered = ""
+        self._spinner_index = 0
+        self._spinner_label = ""
+        self._spinner_timer = None
         self.workspace = Static("", classes="workspace-card", markup=False)
         self.metrics = Static("", classes="turn-metrics", markup=False)
 
@@ -112,12 +119,20 @@ class _TurnView(Vertical):
         yield self.metrics
 
     def on_mount(self) -> None:
+        self._spinner_timer = self.set_interval(
+            0.12, self._advance_process_spinner,
+            name="process-spinner", pause=True,
+        )
         self.sync()
+
+    def on_unmount(self) -> None:
+        if self._spinner_timer is not None:
+            self._spinner_timer.pause()
 
     def sync(self) -> None:
         turn = self.turn
         self.user_row.display = bool(turn.user_text)
-        self.process_text.update("\n\n".join(turn.process_lines))
+        self._sync_process_spinner()
         self.process.title = f"执行过程 · {len(turn.process_lines)} 个事件"
         self.process.collapsed = turn.process_collapsed
         self.process.display = bool(turn.process_lines)
@@ -160,6 +175,38 @@ class _TurnView(Vertical):
         self.workspace.update(workspace)
         self.metrics.display = bool(turn.metrics_summary)
         self.metrics.update(turn.metrics_summary)
+
+    def _sync_process_spinner(self) -> None:
+        turn = self.turn
+        active = bool(turn.activity_active and turn.activity_text)
+        if active and turn.activity_text != self._spinner_label:
+            self._spinner_label = turn.activity_text
+            self._spinner_index = 0
+        if self._spinner_timer is not None:
+            if active:
+                self._spinner_timer.resume()
+            else:
+                self._spinner_timer.pause()
+        self._render_process_text()
+
+    def _advance_process_spinner(self) -> None:
+        if not self.turn.activity_active or not self.turn.activity_text:
+            return
+        self._spinner_index = (
+            self._spinner_index + 1
+        ) % len(self._SPINNER_FRAMES)
+        self._render_process_text()
+
+    def _render_process_text(self) -> None:
+        lines = list(self.turn.process_lines)
+        if self.turn.activity_active and self.turn.activity_text:
+            expected = "· " + self.turn.activity_text
+            for index in range(len(lines) - 1, -1, -1):
+                if lines[index] == expected:
+                    frame = self._SPINNER_FRAMES[self._spinner_index]
+                    lines[index] = f"· {frame} {self.turn.activity_text}"
+                    break
+        self.process_text.update("\n\n".join(lines))
 
     async def _render_final_markdown(self, source: str) -> None:
         """Render once at completion and never outlive this turn widget."""
@@ -664,6 +711,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
     def _print_user(self, text: str) -> None:
         if self._active_turn is not None:
             self._active_turn.finished = True
+            self._active_turn.activity_active = False
+            self._active_turn.activity_text = ""
         turn = _ConversationTurn(user_text=text)
         self._turns.append(turn)
         self._active_turn = turn
@@ -704,6 +753,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
     def _print_success(self) -> None:
         if self._active_turn is not None:
             self._active_turn.finished = True
+        self._set_turn_activity(None)
         self._append_process("✓ 本轮已正常完成")
         self._set_process_collapsed(True)
         self._sync_active_view()
@@ -728,6 +778,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._add_notice("approval", "需要安全确认", text)
 
     def _print_error(self, text: str) -> None:
+        self._set_turn_activity(None)
         if self._command_active and not self._runtime.active:
             self._append_system_answer("错误：" + text, kind="error")
             return
@@ -798,19 +849,40 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
     def _start_progress(self, text: str) -> None:
         self._progress_text = text
         self._status_text = f"运行中 · {text}"
+        activity_changed = self._set_turn_activity(text, sync=False)
         if (
             not (self._command_active and not self._runtime.active)
             and text != self._last_process_progress
         ):
             self._last_process_progress = text
             self._append_process("· " + text)
+        elif activity_changed:
+            self._sync_active_view()
         self._refresh_chrome()
 
     def _stop_progress(self) -> None:
         self._progress_text = None
+        self._set_turn_activity(None)
         if self._command_active and not self._runtime.active:
             self._status_text = "就绪 · 可输入任务"
         self._refresh_chrome()
+
+    def _set_turn_activity(
+        self, text: str | None, *, sync: bool = True,
+    ) -> bool:
+        if self._active_turn is None:
+            return False
+        normalized = (text or "").strip()
+        active = bool(normalized)
+        changed = (
+            self._active_turn.activity_text != normalized
+            or self._active_turn.activity_active != active
+        )
+        self._active_turn.activity_text = normalized
+        self._active_turn.activity_active = active
+        if changed and sync:
+            self._sync_active_view()
+        return changed
 
     async def request_tool_input(self, question: str, options: list[str]) -> str | None:
         self._stop_progress()

@@ -888,6 +888,35 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("# 修复完成", view.turn.answer)
             self.assertIn("已编辑 2 个文件", view.turn.workspace_summary)
 
+    async def test_fullscreen_reasoning_indicator_animates_and_stops(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("执行复杂任务")
+            tui._start_progress("Reasoning")
+            await pilot.pause()
+
+            view = app.query_one(_TurnView)
+            self.assertTrue(tui._active_turn.activity_active)
+            self.assertIn("◐ Reasoning", view.process_text.content)
+            first_frame = str(view.process_text.content)
+            view._advance_process_spinner()
+            self.assertNotEqual(first_frame, str(view.process_text.content))
+
+            tui._stop_progress()
+            await pilot.pause()
+            self.assertFalse(tui._active_turn.activity_active)
+            self.assertIn("· Reasoning", view.process_text.content)
+            self.assertNotIn("◐ Reasoning", view.process_text.content)
+
     async def test_fullscreen_mouse_selection_copies_without_mode_switch(self):
         tui = FullscreenTinyCodeTUI(
             agent_loop=FakeAgentLoop(),
