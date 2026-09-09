@@ -169,19 +169,23 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(2, validator.await_count)
 
-    async def test_web_search_parses_and_limits_results(self):
+    async def test_web_search_prefers_baidu_and_limits_results(self):
         html = b"""
-        <div class="result">
-          <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.example.com%2Fa">First</a>
-          <a class="result__snippet">First snippet</a>
+        <div class="result c-container">
+          <h3 class="t c-title-en">
+            <a href="/link?url=first" data-landurl="https://docs.example.com/a">First</a>
+          </h3>
+          <div class="c-abstract">First snippet</div>
         </div>
-        <div class="result">
-          <a class="result__a" href="https://example.org/b">Second</a>
-          <a class="result__snippet">Second snippet</a>
+        <div class="result c-container">
+          <h3 class="t">
+            <a href="https://example.org/b">Second</a>
+          </h3>
+          <div class="c-abstract">Second snippet</div>
         </div>
         """
         response = WebResponse(
-            url="https://html.duckduckgo.com/html/?q=test",
+            url="https://www.baidu.com/s?wd=test&amp;ie=utf-8",
             status_code=200,
             content_type="text/html",
             body=html,
@@ -190,13 +194,45 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "tinyCode.tools.web_search.fetch_public_url",
             AsyncMock(return_value=response),
-        ):
+        ) as fetch_mock:
             result = await WebSearchTool().execute("test", max_results=1)
 
         self.assertTrue(result.success, result.error)
+        self.assertIn("搜索源: 百度", result.content)
         self.assertIn("First", result.content)
         self.assertIn("https://docs.example.com/a", result.content)
         self.assertNotIn("Second", result.content)
+        requested_url = fetch_mock.await_args.args[0]
+        self.assertTrue(requested_url.startswith("https://www.baidu.com/s?"))
+        self.assertIn("wd=test", requested_url)
+
+    async def test_baidu_verification_skips_retry_and_uses_fallback(self):
+        blocked = WebResponse(
+            url="https://wappass.baidu.com/static/captcha/tuxing.html",
+            status_code=200,
+            content_type="text/html",
+            body="<title>百度安全验证</title>".encode(),
+            truncated=False,
+        )
+        duckduckgo = WebResponse(
+            url="https://html.duckduckgo.com/html/?q=test",
+            status_code=200,
+            content_type="text/html",
+            body=b'<a class="result__a" href="https://example.com">Fallback</a>',
+            truncated=False,
+        )
+        fetch = AsyncMock(side_effect=[blocked, duckduckgo])
+        with patch(
+            "tinyCode.tools.web_search.fetch_public_url", fetch,
+        ), patch(
+            "tinyCode.tools.web_search.asyncio.sleep", AsyncMock(),
+        ) as sleep:
+            result = await WebSearchTool().execute("test")
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(2, fetch.await_count)
+        sleep.assert_not_awaited()
+        self.assertIn("DuckDuckGo 备用源", result.content)
 
     async def test_web_search_retries_then_uses_brave_fallback(self):
         brave_html = b"""
@@ -217,6 +253,7 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         fetch = AsyncMock(side_effect=[
             asyncio.TimeoutError(),
             RuntimeError("temporary connection failure"),
+            RuntimeError("duckduckgo unavailable"),
             brave_response,
         ])
         with patch(
@@ -227,7 +264,7 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
             result = await WebSearchTool().execute("Bosch careers", max_results=3)
 
         self.assertTrue(result.success, result.error)
-        self.assertEqual(3, fetch.await_count)
+        self.assertEqual(4, fetch.await_count)
         self.assertIn("Brave Search 备用源", result.content)
         self.assertIn("https://www.bosch.com.cn/careers/", result.content)
         self.assertIn("Official careers site", result.content)
@@ -236,7 +273,8 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         fetch = AsyncMock(side_effect=[
             RuntimeError("primary unavailable"),
             RuntimeError("retry unavailable"),
-            RuntimeError("fallback unavailable"),
+            RuntimeError("duckduckgo unavailable"),
+            RuntimeError("brave unavailable"),
         ])
         with patch(
             "tinyCode.tools.web_search.fetch_public_url", fetch,
@@ -246,8 +284,9 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
             result = await WebSearchTool().execute("test")
 
         self.assertFalse(result.success)
-        self.assertIn("DuckDuckGo: RuntimeError: primary unavailable", result.error)
-        self.assertIn("DuckDuckGo 重试", result.error)
+        self.assertIn("百度: RuntimeError: primary unavailable", result.error)
+        self.assertIn("百度重试", result.error)
+        self.assertIn("DuckDuckGo 备用源", result.error)
         self.assertIn("Brave Search 备用源", result.error)
 
     def test_duckduckgo_redirect_is_unwrapped(self):
@@ -256,6 +295,12 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
             _direct_result_url(
                 "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs%3Fa%3D1"
             ),
+        )
+
+    def test_relative_baidu_redirect_is_made_absolute(self):
+        self.assertEqual(
+            "https://www.baidu.com/link?url=result",
+            _direct_result_url("/link?url=result"),
         )
 
 
