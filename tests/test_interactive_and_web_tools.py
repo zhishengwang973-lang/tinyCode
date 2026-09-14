@@ -8,6 +8,7 @@ from tinyCode.tools.web_common import WebResponse, validate_public_url
 from tinyCode.tools.web_common import fetch_public_url
 from tinyCode.tools.web_fetch import WebFetchTool
 from tinyCode.tools.web_search import WebSearchTool, _direct_result_url
+from tinyCode.network import ProxyRouteDecision
 
 
 class RequestUserInputToolTests(unittest.IsolatedAsyncioTestCase):
@@ -84,6 +85,54 @@ class RequestUserInputToolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_web_fetch_bypasses_unavailable_local_proxy(self):
+        captured: dict = {}
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/plain"}
+            url = "https://example.com/docs"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def aiter_bytes(self):
+                yield b"ok"
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def stream(self, method, url):
+                return FakeResponse()
+
+        route = ProxyRouteDecision(
+            trust_env=False,
+            proxy_url="http://127.0.0.1:12334",
+            proxy_address="127.0.0.1:12334",
+            bypassed_unavailable_proxy=True,
+        )
+        with patch(
+            "tinyCode.tools.web_common.detect_proxy_route", return_value=route,
+        ), patch(
+            "tinyCode.tools.web_common.httpx.AsyncClient", FakeClient,
+        ):
+            response = await fetch_public_url(
+                "https://example.com/docs", validate_dns=False,
+            )
+
+        self.assertEqual(b"ok", response.body)
+        self.assertFalse(captured["trust_env"])
+
     async def test_public_url_guard_has_bounded_dns_lookup(self):
         async def timeout_wait_for(awaitable, timeout):
             awaitable.close()
@@ -204,7 +253,12 @@ class WebToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Second", result.content)
         requested_url = fetch_mock.await_args.args[0]
         self.assertTrue(requested_url.startswith("https://www.baidu.com/s?"))
+        self.assertIn("tn=baidurt", requested_url)
         self.assertIn("wd=test", requested_url)
+        self.assertIn(
+            "Mozilla/5.0",
+            fetch_mock.await_args.kwargs["request_headers"]["User-Agent"],
+        )
 
     async def test_baidu_verification_skips_retry_and_uses_fallback(self):
         blocked = WebResponse(

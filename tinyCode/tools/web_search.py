@@ -23,6 +23,14 @@ _RETRY_TIMEOUT_SECONDS = 5.0
 _DUCKDUCKGO_TIMEOUT_SECONDS = 6.0
 _BRAVE_TIMEOUT_SECONDS = 7.0
 _RETRY_DELAY_SECONDS = 0.25
+_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+}
 
 
 class _SearchSourceBlocked(RuntimeError):
@@ -37,12 +45,15 @@ class _BaiduParser(HTMLParser):
         self.results: list[dict[str, str]] = []
         self._current: dict[str, str] | None = None
         self._title_depth = 0
+        self._result_table_depth = 0
         self._collect: str | None = None
         self._collect_tag = ""
 
     def handle_starttag(self, tag: str, attrs) -> None:
         attributes = dict(attrs)
         classes = set(attributes.get("class", "").split())
+        if tag == "table" and "result" in classes:
+            self._result_table_depth += 1
         if tag in {"h3", "h2"} and (
             "t" in classes
             or "c-title" in classes
@@ -63,6 +74,11 @@ class _BaiduParser(HTMLParser):
             "c-abstract" in classes
             or "c-span-last" in classes
             or any(name.startswith("content-right_") for name in classes)
+            or (
+                tag == "font"
+                and self._result_table_depth
+                and attributes.get("size") == "-1"
+            )
         ):
             self._collect = "snippet"
             self._collect_tag = tag
@@ -73,6 +89,8 @@ class _BaiduParser(HTMLParser):
             self._collect_tag = ""
         if tag in {"h3", "h2"} and self._title_depth:
             self._title_depth -= 1
+        if tag == "table" and self._result_table_depth:
+            self._result_table_depth -= 1
 
     def handle_data(self, data: str) -> None:
         if self._current is not None and self._collect is not None:
@@ -259,7 +277,9 @@ class WebSearchTool(BaseTool):
         ):
             return ToolResult(False, "", f"max_results 必须是 1–{MAX_SEARCH_RESULTS} 的整数")
 
-        baidu_url = _BAIDU_URL + "?" + urlencode({"wd": query, "ie": "utf-8"})
+        baidu_url = _BAIDU_URL + "?" + urlencode({
+            "tn": "baidurt", "wd": query, "ie": "utf-8",
+        })
         duckduckgo_url = _DUCKDUCKGO_URL + "?" + urlencode({"q": query})
         brave_url = _BRAVE_URL + "?" + urlencode({"q": query, "source": "web"})
         attempts = (
@@ -313,7 +333,9 @@ class WebSearchTool(BaseTool):
         # search to the local or private network.
         try:
             response = await asyncio.wait_for(
-                fetch_public_url(url, max_bytes=400_000),
+                fetch_public_url(
+                    url, max_bytes=400_000, request_headers=_SEARCH_HEADERS,
+                ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:

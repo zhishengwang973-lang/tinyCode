@@ -11,6 +11,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from tinyCode.network import detect_proxy_route
+
 
 MAX_URL_CHARS = 4_096
 MAX_WEB_BYTES = 512_000
@@ -110,17 +112,22 @@ async def fetch_public_url(
     *,
     max_bytes: int = MAX_WEB_BYTES,
     validate_dns: bool = True,
+    request_headers: dict[str, str] | None = None,
 ) -> WebResponse:
     current = url
+    proxy_route = detect_proxy_route(url)
     headers = {
         "User-Agent": "TinyCode/0.1 (+https://github.com/zhishengwang973-lang/tinyCode)",
         "Accept": "text/html,application/json,text/plain,application/xml;q=0.9,*/*;q=0.1",
     }
+    if request_headers:
+        headers.update(request_headers)
     timeout = httpx.Timeout(WEB_TIMEOUT_SECONDS, connect=10.0)
     async with httpx.AsyncClient(
         timeout=timeout,
         follow_redirects=False,
         headers=headers,
+        trust_env=proxy_route.trust_env,
     ) as client:
         for redirect_count in range(MAX_REDIRECTS + 1):
             if validate_dns:

@@ -91,12 +91,12 @@ class ProviderUrlTests(unittest.TestCase):
     def test_unavailable_local_proxy_is_bypassed(self):
         with (
             patch(
-                "tinyCode.providers.base.getproxies",
+                "tinyCode.network.getproxies",
                 return_value={"https": "http://127.0.0.1:12334"},
             ),
-            patch("tinyCode.providers.base.proxy_bypass", return_value=False),
+            patch("tinyCode.network.proxy_bypass", return_value=False),
             patch(
-                "tinyCode.providers.base.socket.create_connection",
+                "tinyCode.network.socket.create_connection",
                 side_effect=ConnectionRefusedError,
             ),
         ):
@@ -116,12 +116,12 @@ class ProviderUrlTests(unittest.TestCase):
         connection = Connection()
         with (
             patch(
-                "tinyCode.providers.base.getproxies",
+                "tinyCode.network.getproxies",
                 return_value={"https": "http://localhost:12334"},
             ),
-            patch("tinyCode.providers.base.proxy_bypass", return_value=False),
+            patch("tinyCode.network.proxy_bypass", return_value=False),
             patch(
-                "tinyCode.providers.base.socket.create_connection",
+                "tinyCode.network.socket.create_connection",
                 return_value=connection,
             ),
         ):
@@ -135,11 +135,11 @@ class ProviderUrlTests(unittest.TestCase):
     def test_no_proxy_target_skips_local_proxy_probe(self):
         with (
             patch(
-                "tinyCode.providers.base.getproxies",
+                "tinyCode.network.getproxies",
                 return_value={"https": "http://127.0.0.1:12334"},
             ),
-            patch("tinyCode.providers.base.proxy_bypass", return_value=True),
-            patch("tinyCode.providers.base.socket.create_connection") as connect,
+            patch("tinyCode.network.proxy_bypass", return_value=True),
+            patch("tinyCode.network.socket.create_connection") as connect,
         ):
             route = detect_proxy_route("https://api.deepseek.com")
 
