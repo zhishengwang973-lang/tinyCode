@@ -23,12 +23,20 @@ from tinyCode.agent.events import (
     ToolResultEvent,
 )
 from tinyCode.agent.loop import AgentLoop
+from tinyCode.agent.task_mode import TaskMode
+from tinyCode.agent.task_mode_router import TaskModeRouteResult
 from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator, TruncateConfig
 from tinyCode.config.models import ProviderConfig, TracingConfig
 from tinyCode.hooks.models import HookEvent
-from tinyCode.providers.base import BaseProvider, Message, ProviderHTTPError, ToolCall
+from tinyCode.providers.base import (
+    BaseProvider,
+    Message,
+    ProviderHTTPError,
+    TokenUsage,
+    ToolCall,
+)
 from tinyCode.prompts.builder import PromptBuilder
 from tinyCode.prompts.injector import PromptInjector
 from tinyCode.tools.base import BaseTool, ToolCategory, ToolParameter, ToolResult
@@ -498,6 +506,44 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("tool-1", tool_results[0].call_id)
         self.assertFalse(tool_results[0].result.success)
         self.assertIn("未知工具", tool_results[0].result.error)
+
+    async def test_semantic_route_controls_schema_and_counts_router_request(self):
+        class StaticRouter:
+            async def route(self, messages):
+                return TaskModeRouteResult(
+                    mode=TaskMode.INSPECT,
+                    source="jev",
+                    rule_decisive=False,
+                    confidence=0.93,
+                    model_requests=1,
+                    usage=TokenUsage(5, 2, 7, True),
+                )
+
+        provider = ToolCaptureProvider()
+        registry = ToolRegistry()
+        registry.register(ReadFixtureTool())
+        registry.register(WriteFixtureTool())
+        loop = AgentLoop(
+            provider=provider,
+            tool_registry=registry,
+            tool_executor=ToolExecutor(),
+            prompt_builder=PromptBuilder(),
+            prompt_injector=PromptInjector(),
+            task_mode_router=StaticRouter(),
+            max_rounds=1,
+            round_limit_action="stop",
+        )
+        history = ConversationHistory()
+        history.add_user_message("这个能做吗")
+
+        events = [event async for event in loop.run(history)]
+
+        self.assertIsInstance(events[-1], AgentDoneEvent)
+        self.assertEqual(2, loop.turn_model_requests)
+        self.assertEqual(7, loop.turn_usage.total_tokens)
+        self.assertEqual(
+            {"read_fixture"}, self._openai_tool_names(provider.received_tools[0]),
+        )
 
     async def test_direct_answer_turn_cannot_execute_unadvertised_tool_call(self):
         tool = ReadFixtureTool()

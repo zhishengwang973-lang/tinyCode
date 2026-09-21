@@ -9,6 +9,11 @@ from tinyCode.config.constants import (
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_TASK_MODE_ROUTING_CONFIDENCE,
+    DEFAULT_TASK_MODE_ROUTING_ENABLED,
+    DEFAULT_TASK_MODE_ROUTING_MODEL,
+    DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT,
+    DEFAULT_TASK_MODE_ROUTING_TIMEOUT,
     DEFAULT_UI_MODE,
 )
 
@@ -33,6 +38,19 @@ class TracingConfig(BaseModel):
     max_files: int = 100
 
 
+class TaskModeRoutingConfig(BaseModel):
+    """Optional hybrid router for ambiguous direct/inspect/modify turns."""
+
+    enabled: bool = DEFAULT_TASK_MODE_ROUTING_ENABLED
+    api_key: str | None = None
+    base_url: str = "https://api.typesafe.ai"
+    model: str = DEFAULT_TASK_MODE_ROUTING_MODEL
+    confidence_threshold: float = DEFAULT_TASK_MODE_ROUTING_CONFIDENCE
+    timeout_seconds: float = DEFAULT_TASK_MODE_ROUTING_TIMEOUT
+    llm_timeout_seconds: float = DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT
+    llm_fallback: bool = True
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -46,3 +64,6 @@ class AppConfig(BaseModel):
     ui_mode: str = DEFAULT_UI_MODE
     notes_enabled: bool = DEFAULT_NOTES_ENABLED
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    task_mode_routing: TaskModeRoutingConfig = Field(
+        default_factory=TaskModeRoutingConfig,
+    )

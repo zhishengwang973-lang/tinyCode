@@ -331,6 +331,7 @@ def _timing_summary(
         "user_wait": "用户等待",
         "notes": "自动笔记",
         "workspace_scan": "工作区扫描",
+        "routing": "任务路由",
     }
     for span in spans:
         if span.parent_span_id in span_ids:
@@ -487,6 +488,7 @@ def _kind_label(kind: str) -> str:
         "user_wait": "用户等待",
         "notes": "笔记",
         "workspace_scan": "工作区扫描",
+        "routing": "任务路由",
     }.get(kind, kind)
 
 
@@ -525,6 +527,7 @@ def _status_label(status: str) -> str:
         "round_budget_stopped": "轮次预算暂停",
         "hard_max_rounds": "达到硬上限",
         "stalled": "无进展暂停",
+        "fallback": "已回退",
     }.get(status, status or "未知")
 
 

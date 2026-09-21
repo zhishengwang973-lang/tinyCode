@@ -40,6 +40,7 @@ from tinyCode.agent.tool_routing import (
     classify_task_mode,
     task_mode_instruction,
 )
+from tinyCode.agent.task_mode_router import TaskModeRouteResult, TaskModeRouter
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.conversation.truncator import ToolResultTruncator
 from tinyCode.config.constants import (
@@ -125,6 +126,7 @@ class AgentLoop:
         compressor: ContextCompressor | None = None,
         trace_recorder: TraceRecorder | None = None,
         recovery_store: TaskRecoveryStore | None = None,
+        task_mode_router: TaskModeRouter | None = None,
     ) -> None:
         self._provider = provider
         self._tool_registry = tool_registry
@@ -159,6 +161,7 @@ class AgentLoop:
         self._compressor = compressor
         self._trace_recorder = trace_recorder
         self._recovery_store = recovery_store
+        self._task_mode_router = task_mode_router
         self._recovery_task_id: str | None = None
         self._context_assembler = PromptContextAssembler(
             protocol=provider.config.protocol,
@@ -184,6 +187,8 @@ class AgentLoop:
         self._task_injection: str | None = None
         self._task_tool_defs: list[dict] | None = None
         self._task_mode = TaskMode.DIRECT
+        self._task_mode_source = "rule"
+        self._task_mode_confidence: float | None = None
         self._task_snapshot_version = 0
         self._task_is_direct_answer = False
         self._task_needs_time = False
@@ -340,7 +345,12 @@ class AgentLoop:
         """Run one user turn and keep history valid if the pipeline fails."""
         history.flush_deferred()
         start_index = len(history.get_messages())
-        self._begin_task_prompt_snapshot(history)
+        self.cache_hit = False
+        self.turn_cache_usage = CacheUsage()
+        self.turn_usage = TokenUsage()
+        self.turn_model_requests = 0
+        self._previous_request_cache_shape = None
+        await self._begin_task_prompt_snapshot(history)
         task_snapshot_version = self._task_snapshot_version
         try:
             async for event in self._run_impl(history):
@@ -375,11 +385,6 @@ class AgentLoop:
 
     async def _run_impl(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         self.reset_cancel()
-        self.cache_hit = False
-        self.turn_cache_usage = CacheUsage()
-        self.turn_usage = TokenUsage()
-        self.turn_model_requests = 0
-        self._previous_request_cache_shape = None
         response_chars = 0
         task_mode = self._task_mode
         tools_enabled = task_mode.tools_enabled
@@ -937,7 +942,7 @@ class AgentLoop:
 
             deferred_count = history.flush_steering()
             if deferred_count:
-                self._refresh_task_mode_after_steering(history)
+                await self._refresh_task_mode_after_steering(history)
                 tools_enabled = self._task_mode.tools_enabled
                 if request_history is not history:
                     request_history = history
@@ -1210,10 +1215,11 @@ class AgentLoop:
             direct_answer=self._task_is_direct_answer,
         )
 
-    def _begin_task_prompt_snapshot(self, history: ConversationHistory) -> None:
+    async def _begin_task_prompt_snapshot(self, history: ConversationHistory) -> None:
         """Freeze dynamic prefix inputs for the lifetime of one user task."""
         self._task_snapshot_version += 1
-        self._task_mode = classify_task_mode(history.get_messages())
+        route = await self._route_task_mode(history.get_messages())
+        self._apply_task_mode_route(route)
         if self._plan_only and self._task_mode is TaskMode.MODIFY:
             self._task_mode = TaskMode.INSPECT
         self._task_is_direct_answer = self._task_mode is TaskMode.DIRECT
@@ -1249,15 +1255,18 @@ class AgentLoop:
         self._task_injection = None
         self._task_tool_defs = None
         self._task_mode = TaskMode.DIRECT
+        self._task_mode_source = "rule"
+        self._task_mode_confidence = None
         self._task_is_direct_answer = False
         self._task_needs_time = False
         self._previous_request_cache_shape = None
 
-    def _refresh_task_mode_after_steering(
+    async def _refresh_task_mode_after_steering(
         self, history: ConversationHistory,
     ) -> None:
         """Apply an explicit mid-task capability escalation or restriction."""
-        candidate = classify_task_mode(history.get_messages())
+        route = await self._route_task_mode(history.get_messages())
+        candidate = route.mode
         if self._plan_only and candidate is TaskMode.MODIFY:
             candidate = TaskMode.INSPECT
         # A direct-answer steering message such as “also explain why” should
@@ -1267,6 +1276,8 @@ class AgentLoop:
             return
 
         self._task_mode = candidate
+        self._task_mode_source = route.source
+        self._task_mode_confidence = route.confidence
         self._task_is_direct_answer = False
         self._task_tool_defs = self._build_tool_defs(task_mode=candidate)
         if not self._task_notes_text:
@@ -1277,6 +1288,50 @@ class AgentLoop:
             self._prompt_injector.build_task_injection() or "",
             task_mode_instruction(candidate),
         )))
+
+    async def _route_task_mode(
+        self, messages: list[Message],
+    ) -> TaskModeRouteResult:
+        if self._task_mode_router is None:
+            return TaskModeRouteResult(
+                mode=classify_task_mode(messages),
+                source="rule",
+                rule_decisive=True,
+            )
+        trace_scope = (
+            self._trace_recorder.span(
+                "task_mode_routing",
+                "routing",
+                {"message_count": len(messages)},
+            )
+            if self._trace_recorder is not None
+            else nullcontext(None)
+        )
+        with trace_scope as trace_span:
+            route = await self._task_mode_router.route(messages)
+            if trace_span is not None:
+                trace_span.finish(
+                    "ok" if not route.error else "fallback",
+                    {
+                        "mode": route.mode.value,
+                        "source": route.source,
+                        "rule_decisive": route.rule_decisive,
+                        "confidence": route.confidence,
+                        "probabilities": route.probabilities,
+                        "model_requests": route.model_requests,
+                        "error": route.error,
+                    },
+                )
+        self.turn_model_requests += route.model_requests
+        self.turn_usage = self.turn_usage + route.usage
+        self.turn_cache_usage = self.turn_cache_usage + route.cache_usage
+        self.cache_hit = self.turn_cache_usage.read_tokens > 0
+        return route
+
+    def _apply_task_mode_route(self, route: TaskModeRouteResult) -> None:
+        self._task_mode = route.mode
+        self._task_mode_source = route.source
+        self._task_mode_confidence = route.confidence
 
     @staticmethod
     def _cache_fingerprint(value: object) -> str:
@@ -1362,6 +1417,8 @@ class AgentLoop:
                         "tool_schema_count": len(tools or []),
                         "model": self._provider.config.model,
                         "task_mode": self._task_mode.value,
+                        "task_mode_source": self._task_mode_source,
+                        "task_mode_confidence": self._task_mode_confidence,
                         **token_budget,
                         **cache_shape,
                     },

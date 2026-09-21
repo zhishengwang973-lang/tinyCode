@@ -2,12 +2,19 @@
 
 import os
 import re
+import math
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
-from tinyCode.config.models import AppConfig, ProviderConfig, TracingConfig
+from tinyCode.config.models import (
+    AppConfig,
+    ProviderConfig,
+    TaskModeRoutingConfig,
+    TracingConfig,
+)
 from tinyCode.config.constants import (
     DEFAULT_HARD_MAX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
@@ -15,6 +22,11 @@ from tinyCode.config.constants import (
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_TASK_MODE_ROUTING_CONFIDENCE,
+    DEFAULT_TASK_MODE_ROUTING_ENABLED,
+    DEFAULT_TASK_MODE_ROUTING_MODEL,
+    DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT,
+    DEFAULT_TASK_MODE_ROUTING_TIMEOUT,
     DEFAULT_UI_MODE,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_ROUND_LIMIT_ACTIONS,
@@ -103,6 +115,12 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["tracing"] = global_raw["tracing"]
     else:
         merged.pop("tracing", None)
+    # Semantic routing sends user text to a separately credentialed external
+    # service. A repository-owned config must never enable or redirect it.
+    if "task_mode_routing" in global_raw:
+        merged["task_mode_routing"] = global_raw["task_mode_routing"]
+    else:
+        merged.pop("task_mode_routing", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -371,6 +389,77 @@ def load_config() -> AppConfig:
     ):
         raise ConfigError("tracing.max_files 必须是 1 到 10000 之间的整数")
 
+    routing_raw = raw.get("task_mode_routing", {})
+    if not isinstance(routing_raw, dict):
+        raise ConfigError("task_mode_routing 必须是对象（mapping）")
+    routing_enabled = routing_raw.get(
+        "enabled", DEFAULT_TASK_MODE_ROUTING_ENABLED,
+    )
+    if not isinstance(routing_enabled, bool):
+        raise ConfigError("task_mode_routing.enabled 必须是 true 或 false")
+    routing_model = routing_raw.get(
+        "model", DEFAULT_TASK_MODE_ROUTING_MODEL,
+    )
+    if not isinstance(routing_model, str) or not routing_model.strip():
+        raise ConfigError("task_mode_routing.model 必须是非空字符串")
+    routing_base_url = routing_raw.get(
+        "base_url", "https://api.typesafe.ai",
+    )
+    if not isinstance(routing_base_url, str) or not routing_base_url.strip():
+        raise ConfigError("task_mode_routing.base_url 必须是非空 URL")
+    parsed_routing_url = urlsplit(routing_base_url.strip())
+    if parsed_routing_url.scheme != "https" or not parsed_routing_url.hostname:
+        raise ConfigError("task_mode_routing.base_url 必须是有效的 https URL")
+    confidence_threshold = routing_raw.get(
+        "confidence_threshold", DEFAULT_TASK_MODE_ROUTING_CONFIDENCE,
+    )
+    if (
+        isinstance(confidence_threshold, bool)
+        or not isinstance(confidence_threshold, (int, float))
+        or not math.isfinite(float(confidence_threshold))
+        or not 0 < float(confidence_threshold) <= 1
+    ):
+        raise ConfigError(
+            "task_mode_routing.confidence_threshold 必须是 0 到 1 之间的数字"
+        )
+    routing_timeout = routing_raw.get(
+        "timeout_seconds", DEFAULT_TASK_MODE_ROUTING_TIMEOUT,
+    )
+    if (
+        isinstance(routing_timeout, bool)
+        or not isinstance(routing_timeout, (int, float))
+        or not math.isfinite(float(routing_timeout))
+        or not 0.1 <= float(routing_timeout) <= 30
+    ):
+        raise ConfigError(
+            "task_mode_routing.timeout_seconds 必须是 0.1 到 30 之间的数字"
+        )
+    llm_fallback = routing_raw.get("llm_fallback", True)
+    if not isinstance(llm_fallback, bool):
+        raise ConfigError("task_mode_routing.llm_fallback 必须是 true 或 false")
+    llm_timeout = routing_raw.get(
+        "llm_timeout_seconds", DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT,
+    )
+    if (
+        isinstance(llm_timeout, bool)
+        or not isinstance(llm_timeout, (int, float))
+        or not math.isfinite(float(llm_timeout))
+        or not 1 <= float(llm_timeout) <= 120
+    ):
+        raise ConfigError(
+            "task_mode_routing.llm_timeout_seconds 必须是 1 到 120 之间的数字"
+        )
+    routing_api_key: str | None = None
+    if routing_enabled:
+        api_key_env = routing_raw.get("api_key_env", "TYPESAFE_API_KEY")
+        if not isinstance(api_key_env, str) or not _ENV_NAME_RE.fullmatch(api_key_env):
+            raise ConfigError("task_mode_routing.api_key_env 不是有效环境变量名")
+        routing_api_key = api_key_env
+        if not routing_api_key:
+            raise ConfigError(
+                f"task_mode_routing 所需环境变量 api_key_env 未设置"
+            )
+
     return AppConfig(
         providers=providers, active_provider=active_provider,
         max_rounds=max_rounds,
@@ -385,6 +474,16 @@ def load_config() -> AppConfig:
             capture_payloads=capture_payloads,
             retention_days=retention_days,
             max_files=max_trace_files,
+        ),
+        task_mode_routing=TaskModeRoutingConfig(
+            enabled=routing_enabled,
+            api_key=routing_api_key,
+            base_url=routing_base_url.strip().rstrip("/"),
+            model=routing_model.strip(),
+            confidence_threshold=float(confidence_threshold),
+            timeout_seconds=float(routing_timeout),
+            llm_timeout_seconds=float(llm_timeout),
+            llm_fallback=llm_fallback,
         ),
     )
 

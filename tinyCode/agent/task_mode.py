@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from enum import Enum
 
 from tinyCode.providers.base import Message
@@ -22,6 +23,14 @@ class TaskMode(str, Enum):
     @property
     def writes_allowed(self) -> bool:
         return self is TaskMode.MODIFY
+
+
+@dataclass(frozen=True)
+class RuleTaskModeDecision:
+    """Rule result plus whether semantic routing can add useful signal."""
+
+    mode: TaskMode
+    decisive: bool
 
 
 _SMALL_TALK = frozenset({
@@ -351,6 +360,70 @@ def classify_task_mode(messages: list[Message]) -> TaskMode:
 def should_enable_tools(messages: list[Message]) -> bool:
     """Compatibility wrapper for callers that only need a binary answer."""
     return classify_task_mode(messages).tools_enabled
+
+
+def classify_task_mode_rule(messages: list[Message]) -> RuleTaskModeDecision:
+    """Return the deterministic mode and whether an explicit rule decided it.
+
+    The existing classifier remains the safety baseline.  Semantic routing is
+    reserved for turns that fall through to a weak/default interpretation, so
+    obvious requests never pay an extra network or model call.
+    """
+    mode = classify_task_mode(messages)
+    latest_index, latest = _latest_user_message(messages)
+    if latest_index is None or not latest.strip():
+        return RuleTaskModeDecision(mode, True)
+
+    normalized = " ".join(latest.casefold().split()).strip(" ，,。.!！?")
+    if normalized in (
+        _SMALL_TALK
+        | _ACKNOWLEDGEMENTS
+        | _NEUTRAL_CONTINUATION
+        | _FAILED_CONTINUATION
+    ):
+        return RuleTaskModeDecision(mode, True)
+    if _EXECUTE_CONTINUATION_RE.fullmatch(normalized):
+        return RuleTaskModeDecision(mode, True)
+
+    workspace = bool(_WORKSPACE_RE.search(latest) or _FILE_REFERENCE_RE.search(latest))
+    fresh_information = bool(_FRESH_INFORMATION_RE.search(latest))
+    read_only = bool(_READ_ONLY_RE.search(latest))
+    explicit_direct = bool(_EXPLICIT_DIRECT_RE.search(latest))
+    desired_change = bool(_DESIRED_CHANGE_RE.search(latest))
+    explicit_execution = _has_explicit_execution_request(latest)
+
+    if mode is TaskMode.MODIFY:
+        return RuleTaskModeDecision(
+            mode,
+            bool(
+                workspace
+                or desired_change
+                or explicit_execution
+                or _COMMAND_REQUEST_RE.search(latest)
+            ),
+        )
+    if mode is TaskMode.INSPECT:
+        return RuleTaskModeDecision(
+            mode,
+            bool(
+                workspace
+                or fresh_information
+                or read_only
+                or _ISSUE_REPORT_RE.search(latest)
+                or _CHANGE_AUDIT_RE.search(latest)
+            ),
+        )
+
+    decisive_direct = bool(
+        explicit_direct
+        or _SELF_CONTAINED_RE.search(latest)
+        or _ANSWER_TRANSFORM_RE.search(latest)
+        or _PROVIDED_CONTENT_RE.search(latest)
+        or _ERROR_EXPLANATION_RE.search(latest)
+        or _STANDALONE_TEMPLATE_RE.search(latest)
+        or (_ADVISORY_RE.search(latest) and not workspace)
+    )
+    return RuleTaskModeDecision(mode, decisive_direct)
 
 
 def task_mode_instruction(mode: TaskMode) -> str:

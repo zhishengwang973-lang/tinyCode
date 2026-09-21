@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from tinyCode.agent.loop import AgentLoop
+from tinyCode.agent.task_mode_router import TaskModeRouter
 from tinyCode.cli import CLIOptions, parse_cli_args
 from tinyCode.config.loader import ConfigError, load_config
 from tinyCode.instructions import InstructionsLoader
@@ -397,6 +398,12 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             )
             return 2
 
+    task_mode_router = (
+        TaskModeRouter(provider, app_config.task_mode_routing)
+        if app_config.task_mode_routing.enabled
+        else None
+    )
+
     agent_loop = AgentLoop(
         provider=provider,
         tool_registry=tool_registry,
@@ -418,6 +425,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         compressor=compressor,
         trace_recorder=trace_recorder,
         recovery_store=recovery_store,
+        task_mode_router=task_mode_router,
     )
 
     tui_ref: dict[str, TinyCodeTUI] = {}
