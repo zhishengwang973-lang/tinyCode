@@ -75,6 +75,7 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("normal", config.security_level)
             self.assertEqual("stream", config.ui_mode)
             self.assertEqual(DEFAULT_NOTES_ENABLED, config.notes_enabled)
+            self.assertFalse(config.note_routing.enabled)
             self.assertTrue(config.tracing.enabled)
             self.assertFalse(config.tracing.capture_payloads)
             self.assertFalse(config.task_mode_routing.enabled)
@@ -147,14 +148,14 @@ class ConfigLoaderTests(unittest.TestCase):
 
         routing = config.task_mode_routing
         self.assertTrue(routing.enabled)
-        self.assertEqual("jev-secret", routing.api_key)
+        self.assertEqual("TEST_TYPESAFE_KEY", routing.api_key)
         self.assertEqual("jev-1.13.0", routing.model)
         self.assertEqual(0.85, routing.confidence_threshold)
         self.assertEqual(3.0, routing.timeout_seconds)
         self.assertEqual(15.0, routing.llm_timeout_seconds)
         self.assertTrue(routing.llm_fallback)
 
-    def test_enabled_task_mode_routing_requires_api_key(self):
+    def test_enabled_task_mode_routing_keeps_api_key_env_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
             config_path.write_text(
@@ -171,8 +172,11 @@ class ConfigLoaderTests(unittest.TestCase):
             with patch.dict(os.environ, {
                 "TINYCODE_CONFIG": str(config_path),
             }, clear=True):
-                with self.assertRaisesRegex(ConfigError, "MISSING_TYPESAFE_KEY"):
-                    load_config()
+                config = load_config()
+
+        self.assertEqual(
+            "MISSING_TYPESAFE_KEY", config.task_mode_routing.api_key,
+        )
 
     def test_notes_enabled_is_configurable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -206,6 +210,81 @@ class ConfigLoaderTests(unittest.TestCase):
             with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
                 with self.assertRaisesRegex(
                     ConfigError, "notes_enabled 必须是 true 或 false",
+                ):
+                    load_config()
+
+    def test_note_routing_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "notes_enabled: true\n"
+                "note_routing:\n"
+                "  enabled: true\n"
+                "  api_key_env: TEST_NOTE_TYPESAFE_KEY\n"
+                "  model: jev-1.13.0\n"
+                "  confidence_threshold: 0.9\n"
+                "  timeout_seconds: 2\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "TINYCODE_CONFIG": str(config_path),
+                "TEST_NOTE_TYPESAFE_KEY": "note-secret",
+            }, clear=False):
+                config = load_config()
+
+        routing = config.note_routing
+        self.assertTrue(routing.enabled)
+        self.assertEqual("TEST_NOTE_TYPESAFE_KEY", routing.api_key)
+        self.assertEqual("jev-1.13.0", routing.model)
+        self.assertEqual(0.9, routing.confidence_threshold)
+        self.assertEqual(2.0, routing.timeout_seconds)
+
+    def test_enabled_note_routing_keeps_api_key_env_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "note_routing:\n"
+                "  enabled: true\n"
+                "  api_key_env: MISSING_NOTE_TYPESAFE_KEY\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "TINYCODE_CONFIG": str(config_path),
+            }, clear=True):
+                config = load_config()
+
+        self.assertEqual(
+            "MISSING_NOTE_TYPESAFE_KEY", config.note_routing.api_key,
+        )
+
+    def test_note_routing_rejects_ambiguous_confidence_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "note_routing:\n"
+                "  confidence_threshold: 0.5\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "TINYCODE_CONFIG": str(config_path),
+            }, clear=False):
+                with self.assertRaisesRegex(
+                    ConfigError, "note_routing.confidence_threshold",
                 ):
                     load_config()
 
@@ -487,6 +566,40 @@ class ConfigLoaderTests(unittest.TestCase):
 
         self.assertFalse(config.task_mode_routing.enabled)
         self.assertIsNone(config.task_mode_routing.api_key)
+
+    def test_project_cannot_enable_note_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "project"
+            (home / ".tinyCode").mkdir(parents=True)
+            project.mkdir()
+            (home / ".tinyCode" / "config.yaml").write_text(
+                "providers:\n"
+                "  - name: global\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n",
+                encoding="utf-8",
+            )
+            (project / ".tinyCode.yaml").write_text(
+                "note_routing:\n"
+                "  enabled: true\n"
+                "  api_key_env: STOLEN_NOTE_KEY\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {
+                "TINYCODE_CONFIG": "", "STOLEN_NOTE_KEY": "secret",
+            }, clear=False), patch(
+                "tinyCode.config.loader.Path.home", return_value=home,
+            ), patch(
+                "tinyCode.config.loader.Path.cwd", return_value=project,
+            ):
+                config = load_config()
+
+        self.assertFalse(config.note_routing.enabled)
+        self.assertIsNone(config.note_routing.api_key)
 
     def test_project_provider_never_inherits_global_api_key(self):
         with tempfile.TemporaryDirectory() as tmp:

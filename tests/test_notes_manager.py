@@ -11,6 +11,8 @@ from tinyCode.notes.manager import (
     MAX_NOTE_OUTPUT_CHARS,
 )
 from tinyCode.notes.categories import build_note_prompt
+from tinyCode.notes.router import NoteRoutingDecision
+from tinyCode.providers.base import TokenUsage
 
 
 class CapturingProvider:
@@ -28,6 +30,7 @@ class ConcurrentProvider:
     def __init__(self) -> None:
         self.active = 0
         self.max_active = 0
+        self.categories: list[str] = []
         self._usage: ContextVar[dict[str, int]] = ContextVar("note_usage", default={})
 
     @property
@@ -44,6 +47,7 @@ class ConcurrentProvider:
             for name in ("用户偏好", "纠正反馈", "项目知识", "参考资料")
             if f"目标分类：{name}" in prompt
         )
+        self.categories.append(category)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -66,6 +70,19 @@ class FailsOneCategoryOnceProvider(ConcurrentProvider):
             raise ConnectionError("temporary note failure")
         async for chunk in super().chat_stream(messages):
             yield chunk
+
+
+class FakeNoteRouter:
+    def __init__(self, decision=None, error: Exception | None = None) -> None:
+        self.decision = decision
+        self.error = error
+        self.calls = 0
+
+    async def route(self, recent_text: str):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.decision
 
 
 class AutoNoteManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -153,6 +170,95 @@ class AutoNoteManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(4, len(results))
         self.assertEqual(4, manager.last_update_model_requests)
         self.assertEqual(12, manager.last_update_tokens)
+
+    async def test_note_router_updates_only_confidently_selected_categories(self):
+        provider = ConcurrentProvider()
+        router = FakeNoteRouter(NoteRoutingDecision(
+            categories=frozenset({"项目知识"}),
+            probabilities={"项目知识": 0.97},
+            usage=TokenUsage(8, 2, 10, True),
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch(
+                    "tinyCode.notes.manager.get_user_notes_dir",
+                    return_value=root / "user-notes",
+                ),
+                patch(
+                    "tinyCode.notes.manager.get_project_notes_dir",
+                    return_value=root / "project-notes",
+                ),
+            ):
+                manager = AutoNoteManager(
+                    provider=provider, cwd=root, router=router,
+                )
+                manager.record_round("项目使用 Textual", "已记录")
+                results = await manager.update_all()
+
+        self.assertEqual(1, router.calls)
+        self.assertEqual(["项目知识"], provider.categories)
+        self.assertEqual(1, len(results))
+        self.assertEqual(2, manager.last_update_model_requests)
+        self.assertEqual(13, manager.last_update_tokens)
+        self.assertEqual([], manager._recent_text)
+
+    async def test_note_router_can_skip_every_generation_request(self):
+        provider = ConcurrentProvider()
+        router = FakeNoteRouter(NoteRoutingDecision(
+            categories=frozenset(),
+            probabilities={},
+            usage=TokenUsage(5, 1, 6, True),
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch(
+                    "tinyCode.notes.manager.get_user_notes_dir",
+                    return_value=root / "user-notes",
+                ),
+                patch(
+                    "tinyCode.notes.manager.get_project_notes_dir",
+                    return_value=root / "project-notes",
+                ),
+            ):
+                manager = AutoNoteManager(
+                    provider=provider, cwd=root, router=router,
+                )
+                manager.record_round("你好", "你好")
+                results = await manager.update_all()
+
+        self.assertEqual({}, results)
+        self.assertEqual([], provider.categories)
+        self.assertEqual(1, manager.last_update_model_requests)
+        self.assertEqual(6, manager.last_update_tokens)
+        self.assertEqual([], manager._recent_text)
+
+    async def test_note_router_failure_falls_back_to_all_categories(self):
+        provider = ConcurrentProvider()
+        router = FakeNoteRouter(error=TimeoutError("jev timeout"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch(
+                    "tinyCode.notes.manager.get_user_notes_dir",
+                    return_value=root / "user-notes",
+                ),
+                patch(
+                    "tinyCode.notes.manager.get_project_notes_dir",
+                    return_value=root / "project-notes",
+                ),
+            ):
+                manager = AutoNoteManager(
+                    provider=provider, cwd=root, router=router,
+                )
+                manager.record_round("重要内容", "助手回复")
+                results = await manager.update_all()
+
+        self.assertEqual(4, len(results))
+        self.assertEqual(5, manager.last_update_model_requests)
+        self.assertTrue(any("笔记分类门控" in item for item in manager.last_errors))
+        self.assertEqual([], manager._recent_text)
 
     async def test_partial_update_failure_keeps_recent_text_for_retry(self):
         provider = FailsOneCategoryOnceProvider()

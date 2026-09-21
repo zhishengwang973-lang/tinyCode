@@ -57,6 +57,15 @@ ui_mode: stream
 # 仅在全局 ~/.tinyCode/config.yaml 中生效，项目配置不能覆盖
 notes_enabled: true
 
+# 可选：用一次 Jev 请求先判断哪些笔记分类值得更新，减少无效生成请求
+# 仅在全局 ~/.tinyCode/config.yaml 中生效；失败或置信度不足会回退为全分类更新
+note_routing:
+  enabled: false
+  api_key_env: TYPESAFE_API_KEY
+  model: jev-latest
+  confidence_threshold: 0.85
+  timeout_seconds: 5
+
 # 本地执行 Trace（仅在全局 ~/.tinyCode/config.yaml 中生效）
 # 默认只保存元数据和摘要；capture_payloads 开启后也会执行敏感字段脱敏
 tracing:

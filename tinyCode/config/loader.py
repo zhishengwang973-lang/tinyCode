@@ -11,6 +11,7 @@ import yaml
 
 from tinyCode.config.models import (
     AppConfig,
+    NoteRoutingConfig,
     ProviderConfig,
     TaskModeRoutingConfig,
     TracingConfig,
@@ -18,6 +19,10 @@ from tinyCode.config.models import (
 from tinyCode.config.constants import (
     DEFAULT_HARD_MAX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_NOTE_ROUTING_CONFIDENCE,
+    DEFAULT_NOTE_ROUTING_ENABLED,
+    DEFAULT_NOTE_ROUTING_MODEL,
+    DEFAULT_NOTE_ROUTING_TIMEOUT,
     DEFAULT_NOTES_ENABLED,
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
@@ -109,6 +114,13 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["notes_enabled"] = global_raw["notes_enabled"]
     else:
         merged.pop("notes_enabled", None)
+    # Note routing sends recent conversation text to a separately
+    # credentialed service. A repository must not opt the user in or redirect
+    # that traffic.
+    if "note_routing" in global_raw:
+        merged["note_routing"] = global_raw["note_routing"]
+    else:
+        merged.pop("note_routing", None)
     # Trace payload capture is a user-level privacy decision. A repository may
     # not silently enable it through project-owned configuration.
     if "tracing" in global_raw:
@@ -365,6 +377,73 @@ def load_config() -> AppConfig:
     if not isinstance(notes_enabled, bool):
         raise ConfigError("notes_enabled 必须是 true 或 false")
 
+    note_routing_raw = raw.get("note_routing", {})
+    if not isinstance(note_routing_raw, dict):
+        raise ConfigError("note_routing 必须是对象（mapping）")
+    note_routing_enabled = note_routing_raw.get(
+        "enabled", DEFAULT_NOTE_ROUTING_ENABLED,
+    )
+    if not isinstance(note_routing_enabled, bool):
+        raise ConfigError("note_routing.enabled 必须是 true 或 false")
+    note_routing_model = note_routing_raw.get(
+        "model", DEFAULT_NOTE_ROUTING_MODEL,
+    )
+    if not isinstance(note_routing_model, str) or not note_routing_model.strip():
+        raise ConfigError("note_routing.model 必须是非空字符串")
+    note_routing_base_url = note_routing_raw.get(
+        "base_url", "https://api.typesafe.ai",
+    )
+    if (
+        not isinstance(note_routing_base_url, str)
+        or not note_routing_base_url.strip()
+    ):
+        raise ConfigError("note_routing.base_url 必须是非空 URL")
+    parsed_note_routing_url = urlsplit(note_routing_base_url.strip())
+    if (
+        parsed_note_routing_url.scheme != "https"
+        or not parsed_note_routing_url.hostname
+    ):
+        raise ConfigError("note_routing.base_url 必须是有效的 https URL")
+    note_routing_confidence = note_routing_raw.get(
+        "confidence_threshold", DEFAULT_NOTE_ROUTING_CONFIDENCE,
+    )
+    if (
+        isinstance(note_routing_confidence, bool)
+        or not isinstance(note_routing_confidence, (int, float))
+        or not math.isfinite(float(note_routing_confidence))
+        or not 0.5 < float(note_routing_confidence) <= 1
+    ):
+        raise ConfigError(
+            "note_routing.confidence_threshold 必须是大于 0.5 且不超过 1 的数字"
+        )
+    note_routing_timeout = note_routing_raw.get(
+        "timeout_seconds", DEFAULT_NOTE_ROUTING_TIMEOUT,
+    )
+    if (
+        isinstance(note_routing_timeout, bool)
+        or not isinstance(note_routing_timeout, (int, float))
+        or not math.isfinite(float(note_routing_timeout))
+        or not 0.1 <= float(note_routing_timeout) <= 30
+    ):
+        raise ConfigError(
+            "note_routing.timeout_seconds 必须是 0.1 到 30 之间的数字"
+        )
+    note_routing_api_key: str | None = None
+    if note_routing_enabled:
+        note_api_key_env = note_routing_raw.get(
+            "api_key_env", "TYPESAFE_API_KEY",
+        )
+        if (
+            not isinstance(note_api_key_env, str)
+            or not _ENV_NAME_RE.fullmatch(note_api_key_env)
+        ):
+            raise ConfigError("note_routing.api_key_env 不是有效环境变量名")
+        note_routing_api_key = note_api_key_env
+        if not note_routing_api_key:
+            raise ConfigError(
+                f"note_routing 所需环境变量 note_api_key_env 未设置"
+            )
+
     tracing_raw = raw.get("tracing", {})
     if not isinstance(tracing_raw, dict):
         raise ConfigError("tracing 必须是对象（mapping）")
@@ -469,6 +548,14 @@ def load_config() -> AppConfig:
         security_level=security_level,
         ui_mode=ui_mode,
         notes_enabled=notes_enabled,
+        note_routing=NoteRoutingConfig(
+            enabled=note_routing_enabled,
+            api_key=note_routing_api_key,
+            base_url=note_routing_base_url.strip().rstrip("/"),
+            model=note_routing_model.strip(),
+            confidence_threshold=float(note_routing_confidence),
+            timeout_seconds=float(note_routing_timeout),
+        ),
         tracing=TracingConfig(
             enabled=tracing_enabled,
             capture_payloads=capture_payloads,

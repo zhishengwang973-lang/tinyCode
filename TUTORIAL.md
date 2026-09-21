@@ -157,6 +157,14 @@ security_level: normal     # strict / normal / permissive
 ui_mode: stream            # stream / fullscreen
 notes_enabled: true        # 持久笔记开关，仅在全局配置中生效
 
+# 可选：一次 Jev 请求筛选本轮需要生成的笔记分类
+note_routing:
+  enabled: true
+  api_key_env: TYPESAFE_API_KEY
+  model: jev-latest
+  confidence_threshold: 0.85
+  timeout_seconds: 5
+
 # 可选：仅对规则无法明确判断的任务使用 Jev 语义路由
 task_mode_routing:
   enabled: true
@@ -197,13 +205,21 @@ Jev 做 `direct / inspect / modify` Choice 判断。高于 `confidence_threshold
 不会增加请求耗时或成本。该功能默认关闭，且只允许由全局配置启用，因为模糊请求的最近
 对话摘要会发送给独立的 TypeSafe 服务。建议先用*评测集校准阈值，再用于自动开放工具*。
 
+**笔记分类门控**：启用 `notes_enabled` 后，还可以在全局配置中启用 `note_routing`。
+自动笔记更新前会把最近对话截断到 8,000 字符，并用一次 Jev 请求并行判断“用户偏好、
+纠正反馈、项目知识、参考资料”四个分类。只有高置信度相关的分类才调用生成模型更新；
+高置信度无关的分类直接跳过。任一分类落入不确定区间，或 Jev 超时、鉴权失败、返回异常，
+都会保守回退到原来的四分类生成流程，避免因优化而漏记。Jev 只负责分类，不生成或修改
+笔记内容。该功能默认关闭，并且和 `task_mode_routing` 独立启用。
+
 **配置规则**：`TINYCODE_CONFIG` 最高优先且单独加载；否则先加载
 `~/.tinyCode/config.yaml`，再用当前目录 `.tinyCode.yaml` 覆盖。项目 Provider 列表
 整体替换全局 Provider 列表，避免项目提供的 `base_url` 偷用全局密钥。项目配置可以
 提高全局安全等级，但不能把显式的全局 `security_level` 降级；需要临时降级时必须由用户
 亲自传入 `--mode`。`notes_enabled` 只接受 `true` 或 `false`，并且只从全局
 `~/.tinyCode/config.yaml` 读取，项目 `.tinyCode.yaml` 不能启用或关闭用户的持久笔记。
-`task_mode_routing` 同样只从全局配置读取，项目配置不能启用它、替换 API 地址或指定密钥。
+`task_mode_routing` 和 `note_routing` 同样只从全局配置读取，项目配置不能启用它们、替换
+API 地址或指定密钥。
 
 **终端界面**：`ui_mode: stream` 是兼容 IDE 控制台的行式输出；`ui_mode: fullscreen`
 启用组件化全屏会话界面。每轮用户输入、执行过程、Markdown 回答、文件变更和统计信息

@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 from tinyCode.config.constants import (
     DEFAULT_HARD_MAX_ROUNDS,
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_NOTE_ROUTING_CONFIDENCE,
+    DEFAULT_NOTE_ROUTING_ENABLED,
+    DEFAULT_NOTE_ROUTING_MODEL,
+    DEFAULT_NOTE_ROUTING_TIMEOUT,
     DEFAULT_NOTES_ENABLED,
     DEFAULT_ROUND_EXTENSION,
     DEFAULT_ROUND_LIMIT_ACTION,
@@ -51,6 +55,17 @@ class TaskModeRoutingConfig(BaseModel):
     llm_fallback: bool = True
 
 
+class NoteRoutingConfig(BaseModel):
+    """Optional Jev gate for selecting auto-note categories to update."""
+
+    enabled: bool = DEFAULT_NOTE_ROUTING_ENABLED
+    api_key: str | None = None
+    base_url: str = "https://api.typesafe.ai"
+    model: str = DEFAULT_NOTE_ROUTING_MODEL
+    confidence_threshold: float = DEFAULT_NOTE_ROUTING_CONFIDENCE
+    timeout_seconds: float = DEFAULT_NOTE_ROUTING_TIMEOUT
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -64,6 +79,7 @@ class AppConfig(BaseModel):
     ui_mode: str = DEFAULT_UI_MODE
     notes_enabled: bool = DEFAULT_NOTES_ENABLED
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    note_routing: NoteRoutingConfig = Field(default_factory=NoteRoutingConfig)
     task_mode_routing: TaskModeRoutingConfig = Field(
         default_factory=TaskModeRoutingConfig,
     )

@@ -11,7 +11,7 @@ from tinyCode.cli import CLIOptions, parse_cli_args
 from tinyCode.config.loader import ConfigError, load_config
 from tinyCode.instructions import InstructionsLoader
 from tinyCode.mcp.manager import MCPManager
-from tinyCode.notes import AutoNoteManager
+from tinyCode.notes import AutoNoteManager, JevNoteRouter
 from tinyCode.hooks import load_hooks, HookEngine, HookEvent
 from tinyCode.skills import SkillLoader, SkillRegistry, SkillTool
 from tinyCode.subagent import RoleLoader, SubAgentRunner, BackgroundTaskManager, SubAgentTool
@@ -224,7 +224,16 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         )
     note_manager: AutoNoteManager | None = None
     if app_config.notes_enabled:
-        note_manager = AutoNoteManager(provider=provider, interval=5)
+        note_router = (
+            JevNoteRouter(app_config.note_routing)
+            if app_config.note_routing.enabled
+            else None
+        )
+        note_manager = AutoNoteManager(
+            provider=provider,
+            interval=5,
+            router=note_router,
+        )
         for error in note_manager.last_errors:
             print(f"笔记初始化: {error}", file=sys.stderr)
 

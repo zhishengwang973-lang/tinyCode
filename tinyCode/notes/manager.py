@@ -1,8 +1,11 @@
 """Auto-note manager — periodic LLM-driven note updates."""
 
+from __future__ import annotations
+
 import asyncio
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tinyCode.notes.categories import (
     PROJECT_CATEGORIES,
@@ -14,6 +17,9 @@ from tinyCode.notes.categories import (
 from tinyCode.providers.base import BaseProvider
 from tinyCode.providers.base import TokenUsage
 from tinyCode.storage.journal import atomic_write_text
+
+if TYPE_CHECKING:
+    from tinyCode.notes.router import JevNoteRouter
 
 
 # Notes are background memory, not a second copy of the entire conversation.
@@ -33,10 +39,12 @@ class AutoNoteManager:
         provider: BaseProvider,
         interval: int = 5,
         cwd: Path | None = None,
+        router: JevNoteRouter | None = None,
     ) -> None:
         self._provider = provider
         self._interval = interval
         self._cwd = (cwd or Path.cwd()).resolve()
+        self._router = router
         self._round_counter = 0
         self._recent_text: list[str] = []
         self.last_update_model_requests = 0
@@ -94,6 +102,28 @@ class AutoNoteManager:
             (get_project_notes_dir(self._cwd) / filename, category)
             for category, filename in PROJECT_CATEGORIES.items()
         ]
+
+        if self._router is not None:
+            self.last_update_model_requests += 1
+            try:
+                decision = await self._router.route(recent)
+                if decision.usage.available:
+                    self.last_update_tokens += decision.usage.total_tokens
+                targets = [
+                    (file_path, category)
+                    for file_path, category in targets
+                    if category in decision.categories
+                ]
+            except Exception as exc:
+                # Routing is an optimization, never a prerequisite for durable
+                # memory. Fall back to the original all-category update path.
+                self.last_errors.append(
+                    f"笔记分类门控: {type(exc).__name__}: {exc}"
+                )
+
+        if not targets:
+            self._recent_text.clear()
+            return results
 
         # Each category is independent. Run the four model requests concurrently
         # so an exit-time update is bounded by the slowest request rather than
