@@ -120,6 +120,15 @@ class MailboxTests(unittest.TestCase):
 
             self.assertFalse((team_dir / "outside.jsonl").exists())
 
+    def test_missing_cursor_after_compaction_returns_retained_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mailbox = Mailbox(Path(tmp), "alice")
+            mailbox.send(TeamMessage(id="new", content="retained"))
+
+            messages = mailbox.read_new("cursor-that-was-compacted")
+
+            self.assertEqual(["retained"], [message.content for message in messages])
+
 
 if __name__ == "__main__":
     unittest.main()

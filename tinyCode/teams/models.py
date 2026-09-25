@@ -72,3 +72,6 @@ class TeamDef:
     members: list[MemberDef] = field(default_factory=list)
     dispatch_mode: bool = False   # double-lock scheduling mode
     max_rounds_per_member: int = 10
+    timeout_seconds: float = 1800.0
+    validation_commands: list[str] = field(default_factory=list)
+    allow_llm_conflict_resolution: bool = False

@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -7,9 +8,93 @@ from unittest.mock import patch
 
 from tinyCode.worktree import manager as worktree_manager
 from tinyCode.worktree.manager import GitWorktreeManager
+from tinyCode.worktree.validator import (
+    dirname_to_name, name_to_branch, name_to_dirname,
+)
 
 
 class GitWorktreeManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_nested_name_worktree_lifecycle(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            for args in (
+                ["git", "init", "-q", "-b", "main"],
+                ["git", "config", "user.email", "tinycode@example.invalid"],
+                ["git", "config", "user.name", "TinyCode Test"],
+            ):
+                subprocess.run(args, cwd=repo, check=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "base"], cwd=repo, check=True,
+            )
+            session_file = Path(tmp) / "session.json"
+            manager = GitWorktreeManager(repo_root=repo)
+            try:
+                info, error = await manager.create("feature/auth")
+                self.assertIsNotNone(info, error)
+                self.assertIn("feature%2Fauth", info.path)
+                self.assertEqual("tinyCode/feature/auth", info.branch)
+
+                with patch.object(worktree_manager, "SESSION_FILE", session_file):
+                    ok, message = await manager.enter("feature/auth")
+                    self.assertTrue(ok, message)
+                    self.assertEqual(Path(info.path).resolve(), Path.cwd().resolve())
+                    ok, message = await manager.exit("feature/auth", force=True)
+
+                self.assertTrue(ok, message)
+                self.assertFalse(Path(info.path).exists())
+            finally:
+                os.chdir(original_cwd)
+
+    def test_nested_and_flat_names_have_distinct_paths_and_branches(self):
+        self.assertNotEqual(name_to_dirname("a/b"), name_to_dirname("a-b"))
+        self.assertNotEqual(name_to_branch("a/b"), name_to_branch("a-b"))
+        self.assertEqual("a/b", dirname_to_name(name_to_dirname("a/b")))
+
+    def test_session_paths_are_scoped_by_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = GitWorktreeManager(repo_root=Path(tmp) / "one")
+            second = GitWorktreeManager(repo_root=Path(tmp) / "two")
+
+            self.assertNotEqual(first._session_path(), second._session_path())
+
+    def test_launch_inside_linked_worktree_finds_main_repository_root(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp) / "main"
+            linked = Path(tmp) / "linked"
+            git_dir = main / ".git" / "worktrees" / "linked"
+            git_dir.mkdir(parents=True)
+            linked.mkdir()
+            (linked / ".git").write_text(
+                f"gitdir: {git_dir}\n", encoding="utf-8",
+            )
+            (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+            try:
+                os.chdir(linked)
+                manager = GitWorktreeManager()
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(main.resolve(), manager.repo_root)
+
+    def test_session_rejects_another_repository_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_file = root / "session.json"
+            session_file.write_text(
+                '{"active_worktree":"","original_cwd":"/tmp",'
+                '"repo_root":"/different/repo"}',
+                encoding="utf-8",
+            )
+            manager = GitWorktreeManager(repo_root=root / "repo")
+
+            with patch.object(worktree_manager, "SESSION_FILE", session_file):
+                self.assertIsNone(manager.load_session())
+
     def test_non_git_directory_reports_worktree_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = GitWorktreeManager(repo_root=Path(tmp))
@@ -37,6 +122,9 @@ class GitWorktreeManagerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 os.chdir(repo_root)
                 manager = GitWorktreeManager(repo_root=repo_root)
+                manager._validate_registered_worktree = unittest.mock.AsyncMock(
+                    return_value=(True, ""),
+                )
 
                 with patch.object(worktree_manager, "SESSION_FILE", session_file):
                     ok, msg = await manager.enter("feature")
@@ -78,6 +166,38 @@ class GitWorktreeManagerTests(unittest.IsolatedAsyncioTestCase):
             worktrees = await manager.list_worktrees()
 
             self.assertEqual([str(managed)], [wt.path for wt in worktrees])
+
+    async def test_list_worktrees_populates_dirty_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            managed = repo_root / ".tinyCode" / "worktrees" / "feature"
+            managed.mkdir(parents=True)
+            manager = GitWorktreeManager(repo_root=repo_root)
+            manager._git = unittest.mock.AsyncMock(return_value=(
+                0,
+                f"worktree {managed}\nHEAD abc\nbranch refs/heads/tinyCode/feature\n",
+                "",
+            ))
+            manager._has_changes = unittest.mock.AsyncMock(return_value=True)
+
+            worktrees = await manager.list_worktrees()
+
+            self.assertTrue(worktrees[0].has_changes)
+
+    async def test_enter_rejects_directory_from_another_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            target = repo_root / ".tinyCode" / "worktrees" / "feature"
+            target.mkdir(parents=True)
+            manager = GitWorktreeManager(repo_root=repo_root)
+            manager._validate_registered_worktree = unittest.mock.AsyncMock(
+                return_value=(False, "目录属于另一个 Git 仓库，已拒绝进入"),
+            )
+
+            ok, message = await manager.enter("feature")
+
+            self.assertFalse(ok)
+            self.assertIn("另一个 Git 仓库", message)
 
     async def test_remove_stale_keeps_recent_and_dirty_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -197,6 +317,9 @@ class GitWorktreeManagerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 os.chdir(repo_root)
                 manager = GitWorktreeManager(repo_root=repo_root)
+                manager._validate_registered_worktree = unittest.mock.AsyncMock(
+                    return_value=(True, ""),
+                )
                 with patch.object(worktree_manager, "SESSION_FILE", session_file):
                     ok, message = await manager.enter("feature")
 

@@ -8,6 +8,8 @@ from tinyCode.teams.models import MessageType, TeamMessage
 
 
 _MEMBER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+MAX_MAILBOX_BYTES = 5_000_000
+MAILBOX_RETAIN_BYTES = 2_000_000
 
 
 def _validate_member_name(member_name: str) -> str:
@@ -27,7 +29,9 @@ class Mailbox:
 
     def send(self, msg: TeamMessage) -> None:
         target_name = msg.to_member or self._member_name
-        with open(self._file_for(target_name), "a", encoding="utf-8") as f:
+        target = self._file_for(target_name)
+        self._compact_if_needed(target)
+        with open(target, "a", encoding="utf-8") as f:
             f.write(json.dumps({
                 "id": msg.id, "from": msg.from_member, "to": msg.to_member,
                 "type": msg.msg_type.value, "content": msg.content,
@@ -40,6 +44,7 @@ class Mailbox:
             return []
         messages: list[TeamMessage] = []
         found_since = not since_id
+        parsed: list[TeamMessage] = []
         try:
             # A partially written or externally damaged JSONL file must not
             # terminate an otherwise healthy team run.  Replacement decoding
@@ -58,11 +63,7 @@ class Mailbox:
                     msg_id = data.get("id", "")
                     if not isinstance(msg_id, str) or not msg_id:
                         continue
-                    if not found_since:
-                        if msg_id == since_id:
-                            found_since = True
-                        continue
-                    messages.append(TeamMessage(
+                    message = TeamMessage(
                         id=msg_id,
                         from_member=self._text(data.get("from")),
                         to_member=self._text(data.get("to")),
@@ -70,10 +71,18 @@ class Mailbox:
                         content=self._text(data.get("content")),
                         summary=self._text(data.get("summary")),
                         timestamp=self._text(data.get("timestamp")),
-                    ))
+                    )
+                    parsed.append(message)
+                    if not found_since:
+                        if msg_id == since_id:
+                            found_since = True
+                        continue
+                    messages.append(message)
         except OSError:
             return []
-        return messages
+        # Compaction may remove the cursor row. Returning the retained messages
+        # is safer than permanently starving the recipient.
+        return messages if found_since else parsed
 
     def broadcast(self, msg: TeamMessage, all_members: list[str]) -> None:
         """Send *msg* to every member's mailbox."""
@@ -92,6 +101,23 @@ class Mailbox:
 
     def _file_for(self, member_name: str) -> Path:
         return self._dir / f"{_validate_member_name(member_name)}.jsonl"
+
+    @staticmethod
+    def _compact_if_needed(path: Path) -> None:
+        try:
+            if not path.exists() or path.stat().st_size <= MAX_MAILBOX_BYTES:
+                return
+            with open(path, "rb") as handle:
+                handle.seek(max(0, path.stat().st_size - MAILBOX_RETAIN_BYTES))
+                tail = handle.read()
+            newline = tail.find(b"\n")
+            if newline >= 0:
+                tail = tail[newline + 1:]
+            from tinyCode.storage.journal import atomic_write_text
+            atomic_write_text(path, tail.decode("utf-8", errors="ignore"))
+        except OSError:
+            # Delivery should still be attempted when best-effort compaction fails.
+            return
 
     @staticmethod
     def _parse_message_type(value: object) -> MessageType:

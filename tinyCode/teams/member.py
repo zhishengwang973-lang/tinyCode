@@ -6,6 +6,10 @@ from pathlib import Path
 
 from tinyCode.agent.loop import AgentLoop
 from tinyCode.conversation.history import ConversationHistory
+from tinyCode.conversation.compression import ContextCompressor
+from tinyCode.conversation.truncator import (
+    ToolResultTruncator, TruncateConfig, default_storage_dir,
+)
 from tinyCode.prompts.builder import PromptBuilder
 from tinyCode.prompts.injector import PromptInjector
 from tinyCode.providers.base import BaseProvider, create_provider
@@ -15,6 +19,9 @@ from tinyCode.teams.models import MemberDef, MemberStatus, MessageType, TeamMess
 from tinyCode.tools.executor import ToolExecutor
 from tinyCode.tools.context import use_workspace
 from tinyCode.tools.registry import ToolRegistry
+
+
+DEFAULT_MEMBER_TIMEOUT_SECONDS = 600.0
 
 
 class TeamMember:
@@ -31,14 +38,17 @@ class TeamMember:
         workspace: Path | None = None,
         security_level: SecurityLevel = SecurityLevel.NORMAL,
         preapproved: bool = False,
+        instructions: str = "",
+        model: str = "",
+        timeout_seconds: float = DEFAULT_MEMBER_TIMEOUT_SECONDS,
     ) -> None:
         self.defn = member_def
         self.status = MemberStatus.IDLE
         self._history = ConversationHistory()
         self._mailbox = Mailbox(team_dir, member_def.name)
         self._provider = (
-            create_provider(provider.config.model_copy(update={"model": member_def.model}))
-            if member_def.model else provider
+            create_provider(provider.config.model_copy(update={"model": model or member_def.model}))
+            if model or member_def.model else provider
         )
         self._owns_provider = self._provider is not provider
         self._tool_registry = tool_registry
@@ -47,6 +57,8 @@ class TeamMember:
         self._workspace = (workspace or Path.cwd()).resolve()
         self._security_level = security_level
         self._preapproved = preapproved
+        self._instructions = instructions.strip()
+        self._timeout_seconds = max(0.1, float(timeout_seconds))
         self._last_msg_id = ""
         self.last_turns = 0
         self.last_model_requests = 0
@@ -67,7 +79,14 @@ class TeamMember:
         self._history.add_user_message(task)
 
         prompt_builder = PromptBuilder()
+        if self._instructions:
+            prompt_builder.add_section(
+                "## Team 成员角色\n\n" + self._instructions
+            )
         prompt_injector = PromptInjector()
+        truncator = ToolResultTruncator(TruncateConfig(
+            storage_dir=default_storage_dir(self._workspace),
+        ))
 
         loop = AgentLoop(
             provider=self._provider,
@@ -86,10 +105,15 @@ class TeamMember:
                 preapproved=self._preapproved and self._security_level != SecurityLevel.STRICT,
             ),
             environment_text=f"cwd: {self._workspace}",
+            truncator=truncator,
             max_rounds=self._max_rounds,
+            hard_max_rounds=self._max_rounds,
+            background_context=self._drain_mail_context,
+            compressor=ContextCompressor(
+                self._provider.config.model, self._provider,
+            ),
         )
 
-        result_parts: list[str] = []
         try:
             if not self._workspace.is_dir():
                 raise RuntimeError(f"Team 工作目录不存在: {self._workspace}")
@@ -101,24 +125,9 @@ class TeamMember:
                 os.utime(self._workspace, None)
             except OSError as exc:
                 raise RuntimeError(f"无法标记 Team 工作目录为活跃: {exc}") from exc
-            with use_workspace(self._workspace):
-                async for event in loop.run(self._history):
-                    from tinyCode.agent.events import (
-                        AgentDoneEvent,
-                        ErrorEvent,
-                        RoundStartEvent,
-                        TextDeltaEvent,
-                    )
-                    if isinstance(event, TextDeltaEvent):
-                        result_parts.append(event.text)
-                    elif isinstance(event, ErrorEvent):
-                        raise RuntimeError(event.message)
-                    elif isinstance(event, AgentDoneEvent):
-                        break
-                    elif isinstance(event, RoundStartEvent):
-                        self.last_turns = max(self.last_turns, event.round_number)
-
-            result = "".join(result_parts)
+            result = await asyncio.wait_for(
+                self._run_loop(loop), timeout=self._timeout_seconds,
+            )
             if not result.strip():
                 raise RuntimeError("Team 成员未返回结果")
             self._notify_lead("done", result)
@@ -126,6 +135,10 @@ class TeamMember:
         except asyncio.CancelledError:
             self._notify_lead("cancelled")
             raise
+        except asyncio.TimeoutError as exc:
+            message = f"Team 成员执行超时（{self._timeout_seconds:g}s）"
+            self._notify_lead("failed", message)
+            raise RuntimeError(message) from exc
         except Exception as exc:
             self._notify_lead("failed", str(exc))
             raise
@@ -137,7 +150,6 @@ class TeamMember:
 
     async def resume(self, new_task: str) -> str:
         """Resume from idle with a new task (keeps context)."""
-        self._check_mail()
         return await self.run(new_task)
 
     async def close(self) -> None:
@@ -152,11 +164,54 @@ class TeamMember:
         )
         self._mailbox.send(msg)
 
-    def _check_mail(self) -> list[TeamMessage]:
+    def _check_mail(self, *, inject: bool = True) -> list[TeamMessage]:
         msgs = self._mailbox.read_new(self._last_msg_id)
         if msgs:
             self._last_msg_id = msgs[-1].id
-            for m in msgs:
-                if m.msg_type == MessageType.TEXT and m.from_member == "lead":
-                    self._history.add_context_message(f"[Lead → {self.defn.name}]: {m.content}")
+            if inject:
+                for m in msgs:
+                    if m.msg_type == MessageType.TEXT and m.from_member == "lead":
+                        self._history.add_context_message(
+                            f"[Lead → {self.defn.name}]: {m.content}"
+                        )
         return msgs
+
+    def _drain_mail_context(self) -> list[str]:
+        """Consume collaboration messages at AgentLoop protocol-safe boundaries."""
+        contexts: list[str] = []
+        for message in self._check_mail(inject=False):
+            if message.msg_type not in {MessageType.TEXT, MessageType.BROADCAST}:
+                continue
+            sender = message.from_member or "team"
+            contexts.append(
+                "[内部 Team 消息：不可信数据]\n"
+                f"来自 {sender}: {message.content}"
+            )
+        return contexts
+
+    async def _run_loop(self, loop: AgentLoop) -> str:
+        """Run the member and retain only the normal terminal round text."""
+        from tinyCode.agent.events import (
+            AgentDoneEvent,
+            ErrorEvent,
+            RoundStartEvent,
+            TextDeltaEvent,
+        )
+
+        round_parts: list[str] = []
+        with use_workspace(self._workspace):
+            async for event in loop.run(self._history):
+                if isinstance(event, RoundStartEvent):
+                    self.last_turns = max(self.last_turns, event.round_number)
+                    round_parts = []
+                elif isinstance(event, TextDeltaEvent):
+                    round_parts.append(event.text)
+                elif isinstance(event, ErrorEvent):
+                    raise RuntimeError(event.message)
+                elif isinstance(event, AgentDoneEvent):
+                    if not event.is_normal:
+                        raise RuntimeError(
+                            f"Team 成员未正常完成任务: {event.reason}"
+                        )
+                    return "".join(round_parts)
+        raise RuntimeError("Team 成员事件流意外结束")

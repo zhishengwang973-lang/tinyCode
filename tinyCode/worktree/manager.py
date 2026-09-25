@@ -1,19 +1,29 @@
 """Git worktree manager — create, enter, exit, delete with full lifecycle."""
 
 import asyncio
+import hashlib
+import json
 import os
 import re
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from tinyCode.tools.run_command import _read_limited, _terminate_process
 from tinyCode.worktree.models import WorktreeInfo
-from tinyCode.worktree.validator import name_to_branch, name_to_dirname, validate_name
+from tinyCode.worktree.validator import (
+    dirname_to_name,
+    legacy_name_to_dirname,
+    name_to_branch,
+    name_to_dirname,
+    resolve_worktree_path,
+    validate_name,
+)
 
 WORKTREES_DIR = ".tinyCode"  # relative to repo root
-SESSION_FILE = Path.home() / ".tinyCode" / "worktree_session.json"
+_LEGACY_SESSION_FILE = Path.home() / ".tinyCode" / "worktree_session.json"
+# Kept as a patchable compatibility hook for integrations and tests.
+SESSION_FILE = _LEGACY_SESSION_FILE
 
 
 class GitWorktreeManager:
@@ -41,6 +51,17 @@ class GitWorktreeManager:
 
         dir_name = name_to_dirname(name)
         target_path = self._worktrees_dir / dir_name
+        legacy_path = self._worktrees_dir / legacy_name_to_dirname(name)
+        if (
+            recover
+            and "/" in name
+            and not target_path.exists()
+            and legacy_path.exists()
+        ):
+            return None, (
+                "检测到旧版扁平 Worktree 目录，但其原始名称存在歧义。"
+                f"请使用扁平名称 '{legacy_path.name}' 进入，或先手动迁移。"
+            )
         branch_name = branch or name_to_branch(name)
 
         # Fast recovery: directory exists
@@ -62,7 +83,7 @@ class GitWorktreeManager:
                     return None, f"无法恢复已有目录: {detail}"
                 head = self._read_head(target_path)
                 info = WorktreeInfo(
-                    name=name, path=str(target_path), branch=branch_name,
+                    name=name, path=str(target_path), branch=actual_branch.strip(),
                     head_commit=head, created_at="recovered",
                 )
                 return info, ""
@@ -94,10 +115,14 @@ class GitWorktreeManager:
         previous_cwd = Path.cwd()
         if name:
             original_cwd = self._current_original_cwd()
-            dir_name = name_to_dirname(name)
-            target_path = self._worktrees_dir / dir_name
+            target_path = resolve_worktree_path(self._repo_root, name)
             if not target_path.exists():
                 return False, f"工作目录不存在: {target_path}"
+            valid_target, target_error = await self._validate_registered_worktree(
+                target_path,
+            )
+            if not valid_target:
+                return False, target_error
             try:
                 # Mark it as recently used before switching.  A cleaner from
                 # this or another TinyCode process must not treat an old,
@@ -137,9 +162,11 @@ class GitWorktreeManager:
         """Exit a worktree and optionally remove it."""
         if not name:
             return False, "未指定工作目录名"
+        ok, error = validate_name(name)
+        if not ok:
+            return False, error
 
-        dir_name = name_to_dirname(name)
-        target_path = self._worktrees_dir / dir_name
+        target_path = resolve_worktree_path(self._repo_root, name)
 
         if not target_path.exists():
             return False, f"工作目录不存在: {target_path}"
@@ -197,7 +224,7 @@ class GitWorktreeManager:
 
         results: list[WorktreeInfo] = []
         active_path = (
-            self._worktrees_dir / name_to_dirname(self._active)
+            resolve_worktree_path(self._repo_root, self._active)
             if self._active else None
         )
         for block in out.strip().split("\n\n"):
@@ -208,6 +235,12 @@ class GitWorktreeManager:
                 if active_path is not None:
                     info.is_active = Path(info.path).resolve() == active_path.resolve()
                 results.append(info)
+        if results:
+            dirty_states = await asyncio.gather(*(
+                self._has_changes(Path(info.path)) for info in results
+            ))
+            for info, dirty in zip(results, dirty_states):
+                info.has_changes = dirty
         return results
 
     async def status(self, name: str = "") -> WorktreeInfo | None:
@@ -216,9 +249,11 @@ class GitWorktreeManager:
             name = self._active
         if not name:
             return None
+        ok, _ = validate_name(name)
+        if not ok:
+            return None
 
-        dir_name = name_to_dirname(name)
-        target_path = self._worktrees_dir / dir_name
+        target_path = resolve_worktree_path(self._repo_root, name)
         if not target_path.exists():
             return None
 
@@ -243,8 +278,9 @@ class GitWorktreeManager:
         removed: list[str] = []
         cutoff = time.time() - max_age_hours * 3600
         worktrees = await self.list_worktrees()
+        protected_names = self._active_session_names()
         for wt in worktrees:
-            if wt.is_active:
+            if wt.is_active or wt.name in protected_names:
                 continue
             path = Path(wt.path)
             try:
@@ -305,11 +341,16 @@ class GitWorktreeManager:
 
     def load_session(self) -> dict[str, str] | None:
         """Load and validate the persisted worktree session."""
-        import json
-        if not SESSION_FILE.exists():
-            return None
+        session_path = self._session_path()
+        if not session_path.exists():
+            # Safely migrate the old global file only when it clearly points to
+            # a worktree owned by this repository.
+            if SESSION_FILE == _LEGACY_SESSION_FILE and _LEGACY_SESSION_FILE.exists():
+                session_path = _LEGACY_SESSION_FILE
+            else:
+                return None
         try:
-            value = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+            value = json.loads(session_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(value, dict):
@@ -318,7 +359,57 @@ class GitWorktreeManager:
         original = value.get("original_cwd", "")
         if not isinstance(active, str) or not isinstance(original, str):
             return None
+        stored_root = value.get("repo_root", "")
+        if stored_root and (
+            not isinstance(stored_root, str)
+            or Path(stored_root).resolve() != self._repo_root
+        ):
+            return None
+        if active:
+            ok, _ = validate_name(active)
+            if not ok or not resolve_worktree_path(self._repo_root, active).exists():
+                return None
+        if session_path == _LEGACY_SESSION_FILE and SESSION_FILE == _LEGACY_SESSION_FILE:
+            try:
+                original_path = Path(original).resolve()
+                original_path.relative_to(self._repo_root)
+            except (OSError, ValueError):
+                return None
         return {"active_worktree": active, "original_cwd": original}
+
+    def _session_path(self) -> Path:
+        if SESSION_FILE != _LEGACY_SESSION_FILE:
+            return SESSION_FILE
+        identity = hashlib.sha256(
+            str(self._repo_root).encode("utf-8")
+        ).hexdigest()[:16]
+        return Path.home() / ".tinyCode" / "worktree_sessions" / f"{identity}.json"
+
+    def _active_session_names(self) -> set[str]:
+        """Return active names persisted by this or another TinyCode process."""
+        names: set[str] = set()
+        directory = Path.home() / ".tinyCode" / "worktree_sessions"
+        try:
+            candidates = list(directory.glob("*.json"))
+        except OSError:
+            return names
+        for path in candidates:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            stored_root = value.get("repo_root")
+            active = value.get("active_worktree")
+            if (
+                isinstance(stored_root, str)
+                and isinstance(active, str)
+                and active
+                and Path(stored_root).resolve() == self._repo_root
+            ):
+                names.add(active)
+        return names
 
     def _is_managed_worktree_path(self, path: Path) -> bool:
         try:
@@ -332,7 +423,25 @@ class GitWorktreeManager:
         """Walk up from cwd to find the git repo root."""
         d = Path.cwd()
         while d != d.parent:
-            if (d / ".git").exists():
+            git_marker = d / ".git"
+            if git_marker.is_dir():
+                return d
+            if git_marker.is_file():
+                try:
+                    raw = git_marker.read_text(encoding="utf-8").strip()
+                    git_dir = Path(raw.split(":", 1)[1].strip())
+                    if not git_dir.is_absolute():
+                        git_dir = (d / git_dir).resolve()
+                    common_file = git_dir / "commondir"
+                    if common_file.is_file():
+                        common = Path(
+                            common_file.read_text(encoding="utf-8").strip()
+                        )
+                        if not common.is_absolute():
+                            common = (git_dir / common).resolve()
+                        return common.parent
+                except (IndexError, OSError, UnicodeError):
+                    return d
                 return d
             d = d.parent
         return Path.cwd()
@@ -412,7 +521,7 @@ class GitWorktreeManager:
         path = info["path"]
         # Flattening '/' to '-' is intentionally not reversed: doing so turned
         # legitimate hyphens into fake nested names and made lookups lossy.
-        name = Path(path).name
+        name = dirname_to_name(Path(path).name)
         return WorktreeInfo(
             name=name, path=path, branch=branch,
             head_commit=info.get("head", ""),
@@ -421,16 +530,37 @@ class GitWorktreeManager:
     # -- session persistence --------------------------------------------------
 
     def _save_session(self, name: str, original_cwd: str = "") -> None:
-        import json
         from tinyCode.storage.sessions import _atomic_write_text
         session = {
             "active_worktree": name,
             "original_cwd": original_cwd or str(self._repo_root),
+            "repo_root": str(self._repo_root),
         }
-        _atomic_write_text(SESSION_FILE, json.dumps(session, indent=2))
+        _atomic_write_text(self._session_path(), json.dumps(session, indent=2))
 
     def _current_original_cwd(self) -> str:
         session = self.load_session()
         if session and session.get("active_worktree") and session.get("original_cwd"):
             return session["original_cwd"]
         return str(Path.cwd())
+
+    async def _validate_registered_worktree(
+        self, target_path: Path,
+    ) -> tuple[bool, str]:
+        code, top, err = await self._git(
+            "-C", str(target_path), "rev-parse", "--show-toplevel",
+        )
+        if code != 0 or Path(top.strip()).resolve() != target_path.resolve():
+            return False, f"目录不是有效 Git worktree: {err or target_path}"
+        code, common, err = await self._git(
+            "-C", str(target_path), "rev-parse", "--git-common-dir",
+        )
+        if code != 0:
+            return False, f"无法验证 Git worktree 归属: {err}"
+        common_path = Path(common.strip())
+        if not common_path.is_absolute():
+            common_path = (target_path / common_path).resolve()
+        expected = (self._repo_root / ".git").resolve()
+        if common_path.resolve() != expected:
+            return False, "目录属于另一个 Git 仓库，已拒绝进入"
+        return True, ""

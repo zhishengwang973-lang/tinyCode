@@ -1,11 +1,13 @@
 """Team orchestration service — builds and runs LeadAgent from a team name."""
 
+import asyncio
 import os
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from tinyCode.teams.lead import LeadAgent
+from tinyCode.teams.lease import TeamRunLease
 from tinyCode.teams.mailbox import Mailbox
 from tinyCode.teams.member import TeamMember
 from tinyCode.teams.merger import GitMerger
@@ -13,9 +15,14 @@ from tinyCode.teams.persistence import get_team_dir, load_team_def
 from tinyCode.teams.scheduler import DispatchScheduler
 from tinyCode.teams.tasks import SharedTaskList
 from tinyCode.teams.tools import create_team_tools
+from tinyCode.subagent.filter import ToolFilter
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tools.base import ToolCategory
+from tinyCode.tools.tool_result_read import ToolResultReadTool
+from tinyCode.tools.tool_result_search import ToolResultSearchTool
+from tinyCode.conversation.truncator import default_storage_dir
 from tinyCode.security import SecurityLevel
-from tinyCode.worktree.validator import name_to_dirname, validate_name
+from tinyCode.worktree.validator import resolve_worktree_path, validate_name
 
 
 async def run_team(
@@ -55,41 +62,92 @@ async def run_team(
     root = (repo_root or Path.cwd()).resolve()
     member_names = [member.name for member in team_def.members]
     members: dict[str, TeamMember] = {}
+    merge_service = merger or GitMerger(
+        provider,
+        root,
+        allow_llm_conflicts=team_def.allow_llm_conflict_resolution,
+    )
+    worktree_baselines: dict[str, dict[str, str]] = {}
     for member in team_def.members:
         workspace = root
         if member.worktree:
             valid, error = validate_name(member.worktree)
             if not valid:
                 return f"Team 成员 '{member.name}' 的 worktree 无效: {error}"
-            workspace = root / ".tinyCode" / "worktrees" / name_to_dirname(member.worktree)
+            workspace = resolve_worktree_path(root, member.worktree)
             if not workspace.is_dir():
                 return f"Team 成员 '{member.name}' 的 worktree 不存在: {workspace}"
             try:
                 os.utime(workspace, None)
             except OSError as exc:
                 return f"Team 成员 '{member.name}' 的 worktree 无法标记为活跃: {exc}"
+            inspect_worktree = getattr(merge_service, "inspect_worktree", None)
+            if inspect_worktree is not None:
+                baseline_ok, baseline = await inspect_worktree(workspace)
+                if not baseline_ok:
+                    return (
+                        f"Team 成员 '{member.name}' 的 worktree 无法作为安全基线: "
+                        f"{baseline}"
+                    )
+                if isinstance(baseline, dict):
+                    worktree_baselines[member.name] = baseline
 
         # Each member gets its own registry so collaboration tools can be
         # bound to that member without mutating the main agent's registry.
+        role = (roles or {}).get(member.role)
+        parent_tools = [tool.name for tool in tool_registry.list_tools()]
+        read_tools = {
+            tool.name for tool in tool_registry.list_tools()
+            if tool.category == ToolCategory.READ
+        }
+        allowed_tools = set(ToolFilter(
+            role,
+            parent_tools=parent_tools,
+            read_tools=read_tools,
+        ).filter(parent_tools))
+
         member_registry = ToolRegistry()
         for tool in tool_registry.list_tools():
             if tool.name in {
                 "sub_agent", "skill_loader", "request_user_input",
-            } or tool.name.startswith("team_"):
+            } or tool.name.startswith("team_") or tool.name not in allowed_tools:
                 continue
-            member_registry.register(tool)
+            if tool.name == "tool_result_read":
+                member_registry.register(ToolResultReadTool(default_storage_dir(workspace)))
+            elif tool.name == "tool_result_search":
+                member_registry.register(ToolResultSearchTool(default_storage_dir(workspace)))
+            else:
+                member_registry.register(tool)
         mailbox = Mailbox(team_dir, member.name)
         for team_tool in create_team_tools(
             team_dir, task_list, mailbox, member.name, member_names,
         ):
             member_registry.register(team_tool)
 
-        role = (roles or {}).get(member.role)
         permission_name = getattr(role, "permission", "normal")
         try:
             member_security_level = SecurityLevel(permission_name)
         except ValueError:
             member_security_level = SecurityLevel.NORMAL
+
+        role_max_rounds = getattr(role, "max_rounds", team_def.max_rounds_per_member)
+        if not isinstance(role_max_rounds, int) or isinstance(role_max_rounds, bool):
+            role_max_rounds = team_def.max_rounds_per_member
+        member_max_rounds = max(
+            1, min(team_def.max_rounds_per_member, role_max_rounds),
+        )
+        role_timeout = getattr(role, "timeout_seconds", 600.0)
+        if (
+            isinstance(role_timeout, bool)
+            or not isinstance(role_timeout, (int, float))
+            or role_timeout <= 0
+        ):
+            role_timeout = 600.0
+        role_prompt = getattr(role, "system_prompt", "")
+        role_model = getattr(role, "model", "")
+        effective_model = member.model or (
+            role_model if isinstance(role_model, str) else ""
+        )
 
         members[member.name] = TeamMember(
             member_def=member,
@@ -97,22 +155,40 @@ async def run_team(
             provider=provider,
             tool_registry=member_registry,
             tool_executor=tool_executor,
-            max_rounds=team_def.max_rounds_per_member,
+            max_rounds=member_max_rounds,
             workspace=workspace,
             security_level=member_security_level,
             preapproved=preapproved,
+            instructions=role_prompt if isinstance(role_prompt, str) else "",
+            model=effective_model,
+            timeout_seconds=float(role_timeout),
         )
-    lead = LeadAgent(
-        team_def=team_def,
-        team_dir=team_dir,
-        members=members,
-        task_list=task_list,
-        merger=merger or GitMerger(provider, root),
-        provider=provider,
-        lead_instructions=_lead_instructions(team_def, roles),
-        progress=progress,
-    )
-    return await lead.execute(goal)
+    lease = TeamRunLease(team_dir)
+    lease_ok, lease_error = lease.acquire()
+    if not lease_ok:
+        return lease_error
+    try:
+        task_list.reconcile_interrupted()
+        lead = LeadAgent(
+            team_def=team_def,
+            team_dir=team_dir,
+            members=members,
+            task_list=task_list,
+            merger=merge_service,
+            provider=provider,
+            lead_instructions=_lead_instructions(team_def, roles),
+            progress=progress,
+            worktree_baselines=worktree_baselines,
+            validation_commands=team_def.validation_commands,
+        )
+        try:
+            return await asyncio.wait_for(
+                lead.execute(goal), timeout=team_def.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return f"Team 执行超过总时限 {team_def.timeout_seconds:g}s，已安全取消运行中的成员"
+    finally:
+        lease.release()
 
 
 def _lead_instructions(team_def, roles: dict[str, Any] | None) -> str:

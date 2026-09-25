@@ -48,8 +48,15 @@ def create(
             branch = args[2] if len(args) > 2 else ""
             info, err = await manager.create(name, branch)
             if info:
-                initializer.initialize(Path(info.path))
-                return f"工作目录已创建: {info.name}\n路径: {info.path}\n分支: {info.branch}"
+                init_logs = initializer.initialize(Path(info.path))
+                details = (
+                    "\n初始化:\n" + "\n".join(f"  {line}" for line in init_logs)
+                    if init_logs else ""
+                )
+                return (
+                    f"工作目录已创建: {info.name}\n路径: {info.path}\n"
+                    f"分支: {info.branch}{details}"
+                )
             return f"创建失败: {err}"
 
         elif sub == "enter":

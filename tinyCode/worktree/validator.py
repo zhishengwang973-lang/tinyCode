@@ -1,6 +1,8 @@
 """Worktree name validator — strict character set, length, traversal prevention."""
 
 import re
+from pathlib import Path
+from urllib.parse import quote, unquote
 
 #: Allowed characters per segment
 _SEGMENT_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -37,11 +39,26 @@ def validate_name(name: str) -> tuple[bool, str]:
 def name_to_branch(name: str) -> str:
     """Convert a worktree name to a git branch name.
 
-    ``/`` → ``-``, prefix with ``tinyCode/``.
+    Preserve validated path segments so distinct names remain distinct.
     """
-    return "tinyCode/" + name.replace("/", "-")
+    return "tinyCode/" + name
 
 
 def name_to_dirname(name: str) -> str:
-    """Convert a worktree name to a subdirectory name."""
+    """Convert a worktree name to one collision-free subdirectory name."""
+    return quote(name, safe="-_")
+
+
+def dirname_to_name(dirname: str) -> str:
+    """Decode a directory name produced by :func:`name_to_dirname`."""
+    return unquote(dirname)
+
+
+def legacy_name_to_dirname(name: str) -> str:
+    """Return the pre-encoding directory name for recovery compatibility."""
     return name.replace("/", "-")
+
+
+def resolve_worktree_path(repo_root: Path, name: str) -> Path:
+    """Resolve the collision-free managed path for a validated name."""
+    return repo_root / ".tinyCode" / "worktrees" / name_to_dirname(name)

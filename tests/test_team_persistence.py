@@ -71,6 +71,26 @@ class TeamPersistenceTests(unittest.TestCase):
             with patch.object(persistence, "USER_TEAMS_DIR", user_dir):
                 self.assertIsNone(persistence.load_team_def("alpha"))
 
+    def test_load_team_def_parses_resilience_and_merge_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp)
+            (user_dir / "alpha.json").write_text(
+                json.dumps({
+                    "members": [{"name": "alice"}],
+                    "timeout_seconds": 900,
+                    "validation_commands": ["python3 -m unittest"],
+                    "allow_llm_conflict_resolution": True,
+                }),
+                encoding="utf-8",
+            )
+
+            with patch.object(persistence, "USER_TEAMS_DIR", user_dir):
+                team = persistence.load_team_def("alpha")
+
+            self.assertEqual(900.0, team.timeout_seconds)
+            self.assertEqual(["python3 -m unittest"], team.validation_commands)
+            self.assertTrue(team.allow_llm_conflict_resolution)
+
 
 if __name__ == "__main__":
     unittest.main()

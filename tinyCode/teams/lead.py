@@ -11,7 +11,7 @@ from typing import Any
 
 from tinyCode.teams.mailbox import Mailbox
 from tinyCode.teams.member import TeamMember
-from tinyCode.teams.models import MemberDef, MemberStatus, MessageType, TaskStatus, TeamDef, TeamMessage
+from tinyCode.teams.models import MessageType, TaskStatus, TeamDef, TeamMessage
 from tinyCode.teams.tasks import SharedTaskList
 from tinyCode.providers.base import TokenUsage
 
@@ -34,6 +34,8 @@ class LeadAgent:
         provider: Any = None,
         lead_instructions: str = "",
         progress: Callable[[str], Awaitable[None] | None] | None = None,
+        worktree_baselines: dict[str, dict[str, str]] | None = None,
+        validation_commands: list[str] | None = None,
     ) -> None:
         self._def = team_def
         self._dir = team_dir
@@ -43,7 +45,11 @@ class LeadAgent:
         self._provider = provider
         self._lead_instructions = lead_instructions.strip()
         self._progress = progress
+        self._worktree_baselines = worktree_baselines or {}
+        self._validation_commands = validation_commands or []
         self._mailbox = Mailbox(team_dir, "lead")
+        self._last_mail_id = ""
+        self._member_reports: list[str] = []
         self._active = True
         self._run_id = ""
         self._running: set[asyncio.Task] = set()
@@ -54,6 +60,7 @@ class LeadAgent:
         self._member_model_requests = 0
         self._member_tokens = 0
         self._member_tokens_available = False
+        self._merge_failed = False
 
     # -- public API -----------------------------------------------------------
 
@@ -70,14 +77,30 @@ class LeadAgent:
                 f"已创建 {len(self._current_tasks())} 个任务，开始并行执行"
             )
             await self._dispatch_loop()
+            self._drain_lead_mail()
 
             await self._emit_progress("成员任务结束，开始验证并合并工作树")
             merge_results = await self._merge_all()
 
             await self._emit_progress("Team 执行结束")
+            has_task_failure = any(
+                task.status == TaskStatus.FAILED for task in self._current_tasks()
+            )
+            heading = (
+                "## Team 部分完成"
+                if has_task_failure or self._merge_failed
+                else "## Team 执行完成"
+            )
+            reports = (
+                "\n成员消息:\n" + "\n".join(
+                    f"- {report}" for report in self._member_reports[-20:]
+                )
+                if self._member_reports else ""
+            )
             return (
-                f"## Team 执行完成\n\n{merge_results}\n\n"
+                f"{heading}\n\n{merge_results}\n\n"
                 f"任务统计: {self._task_summary()}\n{self._metrics_summary()}"
+                f"{reports}"
             )
         finally:
             running = list(self._running)
@@ -137,7 +160,9 @@ class LeadAgent:
             "可独立验收的任务，并为每个任务指定最合适的成员。"
             "只输出 JSON 数组，不要 Markdown。每项必须包含 name、description、"
             "member、depends_on；depends_on 是此前任务的零基索引数组。"
-            "不要让多个成员重复实现同一内容。\n"
+            "description 必须明确目标、验收条件以及独占的文件或模块范围；"
+            "无法划分独占写入范围的任务应标记为只读分析。"
+            "不要让多个成员修改重叠文件或重复实现同一内容。\n"
             f"成员: {json.dumps(members, ensure_ascii=False)}\n"
             f"目标: {goal}{lead_context}"
         )
@@ -209,9 +234,9 @@ class LeadAgent:
 
     def _fallback_plan(self, goal: str) -> list[dict[str, Any]]:
         scopes = [
-            "负责核心分析与主要实现；先检查现状，再完成可运行的修改并自测",
-            "负责复现问题、边界条件和自动化测试；修复发现的独立缺陷",
-            "负责集成审查、兼容性、文档与最终验收；修复遗漏问题",
+            "负责核心分析与主要实现；先声明独占文件范围，再完成修改并自测",
+            "负责只读复现、边界分析和测试方案；除非获得独占文件范围，不修改核心实现",
+            "负责只读集成审查、兼容性和最终验收；报告遗漏，不修改其他成员负责的文件",
         ]
         plan: list[dict[str, Any]] = []
         for index, member in enumerate(self._def.members):
@@ -229,6 +254,7 @@ class LeadAgent:
         """Incrementally dispatch ready tasks to idle members."""
         running_by_member: dict[str, asyncio.Task] = {}
         while self._active:
+            self._drain_lead_mail()
             ready = [task for task in self._tasks.ready_tasks() if self._is_current(task)]
             idle = [
                 member for member in self._members.values()
@@ -283,6 +309,7 @@ class LeadAgent:
                 )
                 running_by_member.pop(member_name)
                 await finished
+            self._drain_lead_mail()
 
     async def _run_member_task(self, member: TeamMember, task) -> None:
         try:
@@ -318,20 +345,68 @@ class LeadAgent:
                 task for task in self._current_tasks()
                 if task.assigned_to == name
             ]
+            if not member_tasks:
+                results.append(f"  {name}: 本轮未分配任务，已跳过合并")
+                continue
             if any(task.status == TaskStatus.FAILED for task in member_tasks):
+                self._merge_failed = True
                 results.append(f"  {name}: 存在失败任务，已跳过自动合并")
                 continue
             wt = member.defn.worktree
             if not wt:
                 continue
-            branch = f"tinyCode/{wt.replace('/', '-')}"
+            baseline = self._worktree_baselines.get(name, {})
+            branch = baseline.get("branch", "")
+            branch_reader = getattr(self._merger, "worktree_branch", None)
+            if branch_reader is not None:
+                branch_ok, actual_branch = await branch_reader(member.workspace)
+                if not branch_ok:
+                    self._merge_failed = True
+                    results.append(f"  {name}: 无法读取实际分支: {actual_branch}")
+                    continue
+                if branch and branch != actual_branch:
+                    self._merge_failed = True
+                    results.append(
+                        f"  {name}: 分支在任务期间从 {branch} 变为 {actual_branch}，已拒绝合并"
+                    )
+                    continue
+                branch = actual_branch
+            branch = branch or f"tinyCode/{wt.replace('/', '-')}"
+            validator = getattr(self._merger, "validate_worktree", None)
+            if validator is not None:
+                valid, validation_msg = await validator(
+                    member.workspace, self._validation_commands,
+                )
+                if not valid:
+                    self._merge_failed = True
+                    results.append(
+                        f"  {name} ({branch}): {validation_msg}，已跳过合并"
+                    )
+                    continue
             prepare = getattr(self._merger, "prepare_worktree", None)
             if prepare is not None:
                 prepared, prepare_msg = await prepare(member.workspace, name)
                 if not prepared:
+                    self._merge_failed = True
                     results.append(f"  {name} ({branch}): {prepare_msg}")
                     continue
-            ok, msg = await self._merger.merge(branch)
+            head_reader = getattr(self._merger, "worktree_head", None)
+            if head_reader is not None and baseline.get("head"):
+                head_ok, current_head = await head_reader(member.workspace)
+                if not head_ok:
+                    self._merge_failed = True
+                    results.append(f"  {name} ({branch}): {current_head}")
+                    continue
+                if current_head == baseline["head"]:
+                    results.append(f"  {name} ({branch}): 本轮没有文件变更")
+                    continue
+            target_branch = baseline.get("target_branch", "")
+            if target_branch:
+                ok, msg = await self._merger.merge(branch, target_branch)
+            else:
+                ok, msg = await self._merger.merge(branch)
+            if not ok:
+                self._merge_failed = True
             results.append(f"  {name} ({branch}): {msg}")
         return "\n".join(results)
 
@@ -362,6 +437,7 @@ class LeadAgent:
         self._member_model_requests = 0
         self._member_tokens = 0
         self._member_tokens_available = False
+        self._merge_failed = False
 
     def _is_current(self, task) -> bool:
         return bool(self._run_id) and task.run_id == self._run_id
@@ -375,6 +451,16 @@ class LeadAgent:
         result = self._progress(message)
         if inspect.isawaitable(result):
             await result
+
+    def _drain_lead_mail(self) -> None:
+        messages = self._mailbox.read_new(self._last_mail_id)
+        if messages:
+            self._last_mail_id = messages[-1].id
+        for message in messages:
+            if message.msg_type not in {MessageType.TEXT, MessageType.BROADCAST}:
+                continue
+            sender = message.from_member or "member"
+            self._member_reports.append(f"{sender}: {message.content}")
 
     # -- messaging ------------------------------------------------------------
 

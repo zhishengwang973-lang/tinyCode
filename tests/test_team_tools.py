@@ -54,6 +54,34 @@ class TeamToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("团队成员不存在", result.error)
             self.assertFalse((root / "mailboxes" / "charlie.jsonl").exists())
 
+    async def test_member_cannot_update_another_members_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tools, tasks = self._tools(Path(tmp))
+            task = tasks.create("bob-task")
+            tasks.assign(task.id, "bob")
+
+            result = await tools["team_update_task"].execute(
+                task_id=task.id, status="completed",
+            )
+
+            self.assertFalse(result.success)
+            self.assertEqual("in_progress", tasks.get(task.id).status.value)
+
+    async def test_member_can_send_status_to_lead(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools, _ = self._tools(root)
+
+            result = await tools["team_send_message"].execute(
+                to="lead", content="blocked on API",
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(
+                ["blocked on API"],
+                [message.content for message in Mailbox(root, "lead").read_new()],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

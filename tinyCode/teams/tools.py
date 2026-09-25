@@ -15,7 +15,7 @@ def create_team_tools(team_dir, task_list: SharedTaskList,
         _CreateTaskTool(task_list),
         _ListTasksTool(task_list),
         _ViewTaskTool(task_list),
-        _UpdateTaskTool(task_list),
+        _UpdateTaskTool(task_list, member_name),
         _SendMessageTool(mailbox, member_name, all_members),
         _BroadcastTool(mailbox, member_name, all_members),
     ]
@@ -45,7 +45,10 @@ class _CreateTaskTool(BaseTool):
         except ValueError as exc:
             return ToolResult(success=False, content="", error=str(exc))
         deps = [d.strip() for d in depends_on.split(",") if d.strip()] if depends_on else []
-        task = self._tasks.create(name, description, deps)
+        try:
+            task = self._tasks.create(name, description, deps)
+        except (OSError, ValueError) as exc:
+            return ToolResult(success=False, content="", error=str(exc))
         return ToolResult(success=True, content=f"任务已创建: {task.id} ({name})")
 
 
@@ -94,8 +97,9 @@ class _ViewTaskTool(BaseTool):
 
 
 class _UpdateTaskTool(BaseTool):
-    def __init__(self, tasks: SharedTaskList):
+    def __init__(self, tasks: SharedTaskList, member_name: str):
         self._tasks = tasks
+        self._member_name = member_name
 
     name = property(lambda s: "team_update_task")
     description = property(lambda s: "更新任务状态或结果。")
@@ -117,6 +121,14 @@ class _UpdateTaskTool(BaseTool):
             if isinstance(status, str) and status not in {item.value for item in TaskStatus}:
                 message = f"无效状态: {status}"
             return ToolResult(success=False, content="", error=message)
+        existing = self._tasks.get(task_id)
+        if existing is None:
+            return ToolResult(success=False, content="", error=f"任务不存在: {task_id}")
+        if existing.assigned_to and existing.assigned_to != self._member_name:
+            return ToolResult(
+                success=False, content="",
+                error=f"任务 {task_id} 已分配给其他成员，禁止修改",
+            )
         t = self._tasks.update(task_id, status=st, result=result)
         if t is None:
             return ToolResult(success=False, content="", error=f"任务不存在: {task_id}")
@@ -127,7 +139,7 @@ class _SendMessageTool(BaseTool):
     def __init__(self, mailbox: Mailbox, sender: str, all_members: list[str]):
         self._mailbox = mailbox;
         self._sender = sender
-        self._all = frozenset(all_members)
+        self._all = frozenset([*all_members, "lead"])
 
     name = property(lambda s: "team_send_message")
     description = property(lambda s: "向指定成员发送点对点消息。")

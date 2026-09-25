@@ -90,6 +90,58 @@ class TeamLeadTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1/1 完成", result)
             self.assertEqual(1, len(members["alice"].received))
 
+    async def test_merge_skips_member_without_tasks_and_uses_actual_branch(self):
+        class OneMemberPlanProvider:
+            async def chat_stream(self, messages):
+                yield (
+                    '[{"name":"core","description":"implement",'
+                    '"member":"alice","depends_on":[]}]'
+                )
+
+        class WorktreeMember(Member):
+            def __init__(self, name, workspace):
+                super().__init__(name)
+                self.defn = MemberDef(name=name, worktree=name)
+                self.workspace = workspace
+
+        class RecordingMerger:
+            def __init__(self):
+                self.merged = []
+
+            async def worktree_branch(self, worktree):
+                return True, "custom/alice"
+
+            async def prepare_worktree(self, worktree, member_name):
+                return True, "ok"
+
+            async def merge(self, branch):
+                self.merged.append(branch)
+                return True, "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            members = {
+                "alice": WorktreeMember("alice", root / "alice"),
+                "bob": WorktreeMember("bob", root / "bob"),
+            }
+            merger = RecordingMerger()
+            lead = LeadAgent(
+                TeamDef(
+                    name="alpha",
+                    members=[members["alice"].defn, members["bob"].defn],
+                ),
+                root,
+                members,
+                SharedTaskList(root),
+                merger,
+                provider=OneMemberPlanProvider(),
+            )
+
+            result = await lead.execute("ship")
+
+            self.assertEqual(["custom/alice"], merger.merged)
+            self.assertIn("bob: 本轮未分配任务，已跳过合并", result)
+
 
 if __name__ == "__main__":
     unittest.main()

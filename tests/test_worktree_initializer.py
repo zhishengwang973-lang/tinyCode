@@ -6,6 +6,18 @@ from tinyCode.worktree.initializer import WorktreeInitializer
 
 
 class WorktreeInitializerTests(unittest.TestCase):
+    def test_initialize_does_not_share_python_bytecode_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            worktree_path = Path(tmp) / "worktree"
+            (repo_root / "__pycache__").mkdir(parents=True)
+            worktree_path.mkdir()
+
+            logs = WorktreeInitializer(repo_root).initialize(worktree_path)
+
+            self.assertFalse((worktree_path / "__pycache__").exists())
+            self.assertNotIn("链接: __pycache__", logs)
+
     def test_initialize_never_copies_credential_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp) / "repo"

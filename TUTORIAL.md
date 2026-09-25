@@ -712,6 +712,11 @@ timeout_seconds: 300
 /worktree exit fix-bug --force    # 强制退出
 ```
 
+名称中的 `/` 会使用无碰撞编码保存，因此 `a/b` 与 `a-b` 是两个不同工作目录。
+旧版本的普通名称不受影响；旧版含 `/` 的扁平目录因无法可靠还原原名，会明确提示
+使用扁平名称或手动迁移。进入目录前还会核对 Git common-dir，拒绝误进入放在
+同一路径下的其他仓库。
+
 ### 变更保护
 
 退出 worktree 时，默认检查 `git status`：
@@ -721,7 +726,8 @@ timeout_seconds: 300
 
 ### 后台清理
 
-每 5 分钟自动清理过期（24h+）且无修改的 worktree。
+每 5 分钟自动清理过期（24h+）、无修改且分支提交已经合并的 worktree。列表中的
+脏状态来自实时 `git status`。依赖目录可以链接共享，但不会共享 `__pycache__`。
 
 在普通非 Git 新目录中 TinyCode 仍可正常对话和操作文件，只会禁用 Worktree 后台清理及
 相关命令并给出原因；需要这些能力时先执行 `git init`。
@@ -732,6 +738,8 @@ timeout_seconds: 300
 python -m tinyCode --resume
 # → 恢复到上次的 worktree 会话
 ```
+
+恢复记录按仓库根目录隔离，不同项目不会覆盖或错误恢复彼此的 worktree。
 
 ---
 
@@ -752,9 +760,17 @@ python -m tinyCode --resume
     {"name": "bob", "role": "planner", "worktree": "bob-wt", "backend": "coro"},
     {"name": "carol", "role": "general", "worktree": "carol-wt", "backend": "coro"}
   ],
-  "dispatch_mode": false
+  "dispatch_mode": false,
+  "max_rounds_per_member": 10,
+  "timeout_seconds": 1800,
+  "validation_commands": ["python3 -m unittest discover -s tests"],
+  "allow_llm_conflict_resolution": false
 }
 ```
+
+成员角色会真正继承角色的系统提示词、模型、轮次上限、权限和工具白名单。多成员
+Team 的每个成员必须使用独立且干净的 worktree；任务开始前已有的修改或未合并
+提交会使安全预检失败，避免把用户原有工作混入本轮自动提交。
 
 ### 协作工具
 
@@ -780,9 +796,14 @@ Team 成员拥有专属的 6 个协作工具（主 Agent 不可见）：
 ### 合并策略
 
 成员完成 → Lead 增量合并 worktree：
-- 无冲突 → 自动 `git merge --commit`
-- 有冲突 → LLM 逐文件裁决
-- 裁决失败 → 回滚，记录不可解决的冲突
+- 先运行 `validation_commands` 和 `git diff --check`
+- 无冲突且验证通过 → 自动 `git merge --commit`
+- 有冲突 → 默认回滚并保留成员分支，供人工处理
+- 只有显式设置 `allow_llm_conflict_resolution: true` 才允许 LLM 逐文件裁决
+- 任何验证、裁决或提交失败都会标记为“部分完成”，不会伪报全量成功
+
+Team 总时限由 `timeout_seconds` 控制。异常退出后，遗留的进行中任务会在下次运行
+时恢复为明确的失败状态；完整的大型任务结果会写入 Team 的 `results/` 目录。
 
 ---
 

@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
@@ -9,6 +10,7 @@ from tinyCode.teams.mailbox import Mailbox
 from tinyCode.teams.member import TeamMember
 from tinyCode.teams.models import MemberDef, MemberStatus, MessageType, TeamMessage
 from tinyCode.tools.executor import ToolExecutor
+from tinyCode.tools.read_file import ReadFileTool
 from tinyCode.tools.registry import ToolRegistry
 
 
@@ -48,6 +50,28 @@ class FailingProvider(EchoProvider):
         yield ""
 
 
+class IntermediateThenFinalProvider(EchoProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield "intermediate narration"
+            yield ToolCall(
+                id="read-1", name="read_file", input={"path": "missing.txt"},
+            )
+        else:
+            yield "final answer"
+
+
+class SlowProvider(EchoProvider):
+    async def chat_stream(self, messages, tools=None, system_blocks=None):
+        await asyncio.sleep(0.2)
+        yield "late"
+
+
 class TeamMemberTests(unittest.IsolatedAsyncioTestCase):
     def test_check_mail_injects_lead_text_message_into_history(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,11 +84,13 @@ class TeamMemberTests(unittest.IsolatedAsyncioTestCase):
                     content="focus on auth",
                 )
             )
+            registry = ToolRegistry()
+            registry.register(ReadFileTool())
             member = TeamMember(
                 member_def=MemberDef(name="alice"),
                 team_dir=team_dir,
                 provider=EchoProvider(),
-                tool_registry=ToolRegistry(),
+                tool_registry=registry,
                 tool_executor=ToolExecutor(),
             )
 
@@ -108,6 +134,57 @@ class TeamMemberTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, member.last_turns)
             self.assertEqual(1, member.last_model_requests)
             self.assertFalse(member.last_tokens_available)
+
+    async def test_member_returns_only_terminal_round_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ToolRegistry()
+            registry.register(ReadFileTool())
+            member = TeamMember(
+                member_def=MemberDef(name="alice"),
+                team_dir=Path(tmp),
+                provider=IntermediateThenFinalProvider(),
+                tool_registry=registry,
+                tool_executor=ToolExecutor(),
+            )
+
+            result = await member.run("查看 missing.txt 并给出结论")
+
+            self.assertEqual("final answer", result)
+
+    async def test_member_has_overall_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            member = TeamMember(
+                member_def=MemberDef(name="alice"),
+                team_dir=Path(tmp),
+                provider=SlowProvider(),
+                tool_registry=ToolRegistry(),
+                tool_executor=ToolExecutor(),
+                timeout_seconds=0.01,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "执行超时"):
+                await member.run("do work")
+
+    def test_mail_is_exposed_as_untrusted_safe_boundary_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            team_dir = Path(tmp)
+            Mailbox(team_dir, "bob").send(TeamMessage(
+                from_member="bob", to_member="alice",
+                msg_type=MessageType.TEXT, content="review auth",
+            ))
+            member = TeamMember(
+                member_def=MemberDef(name="alice"),
+                team_dir=team_dir,
+                provider=EchoProvider(),
+                tool_registry=ToolRegistry(),
+                tool_executor=ToolExecutor(),
+            )
+
+            contexts = member._drain_mail_context()
+
+            self.assertEqual(1, len(contexts))
+            self.assertIn("不可信数据", contexts[0])
+            self.assertIn("bob: review auth", contexts[0])
 
 
 if __name__ == "__main__":

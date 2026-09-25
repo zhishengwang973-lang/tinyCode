@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import tempfile
 from pathlib import Path
@@ -7,6 +8,9 @@ from tinyCode.teams.models import MemberDef, TeamDef
 from tinyCode.teams.lead import LeadAgent
 from tinyCode.teams.tasks import SharedTaskList
 from tinyCode.tools.registry import ToolRegistry
+from tinyCode.tools.read_file import ReadFileTool
+from tinyCode.tools.write_file import WriteFileTool
+from tinyCode.subagent.models import SubAgentRole
 
 
 class TeamOrchestratorTests(unittest.IsolatedAsyncioTestCase):
@@ -141,6 +145,71 @@ class TeamOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("1/1 完成", result)
             self.assertEqual(2, len(tasks.list_all()))
+
+    async def test_member_role_filters_tools_and_injects_role_prompt(self):
+        from tinyCode.teams.orchestrator import run_team
+
+        team_def = TeamDef(
+            name="alpha",
+            members=[MemberDef(name="alice", role="reader")],
+            max_rounds_per_member=10,
+        )
+        role = SubAgentRole(
+            name="reader", tools_allow=["read_file"],
+            system_prompt="Only inspect the requested scope.",
+            max_rounds=6, timeout_seconds=45,
+        )
+        registry = ToolRegistry()
+        registry.register(ReadFileTool())
+        registry.register(WriteFileTool())
+        lead = AsyncMock()
+        lead.execute.return_value = "done"
+
+        with patch("tinyCode.teams.orchestrator.load_team_def", return_value=team_def), \
+             patch("tinyCode.teams.orchestrator.get_team_dir", return_value=Path("/tmp/team-alpha")), \
+             patch("tinyCode.teams.orchestrator.TeamMember") as member_cls, \
+             patch("tinyCode.teams.orchestrator.SharedTaskList"), \
+             patch("tinyCode.teams.orchestrator.GitMerger"), \
+             patch("tinyCode.teams.orchestrator.LeadAgent", return_value=lead):
+            result = await run_team(
+                "alpha", "inspect", provider=AsyncMock(),
+                tool_registry=registry, tool_executor=object(),
+                roles={"reader": role},
+            )
+
+        self.assertEqual("done", result)
+        kwargs = member_cls.call_args.kwargs
+        self.assertIsNotNone(kwargs["tool_registry"].get("read_file"))
+        self.assertIsNone(kwargs["tool_registry"].get("write_file"))
+        self.assertEqual("Only inspect the requested scope.", kwargs["instructions"])
+        self.assertEqual(6, kwargs["max_rounds"])
+        self.assertEqual(45.0, kwargs["timeout_seconds"])
+
+    async def test_team_total_timeout_cancels_lead(self):
+        from tinyCode.teams.orchestrator import run_team
+
+        team_def = TeamDef(
+            name="alpha", members=[MemberDef(name="alice")],
+            timeout_seconds=0.01,
+        )
+        lead = AsyncMock()
+
+        async def block(_goal):
+            await asyncio.sleep(1)
+
+        lead.execute.side_effect = block
+        with patch("tinyCode.teams.orchestrator.load_team_def", return_value=team_def), \
+             patch("tinyCode.teams.orchestrator.get_team_dir", return_value=Path("/tmp/team-alpha")), \
+             patch("tinyCode.teams.orchestrator.TeamMember"), \
+             patch("tinyCode.teams.orchestrator.SharedTaskList"), \
+             patch("tinyCode.teams.orchestrator.GitMerger"), \
+             patch("tinyCode.teams.orchestrator.LeadAgent", return_value=lead):
+            result = await run_team(
+                "alpha", "work", provider=AsyncMock(),
+                tool_registry=ToolRegistry(), tool_executor=object(),
+            )
+
+        self.assertIn("超过总时限", result)
 
 
 if __name__ == "__main__":

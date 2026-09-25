@@ -11,7 +11,7 @@ from pathlib import Path
 _COPY_FILES: list[str] = []
 
 #: Large dependency directories to try symlinking
-_SYMLINK_DIRS = ["node_modules", ".venv", "venv", "__pycache__"]
+_SYMLINK_DIRS = ["node_modules", ".venv", "venv"]
 
 _COPY_GITIGNORED_PATTERNS: list[str] = []
 
