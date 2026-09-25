@@ -5,10 +5,10 @@ from tinyCode.subagent.roles.loader import RoleLoader
 from tinyCode.subagent.filter import ToolFilter
 from tinyCode.subagent.runner import SubAgentRunner
 from tinyCode.subagent.manager import BackgroundTaskManager
-from tinyCode.subagent.tool import SubAgentTool
+from tinyCode.subagent.tool import SubAgentTool, SubAgentWaitTool
 
 __all__ = [
     "SubAgentRole", "SubAgentTask", "TaskStatus",
     "RoleLoader", "ToolFilter", "SubAgentRunner",
-    "BackgroundTaskManager", "SubAgentTool",
+    "BackgroundTaskManager", "SubAgentTool", "SubAgentWaitTool",
 ]

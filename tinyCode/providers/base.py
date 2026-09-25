@@ -35,6 +35,34 @@ async def provider_stream(
     try:
         async with client.stream(method, url, **kwargs) as response:
             yield response
+    except httpx.ConnectTimeout as exc:
+        target = urlsplit(url).hostname or url
+        if proxy_route.bypassed_unavailable_proxy:
+            route = (
+                f"本地代理 {proxy_route.proxy_address} 不可用并已切换直连后，"
+                "仍"
+            )
+        elif proxy_route.proxy_address:
+            route = f"代理 {proxy_route.proxy_address}"
+        else:
+            route = "直连"
+        if proxy_route.bypassed_unavailable_proxy:
+            message = f"模型服务连接超时：{route}无法连接 {target}"
+        else:
+            message = (
+                f"模型服务连接超时：通过{route}连接 {target} "
+                "未在限定时间内建立连接"
+            )
+        raise ProviderError(
+            message, code="connection_timeout", retryable=True,
+        ) from exc
+    except httpx.TimeoutException as exc:
+        target = urlsplit(url).hostname or url
+        raise ProviderError(
+            f"模型服务响应超时：{target} 未在限定时间内返回数据",
+            code="response_timeout",
+            retryable=True,
+        ) from exc
     except (httpx.ConnectError, httpx.ProxyError) as exc:
         target = urlsplit(url).hostname or url
         if proxy_route.bypassed_unavailable_proxy:

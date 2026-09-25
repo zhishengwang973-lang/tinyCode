@@ -79,6 +79,24 @@ def _spans(rows: list[dict[str, Any]]) -> list[_Span]:
     return sorted(by_id.values(), key=lambda span: (span.started_ms, span.span_id))
 
 
+def linked_trace_paths(path: Path) -> list[Path]:
+    """Return detached Subagent traces referenced by a parent trace."""
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for row in _load(path):
+        if row.get("event") != "subagent_trace_started":
+            continue
+        attrs = row.get("attributes")
+        raw_path = attrs.get("trace_path") if isinstance(attrs, dict) else None
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        child = Path(raw_path)
+        if child not in seen:
+            seen.add(child)
+            result.append(child)
+    return result
+
+
 def render_text(path: Path) -> str:
     rows = _load(path)
     if not rows:
@@ -113,11 +131,21 @@ def render_text(path: Path) -> str:
     timing_summary = _timing_summary(spans, duration)
     if timing_summary:
         lines.append(
-            "关键路径耗时: " + " · ".join(
+            "关键路径耗时（并行 Span 可重叠）: " + " · ".join(
                 f"{label} {_duration(elapsed)} ({share:.0%})"
                 for label, elapsed, share in timing_summary
             )
         )
+
+    child_summaries = _linked_trace_summaries(rows)
+    if child_summaries:
+        lines.append("\nSubagent Trace")
+        for summary in child_summaries:
+            lines.append(
+                f"  {summary['task_id']} · {summary['role']} · "
+                f"{_status_label(summary['status'])} · "
+                f"{_duration(summary['duration_ms'])} · {summary['path']}"
+            )
 
     # A sub-agent inherits the parent tool span and emits its own round events.
     # Keep only root rounds as section headers; nested model/tool spans remain
@@ -180,6 +208,7 @@ def render_text(path: Path) -> str:
             "context_compression", "truncation", "steering", "steering_queued",
             "cancellation_requested", "file_changes",
             "tool_call", "tool_result", "tool_blocked",
+            "subagent_trace_started",
         }
     ]
     if notable:
@@ -248,6 +277,7 @@ def render_html(path: Path) -> str:
             "</tr>"
         )
     token_svg = _token_chart(spans)
+    child_cards = _linked_trace_cards(rows)
     timing_cards = "".join(
         "<div class='card'><span class='muted'>"
         f"{html.escape(label)}</span><br><strong>{html.escape(_duration(elapsed))}</strong>"
@@ -261,7 +291,7 @@ def render_html(path: Path) -> str:
 <style>
 :root{{--bg:#111318;--panel:#1a1e26;--muted:#8d98aa;--text:#e8edf5;--line:#303846;--ok:#42d392;--error:#ff6b6b;--warn:#f5c451;--accent:#7799ff}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px ui-monospace,SFMono-Regular,Menlo,monospace}}
-main{{max-width:1500px;margin:auto;padding:28px}}h1{{font-size:22px;margin:0 0 8px}}h2{{font-size:16px;margin:28px 0 12px}}.muted,small{{color:var(--muted)}}
+main{{max-width:1500px;margin:auto;padding:28px}}h1{{font-size:22px;margin:0 0 8px}}h2{{font-size:16px;margin:28px 0 12px}}.muted,small{{color:var(--muted)}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}
 .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin:18px 0}}.card{{background:var(--panel);padding:14px;border:1px solid var(--line);border-radius:8px}}
 .span-row{{border-top:1px solid var(--line)}}.span-summary{{display:grid;grid-template-columns:minmax(280px,36%) minmax(160px,1fr) 72px;gap:10px;align-items:center;min-height:44px;list-style:none;cursor:pointer}}.span-summary::-webkit-details-marker{{display:none}}.span-label{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.span-label small{{float:right;margin-right:8px}}
 .track{{height:14px;background:#222833;border-radius:4px;position:relative}}.bar{{position:absolute;height:100%;border-radius:4px;background:var(--accent);min-width:2px}}.bar.error,.bar.cancelled{{background:var(--error)}}.bar.retry,.bar.interrupted{{background:var(--warn)}}
@@ -276,7 +306,8 @@ svg{{width:100%;height:180px;background:var(--panel);border:1px solid var(--line
 <div class="cards"><div class="card">状态<br><strong class="{'ok-text' if status in {'ok','no_tool_call'} else 'error-text'}">{html.escape(_status_label(status))}</strong></div>
 <div class="card">任务耗时<br><strong>{html.escape(_duration(task_duration_ms))}</strong></div>
 <div class="card">Span<br><strong>{len(spans)}</strong></div><div class="card">事件<br><strong>{len(rows)}</strong></div></div>
-<h2>关键路径耗时</h2><div class="cards">{timing_cards or "<div class='muted'>没有可归类的耗时 Span</div>"}</div>
+<h2>关键路径耗时（并行 Span 可重叠）</h2><div class="cards">{timing_cards or "<div class='muted'>没有可归类的耗时 Span</div>"}</div>
+{("<h2>Subagent Trace</h2><div class='cards'>" + child_cards + "</div>") if child_cards else ""}
 <h2>执行时间线</h2>{''.join(bars) or '<div class="muted">没有 Span 数据</div>'}
 <h2>模型 Token 曲线</h2>{token_svg}
 <h2>上下文窗口曲线</h2>{_context_chart(rows)}
@@ -315,6 +346,52 @@ def _token_chart(spans: list[_Span]) -> str:
         f"<polyline points='{coordinates}' fill='none' stroke='#7799ff' stroke-width='3'/>"
         f"<text x='24' y='24' fill='#8d98aa'>累计 {max_y:,} Token</text></svg>"
     )
+
+
+def _linked_trace_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("event") != "subagent_trace_started":
+            continue
+        attrs = row.get("attributes")
+        if not isinstance(attrs, dict):
+            continue
+        raw_path = attrs.get("trace_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        child_path = Path(raw_path)
+        child_rows = _load(child_path)
+        end = next(
+            (item for item in reversed(child_rows) if item.get("event") == "task_end"),
+            None,
+        )
+        summaries.append({
+            "task_id": str(attrs.get("task_id", "")),
+            "role": str(attrs.get("role", "fork")),
+            "status": str(end.get("status", "interrupted")) if end else "interrupted",
+            "duration_ms": _number(end.get("duration_ms")) if end else 0.0,
+            "path": child_path,
+        })
+    return summaries
+
+
+def _linked_trace_cards(rows: list[dict[str, Any]]) -> str:
+    cards: list[str] = []
+    for summary in _linked_trace_summaries(rows):
+        child_path = summary["path"]
+        child_html = child_path.with_suffix(".html")
+        status = summary["status"]
+        cards.append(
+            "<div class='card'>"
+            f"<span class='muted'>{html.escape(summary['role'])}</span><br>"
+            f"<strong class='{'ok-text' if status in {'ok', 'no_tool_call'} else 'error-text'}'>"
+            f"{html.escape(_status_label(status))}</strong><br>"
+            f"<small>{html.escape(summary['task_id'])} · "
+            f"{html.escape(_duration(summary['duration_ms']))}</small><br>"
+            f"<a href='{html.escape(child_html.name)}'>打开子时间线</a>"
+            "</div>"
+        )
+    return "".join(cards)
 
 
 def _timing_summary(
@@ -513,6 +590,7 @@ def _event_label(event: str) -> str:
         "tool_call": "工具请求",
         "tool_result": "工具结果",
         "tool_blocked": "工具拦截",
+        "subagent_trace_started": "Subagent Trace",
     }.get(event, event)
 
 

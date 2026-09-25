@@ -138,6 +138,32 @@ class PathSandboxTests(unittest.TestCase):
             self.assertEqual(RuleAction.ALLOW, policy.evaluate("apply_patch", path="b.py"))
             self.assertEqual(RuleAction.ASK, policy.evaluate("apply_patch", path="c.py"))
 
+    def test_dynamic_tool_approval_is_scoped_to_capability_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "project"
+            project_root.mkdir()
+            policy = SecurityPolicy(level=SecurityLevel.STRICT, project_root=project_root)
+            guard = SecurityGuard(policy=policy, sandbox=PathSandbox(project_root))
+
+            guard.apply_hitl(
+                HITLDecision.ALLOW_SESSION,
+                "sub_agent",
+                {"command": "subagent-capabilities:reader"},
+            )
+
+            self.assertEqual(
+                RuleAction.ALLOW,
+                policy.evaluate(
+                    "sub_agent", command="subagent-capabilities:reader",
+                ),
+            )
+            self.assertEqual(
+                RuleAction.ASK,
+                policy.evaluate(
+                    "sub_agent", command="subagent-capabilities:writer",
+                ),
+            )
+
     def test_security_guard_blocks_provider_config_from_model_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "project"

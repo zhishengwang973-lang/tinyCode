@@ -2,7 +2,10 @@
 name: planner
 description: 制定执行计划——分析需求、评估影响、输出分步方案
 tools_allow: [read_file, glob, grep, run_command]
-max_rounds: 6
+max_rounds: 24
+initial_rounds: 8
+round_extension: 4
+finalization_rounds: 2
 permission: normal
 ---
 

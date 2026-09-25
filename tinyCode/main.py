@@ -14,7 +14,13 @@ from tinyCode.mcp.manager import MCPManager
 from tinyCode.notes import AutoNoteManager, JevNoteRouter
 from tinyCode.hooks import load_hooks, HookEngine, HookEvent
 from tinyCode.skills import SkillLoader, SkillRegistry, SkillTool
-from tinyCode.subagent import RoleLoader, SubAgentRunner, BackgroundTaskManager, SubAgentTool
+from tinyCode.subagent import (
+    RoleLoader,
+    SubAgentRunner,
+    BackgroundTaskManager,
+    SubAgentTool,
+    SubAgentWaitTool,
+)
 from tinyCode.teams import run_team
 from tinyCode.worktree import GitWorktreeManager, BackgroundCleaner
 from tinyCode.providers.base import create_provider
@@ -138,7 +144,9 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
     trust_project_config = options.trust_project_config
     if not trust_project_config:
         ignored = [
-            name for name in (".tinyCode-mcp.yaml", ".tinyCode-hooks.yaml")
+            name for name in (
+                ".tinyCode-mcp.yaml", ".tinyCode-hooks.yaml", ".tinyCode/roles",
+            )
             if (Path.cwd() / name).exists()
         ]
         if ignored:
@@ -190,6 +198,23 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         )
     # Session selection is delayed until after a possible worktree resume so
     # interrupted tasks are matched against the actual execution workspace.
+
+    # Resolve the execution workspace before loading any project-scoped
+    # instructions, skills, roles, hooks, MCP config, notes or trace storage.
+    worktree_manager = GitWorktreeManager()
+    if options.resume:
+        session = worktree_manager.load_session()
+        if session and session.get("active_worktree"):
+            resumed, resume_error = await worktree_manager.enter(
+                session["active_worktree"]
+            )
+            if resumed:
+                print(
+                    f"已恢复工作目录: {Path.cwd()}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"恢复 Worktree 失败: {resume_error}", file=sys.stderr)
 
     # 4.5. Instructions
     instructions_loader = InstructionsLoader()
@@ -292,18 +317,32 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
 
     # Sub-agent system
     role_loader = RoleLoader()
-    roles = role_loader.load_all()
+    def reload_roles():
+        return role_loader.load_all(
+            cwd=Path.cwd(), include_project=trust_project_config,
+        )
+
+    roles = reload_roles()
     sub_runner = SubAgentRunner(
         provider,
         tool_registry,
         tool_executor,
         roles,
         trace_recorder=trace_recorder,
+        instructions_text=instructions_text,
+        note_manager=note_manager,
+        skill_registry=skill_registry,
+        truncator=truncator,
+        current_time_text=collect_current_time,
     )
-    task_manager = BackgroundTaskManager()
+    task_manager = BackgroundTaskManager(project_root=Path.cwd())
     cleanup.add("sub-agent", task_manager.shutdown)
-    sub_agent_tool = SubAgentTool(sub_runner, task_manager, roles, history)
+    sub_agent_tool = SubAgentTool(
+        sub_runner, task_manager, roles, history,
+        reload_roles=reload_roles,
+    )
     tool_registry.register(sub_agent_tool)
+    tool_registry.register(SubAgentWaitTool(task_manager))
 
     # Validate only after built-ins, MCP and sub_agent are all registered so
     # skills may intentionally whitelist those runtime-provided tools.
@@ -340,25 +379,9 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
     cleanup.add("hooks", shutdown_hooks)
 
     # Worktree management
-    worktree_manager = GitWorktreeManager()
     cleaner = BackgroundCleaner(worktree_manager)
     cleaner.start()
     cleanup.add("worktree cleaner", cleaner.stop)
-
-    # --resume: restore previous worktree session
-    if options.resume:
-        session = worktree_manager.load_session()
-        if session and session.get("active_worktree"):
-            resumed, resume_error = await worktree_manager.enter(
-                session["active_worktree"]
-            )
-            if resumed:
-                security_guard.set_project_root(Path.cwd())
-                trace_recorder.set_project_root(Path.cwd())
-                if note_manager is not None:
-                    note_manager.set_cwd(Path.cwd())
-            else:
-                print(f"恢复 Worktree 失败: {resume_error}", file=sys.stderr)
 
     # Durable foreground-task recovery. Model streams resume by issuing a new
     # request at a protocol-safe boundary; they never pretend to resume from an
@@ -435,6 +458,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         trace_recorder=trace_recorder,
         recovery_store=recovery_store,
         task_mode_router=task_mode_router,
+        background_context=task_manager.drain_context_messages,
     )
 
     tui_ref: dict[str, TinyCodeTUI] = {}

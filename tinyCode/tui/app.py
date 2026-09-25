@@ -19,6 +19,7 @@ from rich.text import Text
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
+    BackgroundResultsAppliedEvent,
     ErrorEvent,
     HITLRequestEvent,
     RoundLimitDecision,
@@ -431,6 +432,7 @@ class TinyCodeTUI(UIControl):
         self._session_store = session_store
         self._note_manager = note_manager
         self._skill_registry = skill_registry
+        self._task_manager = task_manager
         self._provider_name = provider_name
         self._model = model
         self._mcp_server_count = mcp_server_count
@@ -683,6 +685,8 @@ class TinyCodeTUI(UIControl):
             self._trace_recorder.set_project_root(workspace)
         if self._note_manager is not None:
             self._note_manager.set_cwd(workspace)
+        if self._task_manager is not None:
+            self._task_manager.set_project_root(workspace)
 
     def update_progress(self, text: str) -> None:
         self._start_progress(text)
@@ -989,7 +993,10 @@ class TinyCodeTUI(UIControl):
                     should_capture = (
                         True
                         if not callable(may_modify)
-                        else bool(may_modify(event.tool_call.name))
+                        else bool(may_modify(
+                            event.tool_call.name,
+                            event.tool_call.input,
+                        ))
                     )
                     if workspace_snapshot is None and should_capture:
                         trace_scope = (
@@ -1253,6 +1260,21 @@ class TinyCodeTUI(UIControl):
                     else:
                         self._print_warning(
                             f"已保存 {event.message_count} 条追加指令，"
+                            "但任务已达到轮次硬上限"
+                        )
+
+                elif isinstance(event, BackgroundResultsAppliedEvent):
+                    stream_renderer.close_line()
+                    self._save_checkpoint()
+                    if event.continued:
+                        self._print_info(
+                            f"↪ 已接收 {event.result_count} 个后台 Subagent 结果，"
+                            "继续当前任务"
+                        )
+                        self._start_progress("已接收后台结果 · 等待模型")
+                    else:
+                        self._print_warning(
+                            f"已保存 {event.result_count} 个后台 Subagent 结果，"
                             "但任务已达到轮次硬上限"
                         )
 

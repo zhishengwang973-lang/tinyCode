@@ -74,6 +74,18 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertEqual(RuleAction.ALLOW, policy.evaluate("web_fetch"))
         self.assertEqual(RuleAction.ALLOW, policy.evaluate("request_user_input"))
 
+    def test_dynamic_tool_can_declare_a_concrete_call_read_only(self):
+        policy = self.make_policy(SecurityLevel.NORMAL)
+
+        self.assertEqual(
+            RuleAction.ALLOW,
+            policy.evaluate("sub_agent", read_only=True),
+        )
+        self.assertEqual(
+            RuleAction.ASK,
+            policy.evaluate("sub_agent", read_only=False),
+        )
+
     def test_strict_mode_asks_before_transmitting_web_requests(self):
         policy = self.make_policy(SecurityLevel.STRICT)
 

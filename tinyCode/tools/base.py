@@ -78,6 +78,25 @@ class BaseTool(ABC):
         return False
 
     @property
+    def available_in_inspect(self) -> bool:
+        """Whether the schema may be advertised for a read-only task.
+
+        Most tools have fixed side effects and can use their category. A
+        dispatcher may override this while still deciding each concrete call
+        with :meth:`may_modify`.
+        """
+        return self.category is ToolCategory.READ
+
+    def may_modify(self, params: dict[str, Any]) -> bool:
+        """Return whether this concrete call may mutate project state."""
+        del params
+        return self.category is not ToolCategory.READ
+
+    def security_parameters(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return arguments used to scope security rules for this call."""
+        return dict(params)
+
+    @property
     @abstractmethod
     def parameters(self) -> list[ToolParameter]:
         """Parameter schema (name, type, description, required)."""
@@ -87,6 +106,15 @@ class BaseTool(ABC):
     async def execute(self, **kwargs: Any) -> ToolResult:
         """Run the tool with the given named parameters."""
         ...
+
+    def approval_parameters(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Return the user-visible parameters for an approval prompt.
+
+        Execution always receives the original provider arguments. Tools with
+        indirect capabilities (for example a delegated worker) may override
+        this hook to expose the effective permission envelope to the user.
+        """
+        return dict(params)
 
     def to_openai_schema(self) -> dict:
         """Render tool definition in OpenAI-compatible format."""

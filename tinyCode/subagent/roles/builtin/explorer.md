@@ -2,7 +2,10 @@
 name: explorer
 description: 代码探索——搜索文件、读取代码、识别模式和结构
 tools_allow: [read_file, glob, grep]
-max_rounds: 5
+max_rounds: 24
+initial_rounds: 8
+round_extension: 4
+finalization_rounds: 2
 permission: normal
 ---
 

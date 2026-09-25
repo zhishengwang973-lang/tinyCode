@@ -166,6 +166,32 @@ class ProviderUrlTests(unittest.TestCase):
 
 
 class ProviderRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_timeout_has_actionable_nonempty_error(self):
+        class TimedOutClient:
+            def stream(self, *args, **kwargs):
+                raise httpx.ConnectTimeout("")
+
+        route = ProxyRouteDecision(
+            trust_env=True,
+            proxy_url="http://127.0.0.1:12334",
+            proxy_address="127.0.0.1:12334",
+        )
+
+        with self.assertRaises(ProviderError) as raised:
+            async with provider_stream(
+                TimedOutClient(),
+                "POST",
+                "https://api.deepseek.com/v1/chat/completions",
+                proxy_route=route,
+            ):
+                pass
+
+        self.assertEqual("connection_timeout", raised.exception.code)
+        self.assertTrue(raised.exception.retryable)
+        self.assertIn("连接超时", str(raised.exception))
+        self.assertIn("127.0.0.1:12334", str(raised.exception))
+        self.assertIn("api.deepseek.com", str(raised.exception))
+
     async def test_connection_error_reports_failed_proxy_fallback(self):
         class FailedClient:
             def stream(self, *args, **kwargs):

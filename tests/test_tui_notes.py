@@ -16,6 +16,7 @@ from textual.widgets import Button, TextArea
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
+    BackgroundResultsAppliedEvent,
     HITLRequestEvent,
     RoundLimitDecisionAction,
     RoundLimitExtendedEvent,
@@ -275,7 +276,7 @@ class WorkspaceChangingAgentLoop(FakeAgentLoop):
 
 
 class ReadOnlyAgentLoop(FakeAgentLoop):
-    def tool_may_modify_workspace(self, _tool_name: str) -> bool:
+    def tool_may_modify_workspace(self, _tool_name: str, _params=None) -> bool:
         return False
 
     async def run(self, history):
@@ -410,6 +411,19 @@ class HardLimitAgentLoop(FakeAgentLoop):
     async def run(self, history):
         yield RoundStartEvent(100, 100)
         yield AgentDoneEvent("hard_max_rounds")
+
+
+class BackgroundResultReportingLoop(FakeAgentLoop):
+    def __init__(self, continued: bool) -> None:
+        super().__init__()
+        self.continued = continued
+
+    async def run(self, history):
+        yield BackgroundResultsAppliedEvent(
+            result_count=2,
+            continued=self.continued,
+        )
+        yield AgentDoneEvent("no_tool_call" if self.continued else "hard_max_rounds")
 
 
 class StalledAgentLoop(FakeAgentLoop):
@@ -1039,7 +1053,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fullscreen_moves_pre_tool_text_to_process_after_real_events(self):
         class DraftThenToolLoop(FakeAgentLoop):
-            def tool_may_modify_workspace(self, _tool_name: str) -> bool:
+            def tool_may_modify_workspace(self, _tool_name: str, _params=None) -> bool:
                 return False
 
             async def run(self, history):
@@ -1426,6 +1440,20 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已达到轮次硬上限", rendered)
         self.assertNotIn("✓ 本轮已正常完成", rendered)
         self.assertEqual("就绪 · 任务达到轮次硬上限", tui._status_text)
+
+    async def test_background_result_event_uses_its_own_count_in_both_states(self):
+        continued_tui, continued_output = self._make_tui(
+            BackgroundResultReportingLoop(True),
+        )
+        stopped_tui, stopped_output = self._make_tui(
+            BackgroundResultReportingLoop(False),
+        )
+
+        await continued_tui._on_user_input("continue with worker result")
+        await stopped_tui._on_user_input("worker result at hard limit")
+
+        self.assertIn("已接收 2 个后台 Subagent 结果", continued_output.getvalue())
+        self.assertIn("已保存 2 个后台 Subagent 结果", stopped_output.getvalue())
 
     async def test_stalled_task_can_request_strategy_change(self):
         loop = StalledAgentLoop()

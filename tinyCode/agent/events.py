@@ -151,6 +151,14 @@ class SteeringAppliedEvent:
 
 
 @dataclass
+class BackgroundResultsAppliedEvent:
+    """Completed Subagent results entered context at a safe boundary."""
+
+    result_count: int
+    continued: bool
+
+
+@dataclass
 class PlanOnlyToggleEvent:
     """plan-only 模式切换通知。"""
     enabled: bool
@@ -199,6 +207,7 @@ AgentEvent = (
     | ProgressWarningEvent
     | TaskStalledEvent
     | SteeringAppliedEvent
+    | BackgroundResultsAppliedEvent
     | PlanOnlyToggleEvent
     | HITLRequestEvent
     | TruncationEvent

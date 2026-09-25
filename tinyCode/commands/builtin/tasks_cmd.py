@@ -23,9 +23,12 @@ def create(task_manager: BackgroundTaskManager) -> CommandMeta:
                 f"状态: {task.status.value}\n"
                 f"任务: {task.task}\n"
                 f"轮次: {task.round_count}\n"
+                f"Token: {task.token_usage:,}\n"
+                f"耗时: {task.duration_seconds:.2f} 秒\n"
                 f"开始: {format_beijing_time(task.started_at)}\n"
                 f"结束: {format_beijing_time(task.finished_at)}\n"
-                f"后台: {'是' if task.background else '否'}\n\n"
+                f"后台: {'是' if task.background else '否'}\n"
+                f"完整结果: {task.result_path or '—'}\n\n"
                 f"结果:\n{task.result[:2000] if task.result else '(无)'}"
             )
 

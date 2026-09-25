@@ -590,7 +590,8 @@ hooks:
 | `shell` | 执行命令 |
 | `prompt_inject` | 向 LLM 注入文本（拦截事件用此反馈拒绝原因） |
 | `http` | 发起 HTTP 请求 |
-| `sub_agent` | 启动真实后台子 Agent，并将结果注入后续上下文 |
+| `sub_agent` | 启动受限子 Agent；后台结果在安全边界注入内部上下文 |
+| `sub_agent_wait` | 按任务 ID 有界等待后台结果，超时不取消任务 |
 
 ---
 
@@ -616,7 +617,10 @@ hooks:
   → [Fork 模式] 分析结果...
 ```
 
-Fork 模式**强制后台运行**，完成结果自动注入对话。
+Fork 模式**强制后台运行**。后台结果会在主任务的下一个协议安全边界作为
+“内部不可信上下文”注入，不会伪装成用户指令；主任务确实依赖结果时会调用
+`sub_agent_wait(task_id=...)` 等待。后台任务即使跨过主模型的一轮输出，也不会
+丢失结果。
 
 ### 内置角色
 
@@ -635,12 +639,35 @@ Fork 模式**强制后台运行**，完成结果自动注入对话。
 name: my-role
 description: 自定义角色
 tools_allow: [read_file, glob, grep, run_command]
-max_rounds: 5
+max_rounds: 24
+initial_rounds: 8
+round_extension: 4
+finalization_rounds: 2
+permission: normal
+timeout_seconds: 300
 ---
 
 # My Role SOP
 ...
 ```
+
+项目级 `.tinyCode/roles/` 只在使用 `--trust-project-config` 启动时加载，避免
+未经信任的仓库静默扩大子 Agent 权限。用户级角色可放在
+`~/.tinyCode/roles/`。
+
+启动角色型子 Agent 需要安全确认时，确认信息会列出其实际权限、最大轮次、
+总超时和经过过滤后的工具清单。后台任务始终只读；所有子 Agent 都不能再次
+创建子 Agent，也不能直接向前台用户提问。
+
+`sub_agent` 采用调用级副作用判断：它在 inspect 只读任务中仍对模型可见，
+但只允许 fork、`background=true` 或实际工具清单完全只读的角色。带写工具的
+前台角色会被运行时拦截，不能借委派绕过任务模式；安全审批也按能力清单指纹
+隔离，批准只读角色不会顺带批准可写角色。
+
+角色的 `initial_rounds` 是初始软预算，达到后按 `round_extension` 自动扩展，
+`max_rounds` 仅作为硬上限；进入最后 `finalization_rounds` 轮时会要求停止扩大
+范围并输出结论。这避免了过小预算导致无结果，也避免一次性放开几十轮后持续
+消耗 Token。
 
 ### 后台任务管理
 
@@ -649,6 +676,15 @@ max_rounds: 5
 /tasks detail id  # 查看详情
 /tasks kill id    # 终止任务
 ```
+
+任务元数据持久化在当前项目的 `.tinyCode/subagent_tasks.json`。程序异常退出后，
+原先处于 queued/running 的任务会恢复为明确的 failed 状态，而不会错误地显示
+为仍在运行。过长的最终报告会截断注入内容，完整文本写入
+`.tinyCode/subagent_results/<task-id>.md`。
+
+`sub_agent_wait` 使用自身的有界等待时间，不受普通工具 30 秒超时影响；等待超时
+不会取消后台任务。启用 Trace 时，每个后台任务会生成独立子 Trace，父 Trace
+通过 task ID 提供链接，子任务晚于父任务结束也不会污染父时间线。
 
 ---
 

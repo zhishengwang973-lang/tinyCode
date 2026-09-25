@@ -83,6 +83,7 @@ class SecurityPolicy:
         tool_name: str,
         path: str | None = None,
         command: str | None = None,
+        read_only: bool | None = None,
     ) -> RuleAction:
         """Evaluate rules and return the effective action.
 
@@ -95,7 +96,7 @@ class SecurityPolicy:
                     return rule.action
 
         # 2. Mode-based default
-        return self._mode_default(tool_name, path, command)
+        return self._mode_default(tool_name, path, command, read_only=read_only)
 
     def to_hitl_prompt(self, tool_name: str, params: dict[str, Any]) -> str:
         """Build the HITL prompt text."""
@@ -166,6 +167,8 @@ class SecurityPolicy:
         tool_name: str,
         path: str | None,
         command: str | None,
+        *,
+        read_only: bool | None = None,
     ) -> RuleAction:
         # Asking the foreground user is not a side effect and must not itself
         # trigger the separate security-approval prompt.
@@ -181,7 +184,11 @@ class SecurityPolicy:
             )
 
         # Determine if tool is read-only
-        is_read = self._is_read_tool(tool_name, command)
+        is_read = (
+            read_only
+            if read_only is not None
+            else self._is_read_tool(tool_name, command)
+        )
 
         if self.level == SecurityLevel.STRICT:
             # A path allow-list is only a read boundary.  Treating it as a

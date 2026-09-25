@@ -10,6 +10,29 @@ from tinyCode.subagent.roles.loader import RoleLoader
 
 
 class RoleLoaderTests(unittest.TestCase):
+    def test_project_roles_require_explicit_project_inclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            role_dir = root / ".tinyCode" / "roles"
+            role_dir.mkdir(parents=True)
+            (role_dir / "project.md").write_text(
+                "---\nname: project_role\n---\nProject instructions\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(role_loader, "BUILTIN_DIR", root / "missing_builtin"),
+                patch.object(role_loader, "USER_DIR", root / "missing_user"),
+            ):
+                untrusted = RoleLoader().load_all(
+                    cwd=root, include_project=False,
+                )
+                trusted = RoleLoader().load_all(
+                    cwd=root, include_project=True,
+                )
+
+        self.assertNotIn("project_role", untrusted)
+        self.assertIn("project_role", trusted)
+
     def test_malformed_frontmatter_is_skipped_without_stopping_valid_roles(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -93,6 +116,29 @@ class RoleLoaderTests(unittest.TestCase):
             self.assertEqual({}, roles)
             self.assertIn("tools_allow", stderr.getvalue())
             self.assertIn("tools_deny", stderr.getvalue())
+
+    def test_role_round_budget_fields_are_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "worker.md"
+            path.write_text(
+                "---\n"
+                "name: worker\n"
+                "max_rounds: 24\n"
+                "initial_rounds: 7\n"
+                "round_extension: 3\n"
+                "finalization_rounds: 2\n"
+                "---\nWorker\n",
+                encoding="utf-8",
+            )
+
+            role = RoleLoader()._parse(path)
+
+        self.assertIsNotNone(role)
+        assert role is not None
+        self.assertEqual(24, role.max_rounds)
+        self.assertEqual(7, role.initial_rounds)
+        self.assertEqual(3, role.round_extension)
+        self.assertEqual(2, role.finalization_rounds)
 
 
 if __name__ == "__main__":

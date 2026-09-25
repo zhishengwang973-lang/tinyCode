@@ -41,6 +41,8 @@ class SecurityGuard:
         self,
         tool_name: str,
         params: dict[str, Any],
+        *,
+        read_only: bool | None = None,
     ) -> tuple[bool, str]:
         """Run the full security pipeline.
 
@@ -88,7 +90,12 @@ class SecurityGuard:
 
         # ---- 3. Policy evaluation ----
         actions = [
-            self.policy.evaluate(tool_name, path=candidate, command=command)
+            self.policy.evaluate(
+                tool_name,
+                path=candidate,
+                command=command,
+                read_only=read_only,
+            )
             for candidate in (paths or [None])
         ]
         action = (
@@ -114,12 +121,23 @@ class SecurityGuard:
                 return False, f"非交互任务无法确认操作: {tool_name}"
             return True, "ask"
 
-    def needs_hitl(self, tool_name: str, params: dict[str, Any]) -> bool:
+    def needs_hitl(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        *,
+        read_only: bool | None = None,
+    ) -> bool:
         """Check whether this tool call requires human-in-the-loop."""
         paths = self._path_params(tool_name, params)
         command = self._command_param(params)
         actions = [
-            self.policy.evaluate(tool_name, path=path, command=command)
+            self.policy.evaluate(
+                tool_name,
+                path=path,
+                command=command,
+                read_only=read_only,
+            )
             for path in (paths or [None])
         ]
         return RuleAction.DENY not in actions and RuleAction.ASK in actions

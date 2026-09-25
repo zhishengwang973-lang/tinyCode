@@ -42,6 +42,7 @@ class TraceHandle:
     sequence: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     truncated: bool = False
+    detached: bool = False
 
 
 _ACTIVE_TRACE: ContextVar[TraceHandle | None] = ContextVar(
@@ -166,6 +167,7 @@ class TraceRecorder:
         self._runtime_enabled = config.enabled
         self._last_path: Path | None = None
         self._current_handle: TraceHandle | None = None
+        self._active_handles: dict[str, TraceHandle] = {}
         self.last_error = ""
 
     @property
@@ -195,9 +197,15 @@ class TraceRecorder:
         session_id: str = "",
         model: str = "",
         context_window: int = 0,
+        detached: bool = False,
+        parent_task_id: str = "",
+        role: str = "",
     ) -> TraceHandle | None:
         if not self.enabled:
             return None
+        parent_handle = _ACTIVE_TRACE.get() or self._current_handle
+        parent_span = _ACTIVE_SPAN.get()
+        handle: TraceHandle | None = None
         try:
             storage_dir = self._validated_storage_dir()
             storage_dir.mkdir(parents=True, exist_ok=True)
@@ -211,11 +219,14 @@ class TraceRecorder:
                 path=path,
                 started_ns=time_ns(),
                 started_monotonic_ns=monotonic_ns(),
+                detached=detached,
             )
+            self._active_handles[handle.trace_id] = handle
             _ACTIVE_TRACE.set(handle)
             _ACTIVE_SPAN.set(None)
-            self._current_handle = handle
-            self._last_path = path
+            if not detached:
+                self._current_handle = handle
+                self._last_path = path
             attributes: dict[str, Any] = {
                 "session_id": session_id,
                 "model": model,
@@ -224,14 +235,36 @@ class TraceRecorder:
                 "task_sha256": hashlib.sha256(task_text.encode("utf-8")).hexdigest()[:16],
                 "workspace": str(self._project_root),
             }
+            if detached and parent_handle is not None:
+                attributes["parent_trace_id"] = parent_handle.trace_id
+            if parent_task_id:
+                attributes["subagent_task_id"] = parent_task_id
+            if role:
+                attributes["subagent_role"] = role
             if self.capture_payloads:
                 attributes["task"] = task_text
             self.record("task_start", status="running", attributes=attributes)
+            if detached and parent_handle is not None:
+                self.record_for_handle(
+                    parent_handle,
+                    "subagent_trace_started",
+                    parent_span_id=parent_span,
+                    attributes={
+                        "task_id": parent_task_id,
+                        "role": role or "fork",
+                        "child_trace_id": handle.trace_id,
+                        "trace_path": str(path),
+                    },
+                )
             return handle
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
-            _ACTIVE_TRACE.set(None)
-            self._current_handle = None
+            if handle is not None:
+                self._active_handles.pop(handle.trace_id, None)
+            _ACTIVE_TRACE.set(parent_handle if detached else None)
+            _ACTIVE_SPAN.set(parent_span if detached else None)
+            if not detached:
+                self._current_handle = None
             return None
 
     def finish_task(
@@ -248,7 +281,8 @@ class TraceRecorder:
                 0.0,
                 (monotonic_ns() - handle.started_monotonic_ns) / 1_000_000,
             )
-            self.record(
+            self.record_for_handle(
+                handle,
                 "task_end",
                 status=status,
                 duration_ms=duration_ms,
@@ -260,6 +294,20 @@ class TraceRecorder:
                 _ACTIVE_SPAN.set(None)
             if self._current_handle is handle:
                 self._current_handle = None
+            self._active_handles.pop(handle.trace_id, None)
+
+    def record_for_handle(
+        self,
+        handle: TraceHandle,
+        event: str,
+        **kwargs: Any,
+    ) -> None:
+        """Record to an explicit trace without disturbing the caller context."""
+        token = _ACTIVE_TRACE.set(handle)
+        try:
+            self.record(event, **kwargs)
+        finally:
+            _ACTIVE_TRACE.reset(token)
 
     def span(
         self,
@@ -381,7 +429,11 @@ class TraceRecorder:
         try:
             paths = [
                 path for path in self._validated_storage_dir().glob("*.jsonl")
-                if not path.is_symlink() and path.is_file()
+                if (
+                    not path.is_symlink()
+                    and path.is_file()
+                    and not self._is_detached_trace(path)
+                )
             ]
             self._last_path = max(paths, key=lambda path: path.stat().st_mtime_ns) if paths else None
         except (OSError, ValueError) as exc:
@@ -396,13 +448,32 @@ class TraceRecorder:
         return render_text(path) if path else "暂无执行 Trace"
 
     def render_last_html(self) -> Path | None:
-        from tinyCode.tracing.render import render_html
+        from tinyCode.tracing.render import linked_trace_paths, render_html
 
         path = self.latest_path()
         if path is None:
             return None
         html_path = path.with_suffix(".html")
         try:
+            storage_dir = self._validated_storage_dir()
+            for child_path in linked_trace_paths(path):
+                resolved_child = child_path.resolve()
+                if (
+                    resolved_child.parent != storage_dir
+                    or resolved_child.suffix != ".jsonl"
+                    or resolved_child.is_symlink()
+                    or not resolved_child.is_file()
+                ):
+                    continue
+                child_html = resolved_child.with_suffix(".html")
+                child_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                if hasattr(os, "O_NOFOLLOW"):
+                    child_flags |= os.O_NOFOLLOW
+                child_descriptor = os.open(child_html, child_flags, 0o600)
+                with os.fdopen(
+                    child_descriptor, "w", encoding="utf-8",
+                ) as child_stream:
+                    child_stream.write(render_html(resolved_child))
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -468,8 +539,13 @@ class TraceRecorder:
                     self._remove_trace_pair(path)
                 else:
                     keep.append(path)
+            active_paths = {
+                handle.path.resolve()
+                for handle in self._active_handles.values()
+            }
             for path in keep[max(0, self._config.max_files - 1):]:
-                self._remove_trace_pair(path)
+                if path.resolve() not in active_paths:
+                    self._remove_trace_pair(path)
         except (OSError, ValueError) as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
 
@@ -477,6 +553,27 @@ class TraceRecorder:
     def _remove_trace_pair(path: Path) -> None:
         path.unlink(missing_ok=True)
         path.with_suffix(".html").unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_detached_trace(path: Path) -> bool:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if row.get("event") != "task_start":
+                        continue
+                    attrs = row.get("attributes")
+                    return (
+                        isinstance(attrs, dict)
+                        and isinstance(attrs.get("parent_trace_id"), str)
+                        and bool(attrs["parent_trace_id"])
+                    )
+        except OSError:
+            return False
+        return False
 
     def _sanitize(self, value: Any, depth: int = 0, key: str = "") -> Any:
         normalized_key = key.lower()

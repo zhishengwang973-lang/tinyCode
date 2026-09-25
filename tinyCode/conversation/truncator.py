@@ -47,6 +47,7 @@ class ToolResultTruncator:
         self._cfg = config or TruncateConfig()
         self._sequence = 0
         self._stored_results: dict[str, Path] = {}
+        self._processed_results: dict[str, Message] = {}
         self.storage_error = ""
         self.set_storage_dir(self._cfg.storage_dir)
 
@@ -72,6 +73,7 @@ class ToolResultTruncator:
         self._cfg.storage_dir = storage_dir.resolve()
         self._sequence = 0
         self._stored_results.clear()
+        self._processed_results.clear()
         self.storage_error = ""
         try:
             self._cfg.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -129,8 +131,14 @@ class ToolResultTruncator:
         result: list[Message] = []
         for i, msg in enumerate(messages):
             if i in to_truncate and self._tool_result_content(msg) is not None:
+                result_key = self._tool_result_key(msg)
+                cached_message = self._processed_results.get(result_key)
+                if cached_message is not None:
+                    result.append(cached_message)
+                    continue
                 truncated, file_path = self._truncate_tool_msg_with_path(msg)
                 result.append(truncated)
+                self._processed_results[result_key] = truncated
                 infos.append({
                     "tool_name": self._tool_name(msg),
                     "original_chars": len(self._tool_result_content(msg) or ""),
@@ -212,3 +220,25 @@ class ToolResultTruncator:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     return str(block.get("tool_use_id", "unknown"))
         return "unknown"
+
+    def _tool_result_key(self, msg: Message) -> str:
+        """Return a stable identity for an immutable protocol tool result."""
+        if msg.get("role") == "tool":
+            call_id = msg.get("tool_call_id")
+            if isinstance(call_id, str) and call_id:
+                return f"openai:{call_id}"
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                if isinstance(call_id, str) and call_id:
+                    return f"anthropic:{call_id}"
+        # Direct/library callers may omit protocol IDs. Content addressing
+        # retains correctness while production messages use the O(1) ID path.
+        value = self._tool_result_content(msg) or ""
+        digest = hashlib.sha256(
+            value.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        return f"content:{self._tool_name(msg)}:{digest}"

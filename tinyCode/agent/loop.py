@@ -13,6 +13,7 @@ import httpx
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
+    BackgroundResultsAppliedEvent,
     AgentEvent,
     ErrorEvent,
     HITLRequestEvent,
@@ -127,6 +128,9 @@ class AgentLoop:
         trace_recorder: TraceRecorder | None = None,
         recovery_store: TaskRecoveryStore | None = None,
         task_mode_router: TaskModeRouter | None = None,
+        background_context: Callable[[], list[str]] | None = None,
+        auto_extension_prompt: str = "",
+        finalization_rounds: int = 0,
     ) -> None:
         self._provider = provider
         self._tool_registry = tool_registry
@@ -162,6 +166,22 @@ class AgentLoop:
         self._trace_recorder = trace_recorder
         self._recovery_store = recovery_store
         self._task_mode_router = task_mode_router
+        self._background_context = background_context
+        self._auto_extension_prompt = (
+            auto_extension_prompt.strip()
+            if isinstance(auto_extension_prompt, str)
+            else ""
+        )
+        self._finalization_rounds = max(
+            0,
+            min(
+                finalization_rounds
+                if isinstance(finalization_rounds, int)
+                and not isinstance(finalization_rounds, bool)
+                else 0,
+                self._hard_max_rounds,
+            ),
+        )
         self._recovery_task_id: str | None = None
         self._context_assembler = PromptContextAssembler(
             protocol=provider.config.protocol,
@@ -344,6 +364,7 @@ class AgentLoop:
     async def run(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         """Run one user turn and keep history valid if the pipeline fails."""
         history.flush_deferred()
+        self._apply_background_context(history)
         start_index = len(history.get_messages())
         self.cache_hit = False
         self.turn_cache_usage = CacheUsage()
@@ -413,6 +434,23 @@ class AgentLoop:
                 return
 
             self._active_round = round_num
+
+            remaining_rounds = budget.hard_limit - round_num + 1
+            if (
+                self._finalization_rounds
+                and remaining_rounds <= self._finalization_rounds
+            ):
+                if remaining_rounds == 1:
+                    finalization_prompt = (
+                        "[最终收敛阶段] 这是最后一个可用轮次。禁止继续调用工具；"
+                        "请立即基于已有证据输出完整、可交付的最终结果。"
+                    )
+                else:
+                    finalization_prompt = (
+                        f"[最终收敛阶段] 仅剩 {remaining_rounds} 个轮次。停止扩大"
+                        "调查范围；最多完成一批不可缺少的读取，然后输出最终结果。"
+                    )
+                self._prompt_injector.queue_injection(finalization_prompt)
 
             # Recovery instructions are real events in the conversation, not
             # a temporary prefix injected before all prior messages.  Keeping
@@ -754,8 +792,10 @@ class AgentLoop:
                     if request_history is not history:
                         request_history.add_assistant_message(response_text)
                 history_size_before_steering = len(history.get_messages())
+                background_count = self._apply_background_context(history)
                 deferred_count = history.flush_steering()
-                if deferred_count:
+                pending_count = deferred_count + background_count
+                if pending_count:
                     if request_history is not history:
                         # Copy only newly flushed input into the isolated current
                         # turn, keeping unrelated previous answers out.
@@ -764,10 +804,16 @@ class AgentLoop:
                         ]:
                             request_history.add_raw_message(message)
                     can_continue = round_num < budget.hard_limit
-                    yield SteeringAppliedEvent(
-                        message_count=deferred_count,
-                        continued=can_continue,
-                    )
+                    if deferred_count:
+                        yield SteeringAppliedEvent(
+                            message_count=deferred_count,
+                            continued=can_continue,
+                        )
+                    if background_count:
+                        yield BackgroundResultsAppliedEvent(
+                            result_count=background_count,
+                            continued=can_continue,
+                        )
                     if can_continue:
                         previous_limit = budget.current_limit
                         budget.current_limit = min(
@@ -827,7 +873,7 @@ class AgentLoop:
                     )
                     continue
 
-                if not self._tool_allowed_for_task(tc.name):
+                if not self._tool_allowed_for_task(tc):
                     blocked = await self._block_tool(tc)
                     blocked_result = ToolResult(
                         success=False, content="", error=blocked.reason,
@@ -842,9 +888,11 @@ class AgentLoop:
                     guard = self._security_guard
                     if guard is None:
                         raise RuntimeError("安全确认 Future 存在但 SecurityGuard 未配置")
-                    prompt = guard.build_hitl_prompt(tc.name, tc.input)
+                    approval_params = self._approval_parameters(tc)
+                    prompt = guard.build_hitl_prompt(tc.name, approval_params)
                     yield HITLRequestEvent(
-                        tool_name=tc.name, params=tc.input, prompt=prompt, future=hitl_future,
+                        tool_name=tc.name, params=approval_params,
+                        prompt=prompt, future=hitl_future,
                     )
                     decision = await hitl_future
                     if decision == HITLDecision.DENY:
@@ -855,7 +903,9 @@ class AgentLoop:
                             tool_name=tc.name, call_id=tc.id, result=blocked_result,
                         )
                         continue
-                    guard.apply_hitl(decision, tc.name, tc.input)
+                    guard.apply_hitl(
+                        decision, tc.name, self._security_parameters(tc),
+                    )
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
@@ -894,7 +944,7 @@ class AgentLoop:
                     )
                     continue
 
-                if not self._tool_allowed_for_task(tc.name):
+                if not self._tool_allowed_for_task(tc):
                     blocked = await self._block_tool(tc)
                     blocked_result = ToolResult(
                         success=False, content="", error=blocked.reason,
@@ -909,9 +959,11 @@ class AgentLoop:
                     guard = self._security_guard
                     if guard is None:
                         raise RuntimeError("安全确认 Future 存在但 SecurityGuard 未配置")
-                    prompt = guard.build_hitl_prompt(tc.name, tc.input)
+                    approval_params = self._approval_parameters(tc)
+                    prompt = guard.build_hitl_prompt(tc.name, approval_params)
                     yield HITLRequestEvent(
-                        tool_name=tc.name, params=tc.input, prompt=prompt, future=hitl_future,
+                        tool_name=tc.name, params=approval_params,
+                        prompt=prompt, future=hitl_future,
                     )
                     decision = await hitl_future
                     if decision == HITLDecision.DENY:
@@ -922,7 +974,9 @@ class AgentLoop:
                             tool_name=tc.name, call_id=tc.id, result=blocked_result,
                         )
                         continue
-                    guard.apply_hitl(decision, tc.name, tc.input)
+                    guard.apply_hitl(
+                        decision, tc.name, self._security_parameters(tc),
+                    )
                 elif not allowed:
                     blocked_result = ToolResult(success=False, content="", error=reason)
                     self._append_tool_result(history, tc, blocked_result)
@@ -940,17 +994,25 @@ class AgentLoop:
                     tool_name=tc.name, call_id=tc.id, result=result,
                 )
 
+            background_count = self._apply_background_context(history)
             deferred_count = history.flush_steering()
-            if deferred_count:
+            pending_count = deferred_count + background_count
+            if pending_count:
                 await self._refresh_task_mode_after_steering(history)
                 tools_enabled = self._task_mode.tools_enabled
                 if request_history is not history:
                     request_history = history
                 can_continue = round_num < budget.hard_limit
-                yield SteeringAppliedEvent(
-                    message_count=deferred_count,
-                    continued=can_continue,
-                )
+                if deferred_count:
+                    yield SteeringAppliedEvent(
+                        message_count=deferred_count,
+                        continued=can_continue,
+                    )
+                if background_count:
+                    yield BackgroundResultsAppliedEvent(
+                        result_count=background_count,
+                        continued=can_continue,
+                    )
                 if can_continue:
                     previous_limit = budget.current_limit
                     budget.current_limit = min(
@@ -969,7 +1031,7 @@ class AgentLoop:
                         )
 
             progress = progress_watchdog.observe(round_num, round_observations)
-            if deferred_count:
+            if pending_count:
                 # A user steering message supersedes the strategy that produced
                 # this round. Give the new direction a fresh observation window.
                 progress_watchdog.reset_strategy()
@@ -982,7 +1044,7 @@ class AgentLoop:
                 )
 
             if round_num >= budget.hard_limit:
-                if not deferred_count and progress.requires_intervention:
+                if not pending_count and progress.requires_intervention:
                     yield ProgressWarningEvent(
                         state=progress.state.value,
                         reasons=progress.reasons,
@@ -995,7 +1057,7 @@ class AgentLoop:
                 yield AgentDoneEvent("hard_max_rounds")
                 return
 
-            if not deferred_count and progress.requires_intervention:
+            if not pending_count and progress.requires_intervention:
                 await self._fire_round_end(
                     round_num, len(tool_calls), "awaiting_progress_decision",
                 )
@@ -1108,6 +1170,10 @@ class AgentLoop:
                 )
                 if decision.action == RoundLimitDecisionAction.AUTO:
                     budget.auto_extend = True
+                    if self._auto_extension_prompt:
+                        self._prompt_injector.queue_injection(
+                            self._auto_extension_prompt,
+                        )
                 if self._active_round:
                     await self._fire_round_end(
                         round_num, len(tool_calls), "continued",
@@ -1187,6 +1253,33 @@ class AgentLoop:
             await self._fire_round_end(round_number, 0, "error")
 
     # -- message assembly -----------------------------------------------------
+
+    def _apply_background_context(self, history: ConversationHistory) -> int:
+        """Append completed worker reports as bounded internal context."""
+        if self._background_context is None:
+            return 0
+        try:
+            messages = self._background_context()
+        except Exception as exc:
+            if self._trace_recorder is not None:
+                self._trace_recorder.record(
+                    "background_context_error",
+                    status="error",
+                    attributes={"error_type": type(exc).__name__, "error": str(exc)},
+                )
+            return 0
+        count = 0
+        for content in messages:
+            if not isinstance(content, str) or not content.strip():
+                continue
+            history.add_context_message(content)
+            count += 1
+        if count and self._trace_recorder is not None:
+            self._trace_recorder.record(
+                "background_results_applied",
+                attributes={"result_count": count},
+            )
+        return count
 
     def _assemble_messages(
         self, history: ConversationHistory, round_num: int,
@@ -1493,6 +1586,7 @@ class AgentLoop:
 
                 except Exception as exc:
                     await self._close_provider_stream(stream)
+                    error_text = str(exc).strip() or repr(exc)
                     retryable = (
                         isinstance(
                             exc,
@@ -1515,7 +1609,7 @@ class AgentLoop:
                             "retry": attempt,
                             "first_token_ms": first_token_ms,
                             "error_type": type(exc).__name__,
-                            "error": str(exc),
+                            "error": error_text,
                             "retryable": retryable,
                         })
                     if will_retry:
@@ -1526,7 +1620,7 @@ class AgentLoop:
                                 "request": request_number,
                                 "next_attempt": attempt,
                                 "error_type": type(exc).__name__,
-                                "error": str(exc),
+                                "error": error_text,
                             })
                         if self._retry_delay:
                             await asyncio.sleep(self._retry_delay * attempt)
@@ -1688,10 +1782,17 @@ class AgentLoop:
         if tool_name == "request_user_input":
             return True
         tool = self._tool_registry.get(tool_name)
-        return tool is not None and tool.category is ToolCategory.READ
+        return tool is not None and tool.available_in_inspect
 
-    def _tool_allowed_for_task(self, tool_name: str) -> bool:
-        return self._tool_allowed_in_mode(tool_name, self._task_mode)
+    def _tool_allowed_for_task(self, tc: ToolCall) -> bool:
+        if not self._tool_allowed_in_mode(tc.name, self._task_mode):
+            return False
+        if self._task_mode is TaskMode.MODIFY and not self._plan_only:
+            return True
+        if tc.name == "request_user_input":
+            return True
+        tool = self._tool_registry.get(tc.name)
+        return tool is not None and not tool.may_modify(tc.input)
 
     def _validate_tool_call_identity(self, tc: ToolCall) -> str | None:
         if not isinstance(tc.id, str) or not tc.id:
@@ -1779,7 +1880,7 @@ class AgentLoop:
         )
         with trace_scope as trace_span:
             tool = self._tool_registry.get(tc.name)
-            may_modify = tool is None or tool.category.value != "read"
+            may_modify = tool is None or tool.may_modify(tc.input)
             if self._recovery_store is not None and self._recovery_task_id:
                 try:
                     self._recovery_store.record_tool_intent(
@@ -1853,6 +1954,11 @@ class AgentLoop:
                 f"Plan-only 模式已开启，工具 '{tc.name}' 不在只读白名单中，已被拦截。"
                 "请先关闭 plan-only 开关再执行修改操作。"
             )
+        elif tc.name == "sub_agent":
+            reason = (
+                "当前任务处于 inspect 只读模式，但该 Subagent 调用包含写入能力，"
+                "已被运行时拦截。请改用 background=true，或选择只开放读取工具的角色。"
+            )
         else:
             reason = (
                 f"当前任务处于 inspect 只读模式，工具 '{tc.name}' 可能产生副作用，"
@@ -1878,12 +1984,44 @@ class AgentLoop:
         if self._security_guard is None:
             return True, "ok", None
 
-        allowed, reason = self._security_guard.check(tc.name, tc.input)
+        tool = self._tool_registry.get(tc.name)
+        security_params = self._security_parameters(tc)
+        read_only = None if tool is None else not tool.may_modify(tc.input)
+        allowed, reason = self._security_guard.check(
+            tc.name,
+            security_params,
+            read_only=read_only,
+        )
         if allowed and reason == "ask":
             loop = asyncio.get_event_loop()
             future: asyncio.Future = loop.create_future()
             return True, "ask", future
         return allowed, reason, None
+
+    def _approval_parameters(self, tc: ToolCall) -> dict:
+        """Let a tool disclose its effective capability envelope for HITL."""
+        tool = self._tool_registry.get(tc.name)
+        if tool is None:
+            return dict(tc.input)
+        try:
+            details = tool.approval_parameters(tc.input)
+        except Exception:
+            # Approval rendering must never make an otherwise valid tool call
+            # fail. Security evaluation and execution still use the original
+            # provider arguments.
+            return dict(tc.input)
+        return details if isinstance(details, dict) else dict(tc.input)
+
+    def _security_parameters(self, tc: ToolCall) -> dict:
+        """Build rule-matching arguments without changing execution input."""
+        tool = self._tool_registry.get(tc.name)
+        if tool is None:
+            return dict(tc.input)
+        try:
+            details = tool.security_parameters(tc.input)
+        except Exception:
+            return dict(tc.input)
+        return details if isinstance(details, dict) else dict(tc.input)
 
     def record_round(self, user_msg: str, assistant_msg: str) -> None:
         """Record a completed round for auto-note purposes."""
@@ -1902,7 +2040,9 @@ class AgentLoop:
         if self._security_guard:
             self._security_guard.set_level(level)
 
-    def tool_may_modify_workspace(self, tool_name: str) -> bool:
+    def tool_may_modify_workspace(
+        self, tool_name: str, params: dict | None = None,
+    ) -> bool:
         """Whether a call needs a before/after workspace snapshot.
 
         Read tools are declared concurrency-safe and must not mutate the
@@ -1910,7 +2050,7 @@ class AgentLoop:
         extension cannot silently disappear from change reporting.
         """
         tool = self._tool_registry.get(tool_name)
-        return tool is None or tool.category.value != "read"
+        return tool is None or tool.may_modify(params or {})
 
     def set_workspace(self, workspace: Path) -> None:
         if self._security_guard:

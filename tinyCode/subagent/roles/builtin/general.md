@@ -1,7 +1,10 @@
 ---
 name: general
 description: 通用工作器——可使用全部工具，适合需要读写和命令执行的综合任务
-max_rounds: 8
+max_rounds: 32
+initial_rounds: 10
+round_extension: 5
+finalization_rounds: 2
 permission: normal
 ---
 

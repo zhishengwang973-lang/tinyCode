@@ -102,10 +102,33 @@ class ToolResultTruncatorTests(unittest.TestCase):
             ))
 
             _, first_infos = truncator.process_round(messages)
-            _, second_infos = truncator.process_round(messages)
+            second_messages, second_infos = truncator.process_round(messages)
 
-            self.assertEqual(first_infos[0]["file_path"], second_infos[0]["file_path"])
+            self.assertEqual([], second_infos)
+            self.assertIn(first_infos[0]["file_path"], second_messages[0]["content"])
             self.assertEqual(1, len(list(Path(tmp).glob("*.txt"))))
+
+    def test_protocol_call_id_emits_only_one_truncation_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            messages = [{
+                "role": "tool",
+                "tool_call_id": "call-large",
+                "name": "read_file",
+                "content": "x" * 20,
+            }]
+            truncator = ToolResultTruncator(TruncateConfig(
+                per_result_threshold=10,
+                total_round_threshold=100,
+                preview_length=5,
+                storage_dir=Path(tmp),
+            ))
+
+            first_messages, first_infos = truncator.process_round(messages)
+            second_messages, second_infos = truncator.process_round(messages)
+
+            self.assertEqual(1, len(first_infos))
+            self.assertEqual([], second_infos)
+            self.assertEqual(first_messages, second_messages)
 
     def test_cached_result_remains_available_without_new_truncation(self):
         with tempfile.TemporaryDirectory() as tmp:
