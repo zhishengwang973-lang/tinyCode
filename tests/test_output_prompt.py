@@ -26,6 +26,16 @@ class OutputPromptTests(unittest.TestCase):
         self.assertIn("普通文本会被视为任务已经完成", prompt)
         self.assertIn("安全权限确认由系统的 HITL 流程处理", prompt)
 
+    def test_subagent_policy_defines_positive_and_negative_triggers(self):
+        prompt = PromptBuilder().build()
+
+        self.assertIn("### Subagent 委派策略", prompt)
+        self.assertIn("两个及以上互不依赖的模块", prompt)
+        self.assertIn("不要委派：通用问答或独立代码片段", prompt)
+        self.assertIn("不要按文件机械拆分", prompt)
+        self.assertIn("多个可写任务的文件范围不得重叠", prompt)
+        self.assertIn("只有任务确实依赖当前对话中的大量上下文时才使用 fork", prompt)
+
     def test_direct_answer_prompt_omits_only_tool_operations_policy(self):
         prompt = PromptBuilder().build(include_tool_instructions=False)
 

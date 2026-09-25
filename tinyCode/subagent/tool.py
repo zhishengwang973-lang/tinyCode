@@ -50,9 +50,13 @@ class SubAgentTool(BaseTool):
             for role in list(self._roles.values())[:50]
         ) or "fork"
         return (
-            "创建一个子工作器执行任务。可用角色: "
+            "将边界明确、可独立交付的工作流委派给子工作器。仅在任务可并行、"
+            "大范围只读扫描需要压缩为报告，或独立验证可减少主上下文占用时使用；"
+            "简单问答、少量明确文件、局部修改或强顺序依赖任务不要调用。可用角色: "
             f"{role_list}（或省略 role 使用 fork 模式继承当前对话）。"
-            "后台运行: background=true；后台任务强制只读，适合 inspect 审查任务。"
+            "优先使用预定义角色；仅在确实依赖当前对话上下文时使用 fork。"
+            "后台运行: background=true；后台任务强制只读，适合独立的 inspect 审查任务。"
+            "不要让多个可写任务修改重叠文件。"
         )
 
     @property
@@ -92,9 +96,20 @@ class SubAgentTool(BaseTool):
     @property
     def parameters(self) -> list[ToolParameter]:
         return [
-            ToolParameter("task", "string", "要执行的任务描述"),
-            ToolParameter("role", "string", "预定义角色名，省略则使用 fork 模式", required=False),
-            ToolParameter("background", "boolean", "是否后台运行（fork 模式强制后台）", required=False),
+            ToolParameter(
+                "task", "string",
+                "可独立完成的任务说明，必须包含目标、范围、约束和预期交付物",
+            ),
+            ToolParameter(
+                "role", "string",
+                "预定义角色名；仅在任务依赖当前对话上下文时省略并使用 fork 模式",
+                required=False,
+            ),
+            ToolParameter(
+                "background", "boolean",
+                "是否作为可并行的只读后台任务运行（fork 模式强制后台）",
+                required=False,
+            ),
         ]
 
     def approval_parameters(self, params: dict[str, Any]) -> dict[str, Any]:

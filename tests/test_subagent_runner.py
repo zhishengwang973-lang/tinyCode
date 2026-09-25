@@ -129,6 +129,26 @@ class CapturingFinalTextProvider(FinalTextProvider):
 
 
 class SubAgentRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_sub_agent_schema_explains_when_to_delegate(self):
+        tool = SubAgentTool(
+            runner=BlockingRunner(),
+            task_manager=BackgroundTaskManager(),
+            roles={
+                "explorer": SubAgentRole(
+                    name="explorer", description="只读探索",
+                ),
+            },
+            history=ConversationHistory(),
+        )
+
+        self.assertIn("边界明确、可独立交付", tool.description)
+        self.assertIn("简单问答", tool.description)
+        self.assertIn("不要让多个可写任务修改重叠文件", tool.description)
+        parameters = {parameter.name: parameter for parameter in tool.parameters}
+        self.assertIn("目标、范围、约束和预期交付物", parameters["task"].description)
+        self.assertIn("依赖当前对话上下文", parameters["role"].description)
+        self.assertIn("可并行的只读后台任务", parameters["background"].description)
+
     def test_sub_agent_approval_discloses_effective_capabilities(self):
         roles = {
             "worker": SubAgentRole(
