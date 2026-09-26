@@ -9,7 +9,10 @@ def create(ui: UIControl) -> CommandMeta:
         if not args:
             return "用法: /image [--detail low|high|original|auto] <路径或URL> [问题]"
         if not ui.supports_image_input():
-            return "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+            return (
+                "当前模型不支持图片输入；请切换到视觉模型，"
+                "如 deepseek-flash、gpt-4o 或 Claude 3+"
+            )
 
         detail = "auto"
         remaining = list(args)

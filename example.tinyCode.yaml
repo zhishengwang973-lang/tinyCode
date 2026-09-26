@@ -23,7 +23,7 @@ providers:
     api_key_env: DEEPSEEK_API_KEY
     context_window: 1000000
 
-  # DeepSeek 图片理解模型（/image 命令）
+  # DeepSeek 图片理解模型（OpenAI 的 gpt-4o 与 Claude 3+ 也支持图片）
   - name: deepseek-vision
     protocol: deepseek
     model: deepseek-flash

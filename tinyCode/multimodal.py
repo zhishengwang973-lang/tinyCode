@@ -26,6 +26,8 @@ SUPPORTED_IMAGE_TYPES = {
 SUPPORTED_DETAILS = {"low", "high", "original", "auto"}
 MAX_INLINE_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_ANTHROPIC_IMAGE_BYTES = 10 * 1024 * 1024
+DEFAULT_ANTHROPIC_IMAGE_LIMIT = 100
 MAX_IMAGE_URL_CHARS = 8192
 IMAGE_TOKEN_ESTIMATE = 1024
 
@@ -309,7 +311,7 @@ def build_image_user_content(
             raise ImageInputError("图片文件为空")
         if size > MAX_INLINE_IMAGE_BYTES:
             raise ImageInputError(
-                "本地图片不能超过 32 MiB；更大的图片需要使用 DeepSeek Files API"
+                "本地图片不能超过 32 MiB；更大的图片需要使用对应 Provider 的 Files API"
             )
         try:
             with original.open("rb") as handle:
@@ -429,7 +431,7 @@ def materialize_deepseek_images(messages: list[Message]) -> list[Message]:
         )
         if has_image and message.get("role") != "user":
             raise ProviderError(
-                "DeepSeek 图片只能出现在 user 消息中",
+                "图片只能出现在 user 消息中",
                 code="invalid_image_role",
             )
         converted: list[dict[str, Any]] = []
@@ -490,10 +492,84 @@ def materialize_deepseek_images(messages: list[Message]) -> list[Message]:
         message["content"] = converted
     if image_count > 600:
         raise ProviderError(
-            "DeepSeek 单个请求最多包含 600 张图片",
+            "单个请求最多包含 600 张图片",
             code="too_many_images",
         )
     return result
+
+
+def materialize_openai_images(messages: list[Message]) -> list[Message]:
+    """Convert persistent attachments to OpenAI Chat Completions image blocks."""
+    return materialize_deepseek_images(messages)
+
+
+def materialize_anthropic_images(
+    messages: list[Message],
+    *,
+    max_images: int = DEFAULT_ANTHROPIC_IMAGE_LIMIT,
+) -> list[Message]:
+    """Convert persistent attachments to Anthropic Messages image blocks."""
+    result = materialize_deepseek_images(messages)
+    image_count = 0
+    for message in result:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        converted: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "image_url":
+                converted.append(block)
+                continue
+            image_url = block.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            if not isinstance(url, str) or not url:
+                raise ProviderError("图片地址无效", code="invalid_image")
+            image_count += 1
+            if url.startswith("data:"):
+                media_type, data = _decode_image_data_url(url)
+                if len(data) > MAX_ANTHROPIC_IMAGE_BYTES:
+                    raise ProviderError(
+                        "Anthropic 单张本地图片不能超过 10 MiB",
+                        code="image_too_large",
+                    )
+                converted.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                })
+            elif urlsplit(url).scheme in {"http", "https"}:
+                converted.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
+            else:
+                raise ProviderError(
+                    "Anthropic 图片只支持 http(s) URL 或本地附件",
+                    code="invalid_image",
+                )
+        message["content"] = converted
+    if image_count > max_images:
+        raise ProviderError(
+            f"Anthropic 当前模型单个请求最多包含 {max_images} 张图片",
+            code="too_many_images",
+        )
+    return result
+
+
+def _decode_image_data_url(url: str) -> tuple[str, bytes]:
+    header, separator, encoded = url.partition(",")
+    if not separator or not header.startswith("data:") or not header.endswith(";base64"):
+        raise ProviderError("本地图片 data URL 无效", code="invalid_image")
+    media_type = header[5:-7]
+    if media_type not in SUPPORTED_IMAGE_TYPES:
+        raise ProviderError("本地图片格式无效", code="invalid_image")
+    try:
+        return media_type, base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ProviderError("本地图片编码无效", code="invalid_image") from exc
 
 
 def _sha256_file(path: Path) -> str:

@@ -20,6 +20,7 @@ from tinyCode.providers.base import (
     read_error_detail,
 )
 from tinyCode.providers.sse import SSEDecoder
+from tinyCode.multimodal import materialize_openai_images
 
 
 class OpenAIProvider(BaseProvider):
@@ -40,6 +41,23 @@ class OpenAIProvider(BaseProvider):
         tools: list[dict] | None = None,
         system_blocks: list[dict] | None = None,
     ) -> AsyncIterator[str | ToolCall]:
+        has_images = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(block, dict)
+                and block.get("type") in {"image_file", "image_url"}
+                for block in message["content"]
+            )
+            for message in messages
+        )
+        if has_images:
+            if not self.supports_images():
+                raise ProviderError(
+                    "当前 OpenAI 模型不支持图片输入；请切换到视觉模型",
+                    code="image_not_supported",
+                )
+            messages = materialize_openai_images(messages)
+
         url = build_api_url(self.config.base_url, "/v1/chat/completions")
 
         body: dict = {
@@ -189,6 +207,17 @@ class OpenAIProvider(BaseProvider):
                         name=tool_name,
                         input=tool_input,
                     )
+
+    def supports_images(self) -> bool:
+        model = self.config.model.strip().lower()
+        return (
+            model.startswith("gpt-4")
+            or model.startswith("gpt-5")
+            or model.startswith("chatgpt-4")
+            or model.startswith("o1")
+            or model.startswith("o3")
+            or model.startswith("o4")
+        )
 
     # -- tool message formatting (OpenAI style) --------------------------------
 

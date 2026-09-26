@@ -565,7 +565,8 @@ class TinyCodeTUI(UIControl):
         """Validate, persist, and start a user-selected image turn."""
         if not self.supports_image_input():
             self._print_warning(
-                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+                "当前模型不支持图片输入；请切换到视觉模型，"
+                "如 deepseek-flash、gpt-4o 或 Claude 3+"
             )
             return False
         try:

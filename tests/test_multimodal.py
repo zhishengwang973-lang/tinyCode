@@ -10,7 +10,9 @@ from tinyCode.multimodal import (
     ImageInputError,
     build_image_user_content,
     describe_user_content,
+    materialize_anthropic_images,
     materialize_deepseek_images,
+    materialize_openai_images,
     paste_clipboard_image,
     select_local_image,
 )
@@ -60,6 +62,26 @@ class MultimodalInputTests(unittest.TestCase):
                 image["image_url"]["url"],
             )
             self.assertEqual("image_file", content[1]["type"])
+
+    def test_openai_and_anthropic_materialize_local_images_for_their_protocols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "screen.png"
+            source.write_bytes(_PNG)
+            content, _ = build_image_user_content(
+                str(source), "识别文字", project_root=root,
+            )
+            messages = [{"role": "user", "content": content}]
+
+            openai = materialize_openai_images(messages)
+            anthropic = materialize_anthropic_images(messages)
+
+            self.assertEqual("image_url", openai[0]["content"][1]["type"])
+            image = anthropic[0]["content"][1]
+            self.assertEqual("image", image["type"])
+            self.assertEqual("base64", image["source"]["type"])
+            self.assertEqual("image/png", image["source"]["media_type"])
+            self.assertEqual(_PNG, base64.b64decode(image["source"]["data"]))
 
     def test_invalid_file_content_is_rejected_even_with_image_extension(self):
         with tempfile.TemporaryDirectory() as tmp:

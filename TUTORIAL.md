@@ -237,7 +237,8 @@ API 地址或指定密钥。
 
 **DeepSeek Reasoner**：`deepseek-reasoner` 模型的推理过程自动以 `[Reasoning]` 标签渲染。
 
-**DeepSeek 图片输入**：将 `active_provider` 切换为使用 `deepseek-flash` 的 Provider。
+**图片输入**：OpenAI 的 GPT-4、GPT-5 与 o 系列视觉模型、Anthropic 的 Claude 3+，以及
+DeepSeek 的 `deepseek-flash` 都支持图片输入。将 `active_provider` 切换为其中之一即可。
 全屏 TUI 点击输入框左侧的 `+` 会直接打开系统文件选择器；在 macOS 中也可以按
 `Ctrl-V` 直接读取系统剪贴板里的图片。选择或粘贴后，图片会显示在输入框上方，输入
 问题并按 Enter 即可一起发送。如果终端支持传递 Command 修饰键，`⌘V` 也能触发；
@@ -250,7 +251,8 @@ macOS Terminal 通常会吞掉图片剪贴板的 `⌘V`，此时请使用 `Ctrl-
 ```
 
 支持 JPEG、PNG、GIF、WebP，本地图片最大 32 MiB。`low` 会先缩放到 512×512，
-速度更快、Token 更少；`high`、`original` 和 `auto` 保留原图。本地图片会按内容摘要
+速度更快、Token 更少；`high`、`original` 和 `auto` 保留原图（这些 detail 选项适用于
+OpenAI/DeepSeek；Claude 由服务端自动处理分辨率）。本地图片会按内容摘要
 复制到项目 `.tinyCode/attachments/`，会话只保存引用，重启后仍可继续，不会把 Base64
 写入会话文件。图片当前只能在没有前台任务运行时作为新一轮输入发送。
 

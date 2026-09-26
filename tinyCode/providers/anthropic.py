@@ -21,8 +21,10 @@ from tinyCode.providers.base import (
     read_error_detail,
 )
 from tinyCode.providers.sse import SSEDecoder
+from tinyCode.multimodal import materialize_anthropic_images
 
 ANTHROPIC_VERSION = "2023-06-01"
+_MAX_ANTHROPIC_REQUEST_BYTES = 32 * 1024 * 1024
 
 
 class AnthropicProvider(BaseProvider):
@@ -52,6 +54,14 @@ class AnthropicProvider(BaseProvider):
     def supports_thinking(self) -> bool:
         return True
 
+    def supports_images(self) -> bool:
+        model = self.config.model.strip().lower()
+        if model.startswith("claude-3"):
+            return True
+        if not model.startswith("claude-"):
+            return False
+        return any(part.startswith(("4", "5")) for part in model.split("-"))
+
     @property
     def thinking_enabled(self) -> bool:
         return self._thinking_enabled
@@ -64,6 +74,26 @@ class AnthropicProvider(BaseProvider):
         tools: list[dict] | None = None,
         system_blocks: list[dict] | None = None,
     ) -> AsyncIterator[str | ToolCall]:
+        has_images = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(block, dict)
+                and block.get("type") in {"image_file", "image_url"}
+                for block in message["content"]
+            )
+            for message in messages
+        )
+        if has_images:
+            if not self.supports_images():
+                raise ProviderError(
+                    "当前 Anthropic 模型不支持图片输入；请切换到 Claude 3 或更高版本",
+                    code="image_not_supported",
+                )
+            # 100 is the safe API limit for Claude's common 200k-context
+            # models. Keeping this conservative avoids relying on a manually
+            # configured context window that may not match the hosted model.
+            messages = materialize_anthropic_images(messages)
+
         url = build_api_url(self.config.base_url, "/v1/messages")
 
         body: dict[str, Any] = {
@@ -96,6 +126,18 @@ class AnthropicProvider(BaseProvider):
         # Advance a cache entry with the growing conversation while retaining
         # the explicit stable system/tool breakpoints above.
         body["cache_control"] = {"type": "ephemeral"}
+
+        if has_images:
+            request_size = len(json.dumps(
+                body,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            if request_size > _MAX_ANTHROPIC_REQUEST_BYTES:
+                raise ProviderError(
+                    "Anthropic 请求体超过 32 MiB；请减少图片或新建会话",
+                    code="request_too_large",
+                )
 
         headers = {
             "x-api-key": self.config.api_key or "",

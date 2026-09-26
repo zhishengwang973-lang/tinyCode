@@ -624,7 +624,8 @@ class _TinyCodeFullscreenApp(App[None]):
             return
         if not self.owner.supports_image_input():
             self.owner._print_warning(
-                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+                "当前模型不支持图片输入；请切换到视觉模型，"
+                "如 deepseek-flash、gpt-4o 或 Claude 3+"
             )
             return
         try:
@@ -655,7 +656,8 @@ class _TinyCodeFullscreenApp(App[None]):
             return True
         if not self.owner.supports_image_input():
             self.owner._print_warning(
-                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+                "当前模型不支持图片输入；请切换到视觉模型，"
+                "如 deepseek-flash、gpt-4o 或 Claude 3+"
             )
             return True
         self._stage_image_source(str(path))

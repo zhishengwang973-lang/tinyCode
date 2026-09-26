@@ -571,6 +571,65 @@ class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raised.exception.retryable)
 
 
+    def test_current_claude_models_support_images(self):
+        for model in (
+            "claude-3-5-sonnet-latest",
+            "claude-sonnet-4-6",
+            "claude-opus-5-5",
+        ):
+            with self.subTest(model=model):
+                provider = AnthropicProvider(ProviderConfig(
+                    name="anthropic", protocol="anthropic", model=model,
+                    base_url="https://api.anthropic.com", api_key="test-key",
+                ))
+                self.assertTrue(provider.supports_images())
+
+    async def test_non_vision_claude_model_rejects_image_before_network(self):
+        provider = AnthropicProvider(ProviderConfig(
+            name="anthropic", protocol="anthropic", model="claude-2.1",
+            base_url="https://api.anthropic.com", api_key="test-key",
+        ))
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ],
+        }]
+
+        with self.assertRaises(ProviderError) as raised:
+            await _collect(provider.chat_stream(messages=messages))
+
+        self.assertEqual("image_not_supported", raised.exception.code)
+
+    async def test_claude_vision_request_uses_anthropic_image_source(self):
+        _FakeAsyncClient.lines = ["data: [DONE]"]
+        provider = AnthropicProvider(ProviderConfig(
+            name="anthropic", protocol="anthropic", model="claude-sonnet-4-6",
+            base_url="https://api.anthropic.com", api_key="test-key",
+        ))
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png", "detail": "low"},
+                },
+            ],
+        }]
+
+        with patch("tinyCode.providers.anthropic.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=messages))
+
+        image = _FakeAsyncClient.last_stream_kwargs["json"]["messages"][0]["content"][1]
+        self.assertEqual("image", image["type"])
+        self.assertEqual(
+            {"type": "url", "url": "https://example.com/a.png"},
+            image["source"],
+        )
+
+
 class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_object_sse_payload_is_skipped(self):
         _FakeAsyncClient.lines = [
@@ -879,6 +938,63 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("incomplete_tool_call", raised.exception.code)
         self.assertTrue(raised.exception.retryable)
+
+
+    def test_current_openai_models_support_images(self):
+        for model in ("gpt-4o", "gpt-4.1", "gpt-5", "o3"):
+            with self.subTest(model=model):
+                provider = OpenAIProvider(ProviderConfig(
+                    name="openai", protocol="openai", model=model,
+                    base_url="https://api.openai.com", api_key="test-key",
+                ))
+                self.assertTrue(provider.supports_images())
+        legacy = OpenAIProvider(ProviderConfig(
+            name="openai", protocol="openai", model="gpt-3.5-turbo",
+            base_url="https://api.openai.com", api_key="test-key",
+        ))
+        self.assertFalse(legacy.supports_images())
+
+    async def test_non_vision_openai_model_rejects_image_before_network(self):
+        provider = OpenAIProvider(ProviderConfig(
+            name="openai", protocol="openai", model="gpt-3.5-turbo",
+            base_url="https://api.openai.com", api_key="test-key",
+        ))
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ],
+        }]
+
+        with self.assertRaises(ProviderError) as raised:
+            await _collect(provider.chat_stream(messages=messages))
+
+        self.assertEqual("image_not_supported", raised.exception.code)
+
+    async def test_openai_vision_request_uses_chat_completion_image_url(self):
+        _FakeAsyncClient.lines = ["data: [DONE]"]
+        provider = OpenAIProvider(ProviderConfig(
+            name="openai", protocol="openai", model="gpt-4o",
+            base_url="https://api.openai.com", api_key="test-key",
+        ))
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png", "detail": "low"},
+                },
+            ],
+        }]
+
+        with patch("tinyCode.providers.openai.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=messages))
+
+        image = _FakeAsyncClient.last_stream_kwargs["json"]["messages"][0]["content"][1]
+        self.assertEqual("image_url", image["type"])
+        self.assertEqual("low", image["image_url"]["detail"])
 
 
 class DeepSeekProviderTests(unittest.IsolatedAsyncioTestCase):
