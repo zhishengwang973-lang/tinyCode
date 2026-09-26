@@ -210,10 +210,15 @@ class OpenAIProvider(BaseProvider):
 
     def supports_images(self) -> bool:
         model = self.config.model.strip().lower()
+        # Do not use the broad ``gpt-4`` prefix here: legacy GPT-4 and its
+        # dated snapshots are text-only.  Returning false is preferable to
+        # accepting an attachment and failing later with an opaque 400.
         return (
-            model.startswith("gpt-4")
+            model.startswith((
+                "gpt-4o", "gpt-4.1", "gpt-4.5", "gpt-4-turbo", "gpt-4-vision",
+            ))
             or model.startswith("gpt-5")
-            or model.startswith("chatgpt-4")
+            or model.startswith("chatgpt-4o")
             or model.startswith("o1")
             or model.startswith("o3")
             or model.startswith("o4")

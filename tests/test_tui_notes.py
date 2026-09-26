@@ -516,7 +516,10 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "screen.png"
-            source.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            source.write_bytes(
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+                b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+            )
             loop = FakeAgentLoop("图片分析完成")
             loop.provider = VisionProvider()
             tui, _output = self._make_tui(loop)

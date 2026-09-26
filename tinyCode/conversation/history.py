@@ -5,7 +5,7 @@ import math
 import json
 
 from tinyCode.providers.base import Message
-from tinyCode.multimodal import IMAGE_TOKEN_ESTIMATE
+from tinyCode.multimodal import estimate_image_tokens
 
 CHARS_PER_TOKEN = 3.5
 
@@ -161,7 +161,7 @@ def estimate_content_tokens(content: object) -> int:
             continue
         block_type = block.get("type")
         if block_type in {"image_file", "image_url", "input_image", "image"}:
-            total += IMAGE_TOKEN_ESTIMATE
+            total += estimate_image_tokens(block)
         elif isinstance(block.get("text"), str):
             total += estimate_text_tokens(block["text"])
         else:

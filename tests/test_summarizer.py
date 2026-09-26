@@ -376,6 +376,41 @@ class StructuredSummarizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[结构化摘要]\n第一代摘要", contents)
         self.assertEqual("[结构化摘要]\n## 主要请求\n第二代摘要", contents[0])
 
+    async def test_compression_keeps_image_and_following_history_verbatim(self):
+        provider = FakeProvider(
+            ProviderConfig(
+                name="fake", protocol="openai", model="gpt-test", api_key="test-key",
+            ),
+            response="## 主要请求\n保留图片证据",
+        )
+        summarizer = StructuredSummarizer(provider, model="gpt-3.5-turbo")
+        image_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看图里的错误"},
+                {"type": "image_file", "image_file": {
+                    "path": "/tmp/attachment.png", "media_type": "image/png",
+                    "sha256": "a" * 64, "detail": "auto", "width": 100, "height": 100,
+                }},
+            ],
+        }
+        messages = [
+            {"role": "user", "content": "old 1"},
+            {"role": "assistant", "content": "old 2"},
+            image_message,
+            {"role": "assistant", "content": "我看到了图片"},
+            {"role": "user", "content": "继续"},
+            {"role": "assistant", "content": "处理中"},
+            {"role": "user", "content": "给出结论"},
+        ]
+
+        new_messages, result = await summarizer.summarize(messages)
+
+        self.assertEqual(2, result.messages_compressed)
+        self.assertEqual(image_message, new_messages[2])
+        self.assertEqual(messages[2:], new_messages[2:])
+        self.assertNotIn("图片: attachment.png", provider.prompts[0])
+
     async def test_compression_never_splits_existing_summary_from_boundary(self):
         provider = FakeProvider(
             ProviderConfig(

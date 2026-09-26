@@ -533,7 +533,7 @@ class _TinyCodeFullscreenApp(App[None]):
                         tooltip="中断当前任务",
                     )
         yield Static(
-            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · + 选择图片 · Ctrl-V 粘贴图片 · ⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程",
+            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · + 选择图片 · Ctrl-V（macOS）粘贴图片 · ⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程",
             id="helpbar",
             markup=False,
         )

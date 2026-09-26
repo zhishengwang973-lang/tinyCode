@@ -941,7 +941,7 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
     def test_current_openai_models_support_images(self):
-        for model in ("gpt-4o", "gpt-4.1", "gpt-5", "o3"):
+        for model in ("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "o3"):
             with self.subTest(model=model):
                 provider = OpenAIProvider(ProviderConfig(
                     name="openai", protocol="openai", model=model,
@@ -953,6 +953,11 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
             base_url="https://api.openai.com", api_key="test-key",
         ))
         self.assertFalse(legacy.supports_images())
+        legacy_gpt4 = OpenAIProvider(ProviderConfig(
+            name="openai", protocol="openai", model="gpt-4-0613",
+            base_url="https://api.openai.com", api_key="test-key",
+        ))
+        self.assertFalse(legacy_gpt4.supports_images())
 
     async def test_non_vision_openai_model_rejects_image_before_network(self):
         provider = OpenAIProvider(ProviderConfig(

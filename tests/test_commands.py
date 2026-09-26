@@ -567,7 +567,10 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             image_path = root / "screen.png"
-            image_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            image_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+                b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+            )
             ui = FakeUI()
             ui.image_supported = True
             ui.image_attachment_root = root

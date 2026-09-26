@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 import shutil
+import struct
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -29,7 +30,13 @@ MAX_INLINE_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_ANTHROPIC_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_ANTHROPIC_IMAGE_LIMIT = 100
 MAX_IMAGE_URL_CHARS = 8192
-IMAGE_TOKEN_ESTIMATE = 1024
+# Keep a conservative upper bound for an image with unknown dimensions (for
+# example, a remote URL restored from an older session).  Image token billing
+# is model- and detail-dependent, so this is deliberately an estimate used for
+# context protection rather than a cost report.
+IMAGE_TOKEN_ESTIMATE = 30_000
+MAX_IMAGE_DIMENSION = 8_000
+_IMAGE_HEADER_READ_LIMIT = 2 * 1024 * 1024
 
 
 class ImageInputError(ValueError):
@@ -315,12 +322,14 @@ def build_image_user_content(
             )
         try:
             with original.open("rb") as handle:
-                header = handle.read(16)
+                header = handle.read(_IMAGE_HEADER_READ_LIMIT)
         except OSError as exc:
             raise ImageInputError(f"无法读取图片: {exc}") from exc
         media_type = detect_image_media_type(header)
         if media_type is None:
             raise ImageInputError("仅支持实际内容为 JPEG、PNG、GIF 或 WebP 的图片")
+        width, height = image_dimensions(header, media_type)
+        _validate_image_dimensions(width, height)
         root = (project_root or Path.cwd()).resolve()
         attachment_dir = root / ".tinyCode" / "attachments"
         attachment_dir.mkdir(parents=True, exist_ok=True)
@@ -358,6 +367,8 @@ def build_image_user_content(
                 "size": size,
                 "sha256": digest,
                 "name": original.name,
+                "width": width,
+                "height": height,
             },
         }
         label = original.name
@@ -374,6 +385,130 @@ def detect_image_media_type(header: bytes) -> str | None:
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def image_dimensions(data: bytes, media_type: str) -> tuple[int, int]:
+    """Read image dimensions from a validated format header without a decoder.
+
+    This intentionally avoids a heavyweight runtime dependency.  It catches
+    truncated/malformed headers before a request is sent; providers remain the
+    final authority for full image decoding and model-specific resize limits.
+    """
+    try:
+        if media_type == "image/png":
+            if len(data) < 24 or data[12:16] != b"IHDR":
+                raise ValueError("PNG 缺少 IHDR")
+            return struct.unpack(">II", data[16:24])
+        if media_type == "image/gif":
+            if len(data) < 10:
+                raise ValueError("GIF 文件头不完整")
+            return struct.unpack("<HH", data[6:10])
+        if media_type == "image/jpeg":
+            return _jpeg_dimensions(data)
+        if media_type == "image/webp":
+            return _webp_dimensions(data)
+    except (IndexError, struct.error, ValueError) as exc:
+        raise ImageInputError(f"图片文件结构无效: {exc}") from exc
+    raise ImageInputError("图片格式无效")
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 4 or not data.startswith(b"\xff\xd8"):
+        raise ValueError("JPEG 文件头不完整")
+    offset = 2
+    # SOF markers that carry image height/width.  A scan limit prevents a
+    # malformed file from making us walk arbitrary data indefinitely.
+    sof_markers = {
+        *range(0xC0, 0xC4), *range(0xC5, 0xC8), *range(0xC9, 0xCC),
+        *range(0xCD, 0xD0),
+    }
+    while offset + 3 < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            break
+        segment_length = struct.unpack(">H", data[offset:offset + 2])[0]
+        if segment_length < 2 or offset + segment_length > len(data):
+            break
+        if marker in sof_markers:
+            if segment_length < 7:
+                break
+            height, width = struct.unpack(">HH", data[offset + 3:offset + 7])
+            return width, height
+        offset += segment_length
+    raise ValueError("JPEG 缺少尺寸信息")
+
+
+def _webp_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        raise ValueError("WebP 文件头不完整")
+    chunk = data[12:16]
+    if chunk == b"VP8X":
+        if len(data) < 30:
+            raise ValueError("WebP VP8X 文件头不完整")
+        width = int.from_bytes(data[24:27], "little") + 1
+        height = int.from_bytes(data[27:30], "little") + 1
+        return width, height
+    if chunk == b"VP8 ":
+        if len(data) < 30 or data[23:26] != b"\x9d\x01\x2a":
+            raise ValueError("WebP VP8 文件头无效")
+        width = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+        height = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+        return width, height
+    if chunk == b"VP8L":
+        if len(data) < 25 or data[20] != 0x2F:
+            raise ValueError("WebP VP8L 文件头无效")
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    raise ValueError("不支持的 WebP 编码")
+
+
+def _validate_image_dimensions(width: int, height: int) -> None:
+    if width <= 0 or height <= 0:
+        raise ImageInputError("图片尺寸必须大于 0")
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise ImageInputError(
+            f"图片边长不能超过 {MAX_IMAGE_DIMENSION:,} 像素，请先缩小图片"
+        )
+
+
+def estimate_image_tokens(block: dict[str, Any]) -> int:
+    """Return a conservative context estimate without serializing image data."""
+    detail = "auto"
+    image_file = block.get("image_file")
+    image_url = block.get("image_url")
+    source = block.get("source")
+    metadata: dict[str, Any] | None = None
+    if isinstance(image_file, dict):
+        metadata = image_file
+        detail = str(image_file.get("detail", detail)).lower()
+    elif isinstance(image_url, dict):
+        metadata = image_url
+        detail = str(image_url.get("detail", detail)).lower()
+    elif isinstance(source, dict):
+        metadata = source
+    if detail == "low":
+        return 128
+    if not isinstance(metadata, dict):
+        return IMAGE_TOKEN_ESTIMATE
+    width, height = metadata.get("width"), metadata.get("height")
+    if not isinstance(width, int) or not isinstance(height, int):
+        return IMAGE_TOKEN_ESTIMATE
+    if width <= 0 or height <= 0:
+        return IMAGE_TOKEN_ESTIMATE
+    patches = ((width + 31) // 32) * ((height + 31) // 32)
+    # A small image still costs a non-trivial fixed amount with many current
+    # vision models.  For larger images this upper-bounds common patch modes.
+    return min(IMAGE_TOKEN_ESTIMATE, max(256, patches))
 
 
 def extract_text_content(content: object) -> str:
@@ -424,16 +559,7 @@ def materialize_deepseek_images(messages: list[Message]) -> list[Message]:
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        has_image = any(
-            isinstance(block, dict)
-            and block.get("type") in {"image_file", "image_url"}
-            for block in content
-        )
-        if has_image and message.get("role") != "user":
-            raise ProviderError(
-                "图片只能出现在 user 消息中",
-                code="invalid_image_role",
-            )
+        _ensure_images_are_user_content(message, content)
         converted: list[dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "image_file":
@@ -441,39 +567,11 @@ def materialize_deepseek_images(messages: list[Message]) -> list[Message]:
                 if isinstance(block, dict) and block.get("type") == "image_url":
                     image_count += 1
                 continue
-            image = block.get("image_file")
-            if not isinstance(image, dict):
-                raise ProviderError("图片附件结构无效", code="invalid_image")
-            path = image.get("path")
-            media_type = image.get("media_type")
-            detail = image.get("detail", "auto")
-            expected_digest = image.get("sha256")
-            if (
-                not isinstance(path, str)
-                or media_type not in SUPPORTED_IMAGE_TYPES
-                or detail not in SUPPORTED_DETAILS
-                or not isinstance(expected_digest, str)
-                or len(expected_digest) != 64
-            ):
-                raise ProviderError("图片附件元数据无效", code="invalid_image")
-            file_path = Path(path)
-            try:
-                data = file_path.read_bytes()
-            except OSError as exc:
-                raise ProviderError(
-                    f"无法读取图片附件 {file_path.name}: {exc}",
-                    code="image_unavailable",
-                ) from exc
-            if detect_image_media_type(data[:16]) != media_type:
-                raise ProviderError(
-                    f"图片附件 {file_path.name} 的实际格式已变化",
-                    code="invalid_image",
-                )
-            if hashlib.sha256(data).hexdigest() != expected_digest:
-                raise ProviderError(
-                    f"图片附件 {file_path.name} 内容已变化，请重新附加",
-                    code="image_changed",
-                )
+            image, data = _read_local_image_attachment(
+                block, max_bytes=MAX_INLINE_IMAGE_BYTES,
+            )
+            media_type = image["media_type"]
+            detail = image["detail"]
             total_bytes += len(data)
             image_count += 1
             if total_bytes > MAX_INLINE_TOTAL_BYTES:
@@ -509,15 +607,41 @@ def materialize_anthropic_images(
     max_images: int = DEFAULT_ANTHROPIC_IMAGE_LIMIT,
 ) -> list[Message]:
     """Convert persistent attachments to Anthropic Messages image blocks."""
-    result = materialize_deepseek_images(messages)
+    result = deepcopy(messages)
     image_count = 0
+    total_local_bytes = 0
     for message in result:
         content = message.get("content")
         if not isinstance(content, list):
             continue
+        _ensure_images_are_user_content(message, content)
         converted: list[dict[str, Any]] = []
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "image_url":
+            if not isinstance(block, dict):
+                converted.append(block)
+                continue
+            block_type = block.get("type")
+            if block_type == "image_file":
+                image, data = _read_local_image_attachment(
+                    block, max_bytes=MAX_ANTHROPIC_IMAGE_BYTES,
+                )
+                total_local_bytes += len(data)
+                if total_local_bytes > MAX_INLINE_TOTAL_BYTES:
+                    raise ProviderError(
+                        "当前请求的本地图片总大小超过 32 MiB；请新建会话或减少图片",
+                        code="image_request_too_large",
+                    )
+                image_count += 1
+                converted.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image["media_type"],
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                })
+                continue
+            if block_type != "image_url":
                 converted.append(block)
                 continue
             image_url = block.get("image_url")
@@ -526,7 +650,9 @@ def materialize_anthropic_images(
                 raise ProviderError("图片地址无效", code="invalid_image")
             image_count += 1
             if url.startswith("data:"):
-                media_type, data = _decode_image_data_url(url)
+                media_type, data = _decode_image_data_url(
+                    url, max_bytes=MAX_ANTHROPIC_IMAGE_BYTES,
+                )
                 if len(data) > MAX_ANTHROPIC_IMAGE_BYTES:
                     raise ProviderError(
                         "Anthropic 单张本地图片不能超过 10 MiB",
@@ -559,17 +685,103 @@ def materialize_anthropic_images(
     return result
 
 
-def _decode_image_data_url(url: str) -> tuple[str, bytes]:
+def _ensure_images_are_user_content(
+    message: Message, content: list[object],
+) -> None:
+    if any(
+        isinstance(block, dict)
+        and block.get("type") in {"image_file", "image_url"}
+        for block in content
+    ) and message.get("role") != "user":
+        raise ProviderError("图片只能出现在 user 消息中", code="invalid_image_role")
+
+
+def _read_local_image_attachment(
+    block: dict[str, Any], *, max_bytes: int | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    image = block.get("image_file")
+    if not isinstance(image, dict):
+        raise ProviderError("图片附件结构无效", code="invalid_image")
+    path = image.get("path")
+    media_type = image.get("media_type")
+    detail = image.get("detail", "auto")
+    expected_digest = image.get("sha256")
+    if (
+        not isinstance(path, str)
+        or media_type not in SUPPORTED_IMAGE_TYPES
+        or detail not in SUPPORTED_DETAILS
+        or not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+    ):
+        raise ProviderError("图片附件元数据无效", code="invalid_image")
+    file_path = Path(path)
+    try:
+        size = file_path.stat().st_size
+    except OSError as exc:
+        raise ProviderError(
+            f"无法读取图片附件 {file_path.name}: {exc}",
+            code="image_unavailable",
+        ) from exc
+    if max_bytes is not None and size > max_bytes:
+        message = (
+            "Anthropic 单张本地图片不能超过 10 MiB"
+            if max_bytes == MAX_ANTHROPIC_IMAGE_BYTES
+            else "本地图片不能超过 32 MiB；请重新附加较小的图片"
+        )
+        raise ProviderError(
+            message,
+            code="image_too_large",
+        )
+    try:
+        data = file_path.read_bytes()
+    except OSError as exc:
+        raise ProviderError(
+            f"无法读取图片附件 {file_path.name}: {exc}",
+            code="image_unavailable",
+        ) from exc
+    if detect_image_media_type(data[:16]) != media_type:
+        raise ProviderError(
+            f"图片附件 {file_path.name} 的实际格式已变化",
+            code="invalid_image",
+        )
+    try:
+        width, height = image_dimensions(data[:_IMAGE_HEADER_READ_LIMIT], media_type)
+        _validate_image_dimensions(width, height)
+    except ImageInputError as exc:
+        raise ProviderError(str(exc), code="invalid_image") from exc
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        raise ProviderError(
+            f"图片附件 {file_path.name} 内容已变化，请重新附加",
+            code="image_changed",
+        )
+    return {
+        "media_type": media_type,
+        "detail": detail,
+        "width": width,
+        "height": height,
+    }, data
+
+
+def _decode_image_data_url(
+    url: str, *, max_bytes: int | None = None,
+) -> tuple[str, bytes]:
     header, separator, encoded = url.partition(",")
     if not separator or not header.startswith("data:") or not header.endswith(";base64"):
         raise ProviderError("本地图片 data URL 无效", code="invalid_image")
     media_type = header[5:-7]
     if media_type not in SUPPORTED_IMAGE_TYPES:
         raise ProviderError("本地图片格式无效", code="invalid_image")
+    # Base64 is about 4/3 of the binary length.  Check its encoded size first
+    # so a malformed persisted message cannot force an unbounded allocation.
+    if max_bytes is not None and len(encoded) > ((max_bytes + 2) // 3) * 4:
+        raise ProviderError("Anthropic 单张本地图片不能超过 10 MiB", code="image_too_large")
     try:
-        return media_type, base64.b64decode(encoded, validate=True)
+        data = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError) as exc:
         raise ProviderError("本地图片编码无效", code="invalid_image") from exc
+    if max_bytes is not None and len(data) > max_bytes:
+        raise ProviderError("Anthropic 单张本地图片不能超过 10 MiB", code="image_too_large")
+    return media_type, data
 
 
 def _sha256_file(path: Path) -> str:

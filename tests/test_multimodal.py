@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.multimodal import (
     IMAGE_TOKEN_ESTIMATE,
+    MAX_IMAGE_DIMENSION,
     ImageInputError,
     build_image_user_content,
     describe_user_content,
@@ -18,7 +19,14 @@ from tinyCode.multimodal import (
 )
 
 
-_PNG = b"\x89PNG\r\n\x1a\n" + b"test-image-data"
+# A compact structurally valid PNG header.  The implementation deliberately
+# reads dimensions without requiring Pillow, so the payload itself need not be
+# decoded by the test suite.
+_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + b"\x00\x00\x00\x0dIHDR"
+    + b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+)
 
 
 class MultimodalInputTests(unittest.TestCase):
@@ -39,6 +47,8 @@ class MultimodalInputTests(unittest.TestCase):
             self.assertTrue(attachment.is_file())
             self.assertEqual(_PNG, attachment.read_bytes())
             self.assertNotIn("base64", str(content))
+            self.assertEqual(1, content[1]["image_file"]["width"])
+            self.assertEqual(1, content[1]["image_file"]["height"])
 
     def test_materialization_uses_deepseek_image_url_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,6 +102,24 @@ class MultimodalInputTests(unittest.TestCase):
             with self.assertRaisesRegex(ImageInputError, "JPEG、PNG、GIF 或 WebP"):
                 build_image_user_content(str(source), "", project_root=root)
 
+    def test_truncated_or_oversized_image_header_is_rejected_before_attachment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            truncated = root / "truncated.png"
+            truncated.write_bytes(b"\x89PNG\r\n\x1a\n")
+            with self.assertRaisesRegex(ImageInputError, "图片文件结构无效"):
+                build_image_user_content(str(truncated), "", project_root=root)
+
+            too_wide = root / "wide.png"
+            too_wide.write_bytes(
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+                + (MAX_IMAGE_DIMENSION + 1).to_bytes(4, "big")
+                + (1).to_bytes(4, "big")
+                + b"\x08\x06\x00\x00\x00"
+            )
+            with self.assertRaisesRegex(ImageInputError, "边长不能超过"):
+                build_image_user_content(str(too_wide), "", project_root=root)
+
     def test_history_estimates_image_tokens_without_counting_binary_payload(self):
         history = ConversationHistory()
         history.add_user_message([
@@ -105,7 +133,19 @@ class MultimodalInputTests(unittest.TestCase):
         estimated = history.estimated_token_count()
 
         self.assertGreaterEqual(estimated, IMAGE_TOKEN_ESTIMATE)
-        self.assertLess(estimated, 2_000)
+        self.assertLess(estimated, IMAGE_TOKEN_ESTIMATE + 1_000)
+
+    def test_local_image_token_estimate_uses_detail_and_dimensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "screen.png"
+            source.write_bytes(_PNG)
+            content, _ = build_image_user_content(
+                str(source), "分析", detail="low", project_root=root,
+            )
+            history = ConversationHistory()
+            history.add_user_message(content)
+            self.assertLess(history.estimated_token_count(), 500)
 
     def test_user_content_description_hides_attachment_path(self):
         content = [

@@ -19,7 +19,7 @@ _MODEL_WINDOWS: dict[str, int] = {
     "claude-opus-4": 200_000, "claude-sonnet-4": 200_000, "claude-haiku-4": 200_000,
     "claude-3-opus": 200_000, "claude-3-sonnet": 200_000, "claude-3-haiku": 200_000,
     "claude-3.5-sonnet": 200_000, "claude-3.5-haiku": 200_000,
-    "gpt-4": 128_000, "gpt-4o": 128_000, "gpt-4-turbo": 128_000,
+    "gpt-4": 8_192, "gpt-4o": 128_000, "gpt-4-turbo": 128_000,
     "gpt-4.1": 1_000_000, "gpt-3.5-turbo": 16_385,
     "o1": 200_000, "o3": 200_000, "o4": 200_000,
     "deepseek-v4-pro": 1_000_000, "deepseek-v4-flash": 1_000_000,
@@ -204,9 +204,27 @@ class StructuredSummarizer:
         # can split an assistant tool call from its result, making the next
         # provider request invalid (and this happens often on long tasks).
         keep_recent = min(KEEP_RECENT, max(1, len(messages) // 2))
-        split = _find_safe_split(messages, len(messages) - keep_recent)
+        desired_split = len(messages) - keep_recent
+        # A text-only summary cannot faithfully retain visual evidence.  Keep
+        # every image and the conversation that follows it verbatim, rather
+        # than silently replacing an image with only its filename/prompt.
+        first_image = _first_image_message_index(messages)
+        if first_image is not None:
+            desired_split = min(desired_split, first_image)
+        if (
+            first_image is not None
+            and _has_compression_prefix(messages)
+            and desired_split <= 2
+        ):
+            result.error = "图片上下文之后没有可安全压缩的新增历史"
+            return messages, result
+        split = _find_safe_split(messages, desired_split)
         if split <= 0:
-            result.error = "无法找到不会破坏工具调用配对的压缩边界"
+            result.error = (
+                "无法在保留图片上下文且不破坏工具调用配对的前提下压缩"
+                if first_image is not None
+                else "无法找到不会破坏工具调用配对的压缩边界"
+            )
             return messages, result
         old = messages[:split]
         recent = messages[split:]
@@ -488,3 +506,18 @@ def _find_safe_split(messages: list[Message], desired: int) -> int:
         if not open_calls:
             return split
     return 0
+
+
+def _first_image_message_index(messages: list[Message]) -> int | None:
+    """Return the first message carrying image evidence, if any."""
+    for index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(block, dict)
+            and block.get("type") in {"image_file", "image_url", "input_image", "image"}
+            for block in content
+        ):
+            return index
+    return None
