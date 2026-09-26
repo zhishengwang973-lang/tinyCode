@@ -13,6 +13,7 @@ from tinyCode.config.models import (
     AppConfig,
     NoteRoutingConfig,
     ProviderConfig,
+    TeamAutomationConfig,
     TaskModeRoutingConfig,
     TracingConfig,
 )
@@ -133,6 +134,13 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["task_mode_routing"] = global_raw["task_mode_routing"]
     else:
         merged.pop("task_mode_routing", None)
+    # Automatic teams can create processes, worktrees and commits.  This is a
+    # user-level execution policy; repository-owned configuration must not
+    # silently opt the user in or weaken its review boundary.
+    if "team" in global_raw:
+        merged["team"] = global_raw["team"]
+    else:
+        merged.pop("team", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -539,6 +547,60 @@ def load_config() -> AppConfig:
                 f"task_mode_routing 所需环境变量 api_key_env 未设置"
             )
 
+    team_raw = raw.get("team", {})
+    if not isinstance(team_raw, dict):
+        raise ConfigError("team 必须是对象（mapping）")
+    team_mode = team_raw.get("mode", "auto")
+    if not isinstance(team_mode, str) or team_mode.strip().lower() not in {
+        "single", "auto", "team",
+    }:
+        raise ConfigError("team.mode 必须是 single、auto 或 team")
+    team_mode = team_mode.strip().lower()
+    team_max_members = team_raw.get("max_members", 3)
+    if (
+        isinstance(team_max_members, bool)
+        or not isinstance(team_max_members, int)
+        or not 2 <= team_max_members <= 4
+    ):
+        raise ConfigError("team.max_members 必须是 2 到 4 之间的整数")
+    team_isolation = team_raw.get("isolation", "worktree")
+    if team_isolation != "worktree":
+        raise ConfigError("team.isolation 当前仅支持 worktree")
+    team_worktree_creation = team_raw.get("worktree_creation", "automatic")
+    if team_worktree_creation != "automatic":
+        raise ConfigError("team.worktree_creation 当前仅支持 automatic")
+    team_merge_policy = team_raw.get("merge_policy", "review")
+    if team_merge_policy not in {"review", "auto", "none"}:
+        raise ConfigError("team.merge_policy 必须是 review、auto 或 none")
+    team_plan_approval = team_raw.get("require_plan_approval", True)
+    team_cleanup = team_raw.get("cleanup_after_apply", True)
+    team_llm_conflicts = team_raw.get("allow_llm_conflict_resolution", False)
+    for key, value in (
+        ("require_plan_approval", team_plan_approval),
+        ("cleanup_after_apply", team_cleanup),
+        ("allow_llm_conflict_resolution", team_llm_conflicts),
+    ):
+        if not isinstance(value, bool):
+            raise ConfigError(f"team.{key} 必须是 true 或 false")
+    team_timeout = team_raw.get("timeout_seconds", 1800.0)
+    if (
+        isinstance(team_timeout, bool)
+        or not isinstance(team_timeout, (int, float))
+        or not math.isfinite(float(team_timeout))
+        or not 60 <= float(team_timeout) <= 86_400
+    ):
+        raise ConfigError("team.timeout_seconds 必须是 60 到 86400 之间的数字")
+    team_validation_commands = team_raw.get("validation_commands", [])
+    if (
+        not isinstance(team_validation_commands, list)
+        or len(team_validation_commands) > 10
+        or not all(
+            isinstance(command, str) and command.strip() and len(command) <= 1_000
+            for command in team_validation_commands
+        )
+    ):
+        raise ConfigError("team.validation_commands 必须是最多 10 条非空命令")
+
     return AppConfig(
         providers=providers, active_provider=active_provider,
         max_rounds=max_rounds,
@@ -571,6 +633,20 @@ def load_config() -> AppConfig:
             timeout_seconds=float(routing_timeout),
             llm_timeout_seconds=float(llm_timeout),
             llm_fallback=llm_fallback,
+        ),
+        team=TeamAutomationConfig(
+            mode=team_mode,
+            max_members=team_max_members,
+            isolation=team_isolation,
+            worktree_creation=team_worktree_creation,
+            merge_policy=team_merge_policy,
+            require_plan_approval=team_plan_approval,
+            cleanup_after_apply=team_cleanup,
+            timeout_seconds=float(team_timeout),
+            validation_commands=[
+                command.strip() for command in team_validation_commands
+            ],
+            allow_llm_conflict_resolution=team_llm_conflicts,
         ),
     )
 

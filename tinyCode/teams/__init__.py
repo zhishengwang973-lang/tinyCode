@@ -10,10 +10,12 @@ from tinyCode.teams.merger import GitMerger
 from tinyCode.teams.scheduler import DispatchScheduler
 from tinyCode.teams.persistence import load_team_def, list_team_defs, get_team_dir
 from tinyCode.teams.orchestrator import run_team
+from tinyCode.teams.auto import AutoTeamService, TeamProposal, TeamRunResult
 
 __all__ = [
     "TeamDef", "MemberDef", "TeamTask", "TeamMessage", "MemberStatus", "TaskStatus",
     "LeadAgent", "TeamMember", "SharedTaskList", "Mailbox", "NameRegistry",
     "GitMerger", "DispatchScheduler",
     "load_team_def", "list_team_defs", "get_team_dir", "run_team",
+    "AutoTeamService", "TeamProposal", "TeamRunResult",
 ]

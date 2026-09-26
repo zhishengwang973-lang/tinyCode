@@ -37,8 +37,10 @@ async def run_team(
     roles: dict[str, Any] | None = None,
     preapproved: bool = False,
     progress: Callable[[str], Awaitable[None] | None] | None = None,
+    definition: Any = None,
+    state_dir: Path | None = None,
 ) -> str:
-    team_def = load_team_def(name)
+    team_def = definition or load_team_def(name)
     if team_def is None:
         return f"Team '{name}' 不存在"
     if not team_def.members:
@@ -54,7 +56,8 @@ async def run_team(
     if len(team_def.members) > 1 and any(not member.worktree for member in team_def.members):
         return "多成员 Team 必须为每个成员配置独立 worktree"
 
-    team_dir = get_team_dir(name)
+    team_dir = state_dir or get_team_dir(name)
+    team_dir.mkdir(parents=True, exist_ok=True)
     task_list = SharedTaskList(team_dir)
     task_load_error = getattr(task_list, "load_error", "")
     if isinstance(task_load_error, str) and task_load_error:

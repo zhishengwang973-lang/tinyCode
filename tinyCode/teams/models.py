@@ -75,3 +75,4 @@ class TeamDef:
     timeout_seconds: float = 1800.0
     validation_commands: list[str] = field(default_factory=list)
     allow_llm_conflict_resolution: bool = False
+    merge_policy: str = "auto"  # "auto" | "review" | "none"

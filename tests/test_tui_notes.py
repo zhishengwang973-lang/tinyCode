@@ -45,6 +45,7 @@ from tinyCode.tui.fullscreen_textual import (
 from tinyCode.tui.workspace_changes import WorkspaceChanges
 from tinyCode.config.models import TracingConfig
 from tinyCode.tracing.recorder import TraceRecorder
+from tinyCode.teams.auto import TeamRunResult
 
 
 class FakeHistory:
@@ -587,6 +588,52 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(was_command)
         self.assertEqual("team ok", result)
         self.assertEqual([("Alpha", "do it")], calls)
+
+    async def test_automatic_team_proposal_runs_and_preserves_review_on_decline(self):
+        class Proposal:
+            def render(self):
+                return "Team proposal"
+
+        class Service:
+            config = SimpleNamespace(require_plan_approval=True)
+
+            def propose(self, text):
+                return Proposal()
+
+            async def preflight(self):
+                return True, ""
+
+            async def run(self, proposal):
+                return TeamRunResult(
+                    "team answer", run_id="abcdef123456", review_ready=True,
+                )
+
+            async def apply(self, run_id):
+                raise AssertionError("review should remain pending")
+
+        output = io.StringIO()
+        history = ConversationHistory()
+        tui = TinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=history,
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+            auto_team_service=Service(),
+            console=Console(file=output, force_terminal=False, color_system=None),
+            prompt_session=FakePromptSession(["y", "n"]),
+        )
+
+        await tui._on_user_input("complex task")
+
+        self.assertEqual(
+            ["user", "assistant"],
+            [message["role"] for message in history.get_messages()],
+        )
+        self.assertIn("team answer", output.getvalue())
+        self.assertIn("/team review apply abcdef123456", output.getvalue())
 
     async def test_completed_round_is_recorded_before_note_update_is_scheduled(self):
         agent_loop = FakeAgentLoop()

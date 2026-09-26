@@ -22,6 +22,7 @@ def register_builtins(
     task_manager=None,
     worktree_manager=None,
     team_runner=None,
+    team_review_service=None,
     trace_recorder=None,
 ) -> None:
     """Register all built-in commands with the given registry."""
@@ -64,6 +65,10 @@ def register_builtins(
         registry.register(_tasks(task_manager))
     if worktree_manager:
         registry.register(_worktree(worktree_manager, workspace_changed=ui.workspace_changed))
-    registry.register(_team(runner=team_runner, confirmer=ui.confirm_action))
+    registry.register(_team(
+        runner=team_runner,
+        confirmer=ui.confirm_action,
+        review_service=team_review_service,
+    ))
     if trace_recorder:
         registry.register(_trace(trace_recorder, confirmer=ui.confirm_action))

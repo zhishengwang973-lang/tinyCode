@@ -400,6 +400,12 @@ class LeadAgent:
                 if current_head == baseline["head"]:
                     results.append(f"  {name} ({branch}): 本轮没有文件变更")
                     continue
+            if self._def.merge_policy == "review":
+                results.append(f"  {name} ({branch}): 变更已提交，等待统一审核")
+                continue
+            if self._def.merge_policy == "none":
+                results.append(f"  {name} ({branch}): 变更已保留，未执行合并")
+                continue
             target_branch = baseline.get("target_branch", "")
             if target_branch:
                 ok, msg = await self._merger.merge(branch, target_branch)

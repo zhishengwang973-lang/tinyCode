@@ -13,6 +13,7 @@ Confirmer = Callable[[str], Awaitable[bool]]
 def create(
     runner: TeamRunner | None = None,
     confirmer: Confirmer | None = None,
+    review_service=None,
 ) -> CommandMeta:
     team_runner = runner or run_team
 
@@ -67,13 +68,50 @@ def create(
                     return "Team 执行已取消"
             return await team_runner(team_name, goal)
 
-        return f"未知子命令: {args[0]}。可用: list, show, dir, run"
+        elif sub == "review":
+            if review_service is None:
+                return "当前运行环境未启用 Team 审核服务"
+            action = args[1].lower() if len(args) > 1 else "list"
+            if action == "list":
+                records = review_service.list_reviews()
+                if not records:
+                    return "没有 Team 审核记录"
+                return "Team 审核记录:\n" + "\n".join(
+                    f"  {record.run_id} · {record.status} · {record.goal[:60]}"
+                    for record in records
+                )
+            if action == "show" and len(args) >= 3:
+                return review_service.show_review(args[2])
+            if action in {"apply", "discard"} and len(args) >= 3:
+                run_id = args[2]
+                if confirmer is not None:
+                    verb = "应用到当前分支" if action == "apply" else "永久丢弃"
+                    approved = await confirmer(
+                        f"即将{verb} Team 审核 {run_id}，是否继续？"
+                    )
+                    if not approved:
+                        return "Team 审核操作已取消"
+                operation = (
+                    review_service.apply if action == "apply"
+                    else review_service.discard
+                )
+                _ok, message = await operation(run_id)
+                return message
+            return (
+                "用法: /team review [list | show <编号> | "
+                "apply <编号> | discard <编号>]"
+            )
+
+        return f"未知子命令: {args[0]}。可用: list, show, dir, run, review"
 
     return CommandMeta(
         name="team",
         aliases=["tm"],
-        description="管理 Agent Team（list / show / dir / run）",
-        usage="/team [list | show <名称> | dir <名称> | run <名称> <目标>]",
+        description="管理 Agent Team 与待审核变更",
+        usage=(
+            "/team [list | show <名称> | dir <名称> | run <名称> <目标> | "
+            "review [list|show|apply|discard]]"
+        ),
         cmd_type=CommandType.LOCAL,
         handler=handler,
     )

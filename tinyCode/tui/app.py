@@ -418,6 +418,7 @@ class TinyCodeTUI(UIControl):
         task_manager=None,
         worktree_manager=None,
         team_runner=None,
+        auto_team_service=None,
         trace_recorder: TraceRecorder | None = None,
         recovery_store: "TaskRecoveryStore | None" = None,
         startup_recovery_prompt: str = "",
@@ -441,6 +442,7 @@ class TinyCodeTUI(UIControl):
         self._startup_recovery_prompt = startup_recovery_prompt
         self._resume_recovery_task_id = startup_recovery_task_id
         self._active_recovery_task_id: str | None = None
+        self._auto_team_service = auto_team_service
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -451,6 +453,7 @@ class TinyCodeTUI(UIControl):
             task_manager=task_manager,
             worktree_manager=worktree_manager,
             team_runner=team_runner,
+            team_review_service=auto_team_service,
             trace_recorder=trace_recorder,
         )
         if skill_registry:
@@ -913,6 +916,17 @@ class TinyCodeTUI(UIControl):
                     model=self._model,
                     context_window=int(self._compressor.context_window),
                 )
+            auto_response = await self._try_auto_team(
+                text,
+                display_user=display_user,
+                stream_renderer=stream_renderer,
+            )
+            if auto_response is not None:
+                current_response = auto_response
+                trace_status = "completed"
+                recovery_terminal_state = "completed"
+                round_recorded = bool(auto_response)
+                return
             if self._recovery_store is not None:
                 recovery_task_id = self._resume_recovery_task_id
                 self._resume_recovery_task_id = None
@@ -1464,6 +1478,90 @@ class TinyCodeTUI(UIControl):
                 finally:
                     self._agent_loop.set_recovery_task(None)
                     self._active_recovery_task_id = None
+
+    async def _try_auto_team(
+        self,
+        text: str,
+        *,
+        display_user: bool,
+        stream_renderer,
+    ) -> str | None:
+        """Run an automatically proposed Team; return None for normal routing."""
+        service = self._auto_team_service
+        if service is None:
+            return None
+        proposal = service.propose(text)
+        if proposal is None:
+            return None
+
+        self._stop_progress()
+        self._print_warning(proposal.render())
+        if service.config.require_plan_approval:
+            approved = await self._ask_yes_no("启用上述 Team 方案？")
+            if not approved:
+                self._print_info("已改用单 Agent 执行本任务")
+                return None
+
+        ready, reason = await service.preflight()
+        if not ready:
+            self._print_warning(f"Team 暂时无法安全启动：{reason}\n已改用单 Agent 执行。")
+            return None
+
+        if display_user:
+            self._print_user(text)
+        self._history.flush_deferred()
+        self._history.add_user_message(text)
+        self._save_checkpoint()
+        workspace_snapshot = await asyncio.to_thread(
+            WorkspaceSnapshot.capture,
+            Path.cwd(),
+        )
+        self._start_progress("正在启动 Agent Team")
+        result = await service.run(proposal)
+        self._stop_progress()
+        self._print_ai_prefix()
+        stream_renderer.write(result.summary)
+        stream_renderer.close_line()
+        self._finalize_response(result.summary)
+        self._history.add_assistant_message(result.summary)
+        self._save_checkpoint()
+
+        if result.applied:
+            await self._print_workspace_changes(workspace_snapshot)
+        elif result.review_ready:
+            approved = await self._ask_yes_no(
+                f"审核分支已就绪，立即应用变更 {result.run_id}？"
+            )
+            if approved:
+                applied, message = await service.apply(result.run_id)
+                if applied:
+                    await self._print_workspace_changes(workspace_snapshot)
+                    self._print_info(message)
+                else:
+                    self._print_error(message)
+            else:
+                self._print_info(
+                    f"变更仍在审核分支中；可稍后运行 "
+                    f"/team review apply {result.run_id}"
+                )
+        self._status_text = "就绪 · Team 任务已完成"
+        self._print_success()
+        return result.summary
+
+    async def _ask_yes_no(self, prompt: str) -> bool:
+        while True:
+            try:
+                answer = await self._read_control_input(
+                    [("class:warning", f"{prompt} [Y/n] › ")]
+                )
+            except (EOFError, KeyboardInterrupt):
+                return False
+            normalized = answer.strip().lower()
+            if normalized in {"", "y", "yes", "是", "确认"}:
+                return True
+            if normalized in {"n", "no", "否", "取消"}:
+                return False
+            self._print_warning("请输入 Y 或 N")
 
     async def _prompt_for_approval(self) -> HITLDecision:
         choices = {

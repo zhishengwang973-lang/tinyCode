@@ -89,6 +89,9 @@ def load_team_def(name: str) -> TeamDef | None:
     allow_llm_conflicts = data.get("allow_llm_conflict_resolution", False)
     if not isinstance(allow_llm_conflicts, bool):
         return None
+    merge_policy = data.get("merge_policy", "auto")
+    if merge_policy not in {"auto", "review", "none"}:
+        return None
     return TeamDef(
         name=_text("name", name), description=_text("description"),
         lead_role=_text("lead_role"), members=members,
@@ -96,6 +99,7 @@ def load_team_def(name: str) -> TeamDef | None:
         timeout_seconds=float(timeout_seconds),
         validation_commands=[command.strip() for command in validation_commands],
         allow_llm_conflict_resolution=allow_llm_conflicts,
+        merge_policy=merge_policy,
     )
 
 

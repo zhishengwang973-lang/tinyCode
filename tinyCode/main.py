@@ -21,7 +21,7 @@ from tinyCode.subagent import (
     SubAgentTool,
     SubAgentWaitTool,
 )
-from tinyCode.teams import run_team
+from tinyCode.teams import AutoTeamService, run_team
 from tinyCode.worktree import GitWorktreeManager, BackgroundCleaner
 from tinyCode.providers.base import create_provider
 from tinyCode.conversation.history import ConversationHistory
@@ -488,6 +488,19 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         finally:
             cleaner.start()
 
+    auto_team_service = AutoTeamService(
+        app_config.team,
+        repo_root=worktree_manager.repo_root,
+        worktree_manager=worktree_manager,
+        provider=provider,
+        tool_registry=tool_registry,
+        tool_executor=tool_executor,
+        roles=roles,
+        progress=team_progress,
+        before_run=cleaner.stop,
+        after_run=cleaner.start,
+    )
+
     # Apply --mode CLI flag if any
     if options.mode:
         level = SecurityLevel(options.mode)
@@ -517,6 +530,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         task_manager=task_manager,
         worktree_manager=worktree_manager,
         team_runner=team_runner,
+        auto_team_service=auto_team_service,
         trace_recorder=trace_recorder,
         recovery_store=recovery_store,
         startup_recovery_prompt=startup_recovery_prompt,

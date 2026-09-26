@@ -295,7 +295,7 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 | `/skill [list\|reload\|clear]` | `skills` | Skill 管理 |
 | `/tasks [list\|detail\|kill]` | `bg` | 后台任务管理 |
 | `/worktree [status\|list\|create\|enter\|exit]` | `wt` | Git 工作目录 |
-| `/team [list\|show\|dir\|run]` | `tm` | Team 管理和执行 |
+| `/team [list\|show\|dir\|run\|review]` | `tm` | Team 管理、执行和变更审核 |
 
 `/prompt` 只读取当前系统上下文，不会请求模型。可查看 `all`、`base`、
 `instructions`、`skills`、`environment`、`notes` 或 `injection`；可连续执行，不会消耗对话轮次。
@@ -745,7 +745,39 @@ python -m tinyCode --resume
 
 ## 13. Agent Team
 
-长期存在的协作小组，Leader 拆解目标、分配成员、合并结果。
+普通输入就是默认入口。`team.mode: auto` 时，TinyCode 只会对明确复杂、可以划分
+独立工作面的任务展示 Team 方案；简单问答、代码片段和局部修改继续使用单 Agent。
+用户批准方案后，成员工作树会自动创建，最终变更先汇总到独立审核分支，不会直接
+修改当前分支。完成后可立即应用，也可稍后执行：
+
+```
+/team review list
+/team review show <审核编号>
+/team review apply <审核编号>
+/team review discard <审核编号>
+```
+
+全局配置示例：
+
+```yaml
+team:
+  mode: auto                 # single / auto / team
+  max_members: 3             # 2–4
+  isolation: worktree
+  worktree_creation: automatic
+  merge_policy: review       # review / auto / none
+  require_plan_approval: true
+  cleanup_after_apply: true
+  timeout_seconds: 1800
+  validation_commands: []
+  allow_llm_conflict_resolution: false
+```
+
+该配置只能来自 `~/.tinyCode/config.yaml`，项目配置不能静默开启 Team 或把
+`review` 改成自动合并。应用审核分支前还会再次确认当前分支、HEAD 和工作区状态；
+任一条件变化都会拒绝应用，避免覆盖用户在 Team 运行期间产生的修改。
+
+`/team run <名称> <目标>` 仍作为高级入口，用于长期存在的自定义协作小组。
 
 ### Team 定义
 
@@ -764,7 +796,8 @@ python -m tinyCode --resume
   "max_rounds_per_member": 10,
   "timeout_seconds": 1800,
   "validation_commands": ["python3 -m unittest discover -s tests"],
-  "allow_llm_conflict_resolution": false
+  "allow_llm_conflict_resolution": false,
+  "merge_policy": "auto"
 }
 ```
 

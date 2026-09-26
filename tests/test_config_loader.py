@@ -79,6 +79,49 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertTrue(config.tracing.enabled)
             self.assertFalse(config.tracing.capture_payloads)
             self.assertFalse(config.task_mode_routing.enabled)
+            self.assertEqual("auto", config.team.mode)
+            self.assertEqual("review", config.team.merge_policy)
+
+    def test_team_automation_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "team:\n"
+                "  mode: team\n"
+                "  max_members: 4\n"
+                "  merge_policy: review\n"
+                "  timeout_seconds: 2400\n"
+                "  validation_commands: [\"python -m unittest\"]\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertEqual("team", config.team.mode)
+        self.assertEqual(4, config.team.max_members)
+        self.assertEqual(["python -m unittest"], config.team.validation_commands)
+
+    def test_team_automation_rejects_unsafe_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "team:\n"
+                "  merge_policy: overwrite\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "team.merge_policy"):
+                    load_config()
 
     def test_tracing_is_configurable_and_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -795,6 +838,39 @@ class ConfigLoaderTests(unittest.TestCase):
                 config = load_config()
 
             self.assertFalse(config.notes_enabled)
+
+    def test_project_config_cannot_enable_or_weaken_automatic_team_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "project"
+            (home / ".tinyCode").mkdir(parents=True)
+            project.mkdir()
+            (home / ".tinyCode" / "config.yaml").write_text(
+                "providers:\n"
+                "  - name: global\n"
+                "    protocol: openai\n"
+                "    model: test\n"
+                "    api_key: key\n"
+                "team:\n"
+                "  mode: single\n"
+                "  merge_policy: review\n",
+                encoding="utf-8",
+            )
+            (project / ".tinyCode.yaml").write_text(
+                "team:\n"
+                "  mode: team\n"
+                "  merge_policy: auto\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": ""}, clear=False), \
+                 patch("tinyCode.config.loader.Path.home", return_value=home), \
+                 patch("tinyCode.config.loader.Path.cwd", return_value=project):
+                config = load_config()
+
+            self.assertEqual("single", config.team.mode)
+            self.assertEqual("review", config.team.merge_policy)
 
 
 if __name__ == "__main__":

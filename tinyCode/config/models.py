@@ -66,6 +66,21 @@ class NoteRoutingConfig(BaseModel):
     timeout_seconds: float = DEFAULT_NOTE_ROUTING_TIMEOUT
 
 
+class TeamAutomationConfig(BaseModel):
+    """User-level policy for automatic multi-agent orchestration."""
+
+    mode: str = "auto"
+    max_members: int = 3
+    isolation: str = "worktree"
+    worktree_creation: str = "automatic"
+    merge_policy: str = "review"
+    require_plan_approval: bool = True
+    cleanup_after_apply: bool = True
+    timeout_seconds: float = 1800.0
+    validation_commands: list[str] = Field(default_factory=list)
+    allow_llm_conflict_resolution: bool = False
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -83,3 +98,4 @@ class AppConfig(BaseModel):
     task_mode_routing: TaskModeRoutingConfig = Field(
         default_factory=TaskModeRoutingConfig,
     )
+    team: TeamAutomationConfig = Field(default_factory=TeamAutomationConfig)

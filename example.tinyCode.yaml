@@ -73,3 +73,17 @@ tracing:
   capture_payloads: false
   retention_days: 14
   max_files: 100
+
+# 自动 Agent Team（仅在全局 ~/.tinyCode/config.yaml 中生效）
+# auto 仅对明确复杂且可并行的任务提出方案；single 永不自动启用；team 总是提出。
+team:
+  mode: auto
+  max_members: 3
+  isolation: worktree
+  worktree_creation: automatic
+  merge_policy: review
+  require_plan_approval: true
+  cleanup_after_apply: true
+  timeout_seconds: 1800
+  validation_commands: []
+  allow_llm_conflict_resolution: false

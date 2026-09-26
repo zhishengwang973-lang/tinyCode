@@ -763,6 +763,34 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("wired", result)
         self.assertEqual([("AlphaTeam", "ship it")], calls)
 
+    async def test_team_review_commands_use_durable_review_service(self):
+        class ReviewService:
+            def list_reviews(self):
+                return [type("Record", (), {
+                    "run_id": "abcdef123456",
+                    "status": "ready",
+                    "goal": "ship feature",
+                })()]
+
+            def show_review(self, run_id):
+                return f"show:{run_id}"
+
+            async def apply(self, run_id):
+                return True, f"applied:{run_id}"
+
+            async def discard(self, run_id):
+                return True, f"discarded:{run_id}"
+
+        registry = CommandRegistry()
+        registry.register(team_cmd.create(review_service=ReviewService()))
+        dispatcher = CommandDispatcher(registry, ui=FakeUI())
+
+        _, listed = await dispatcher.dispatch("/team review list")
+        _, shown = await dispatcher.dispatch("/team review show abcdef123456")
+
+        self.assertIn("abcdef123456 · ready", listed)
+        self.assertEqual("show:abcdef123456", shown)
+
     async def test_worktree_exit_subcommand_is_case_insensitive_without_mutating_name(self):
         manager = FakeWorktreeManager()
         registry = CommandRegistry()
