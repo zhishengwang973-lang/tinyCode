@@ -320,6 +320,10 @@ class BaseProvider(ABC):
         self._retired_clients: list[Any] = []
         self._client_lock = asyncio.Lock()
 
+    def supports_images(self) -> bool:
+        """Whether this configured provider/model accepts image input."""
+        return False
+
     @property
     def last_usage(self) -> dict[str, Any]:
         """Usage for the current async task, isolated from background calls."""

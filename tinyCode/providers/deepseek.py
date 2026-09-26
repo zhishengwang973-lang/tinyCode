@@ -23,6 +23,7 @@ from tinyCode.providers.base import (
     read_error_detail,
 )
 from tinyCode.providers.sse import SSEDecoder
+from tinyCode.multimodal import materialize_deepseek_images
 
 
 _DSML_START = "<｜｜DSML｜｜tool_calls>"
@@ -35,6 +36,7 @@ _DSML_PARAMETER_RE = re.compile(
     r'(.*?)</｜｜DSML｜｜parameter>',
     re.DOTALL,
 )
+_MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
 
 
 def _tool_parameter_names(tools: list[dict] | None, tool_name: str) -> set[str]:
@@ -125,6 +127,23 @@ class DeepSeekProvider(BaseProvider):
         tools: list[dict] | None = None,
         system_blocks: list[dict] | None = None,
     ) -> AsyncIterator[str | ToolCall]:
+        has_images = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(block, dict)
+                and block.get("type") in {"image_file", "image_url"}
+                for block in message["content"]
+            )
+            for message in messages
+        )
+        if has_images:
+            if not self.supports_images():
+                raise ProviderError(
+                    "当前 DeepSeek 模型不支持图片输入；请切换到 deepseek-flash",
+                    code="image_not_supported",
+                )
+            messages = materialize_deepseek_images(messages)
+
         url = build_api_url(self.config.base_url, "/v1/chat/completions")
 
         body: dict = {
@@ -136,6 +155,18 @@ class DeepSeekProvider(BaseProvider):
 
         if tools:
             body["tools"] = tools
+
+        if has_images:
+            request_size = len(json.dumps(
+                body,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"))
+            if request_size > _MAX_REQUEST_BODY_BYTES:
+                raise ProviderError(
+                    "DeepSeek 请求体超过 48 MiB；请减少图片或新建会话",
+                    code="request_too_large",
+                )
 
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
@@ -318,6 +349,15 @@ class DeepSeekProvider(BaseProvider):
 
     def supports_thinking(self) -> bool:
         return True
+
+    def supports_images(self) -> bool:
+        model = self.config.model.strip().lower()
+        return (
+            model == "deepseek-flash"
+            or model.startswith("deepseek-flash-")
+            or model == "deepseek-v4-flash"
+            or model.startswith("deepseek-v4-flash-")
+        )
 
     # -- tool message formatting (OpenAI style) --------------------------------
 

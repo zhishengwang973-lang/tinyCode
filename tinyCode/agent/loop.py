@@ -54,6 +54,7 @@ from tinyCode.config.constants import (
 from tinyCode.conversation.compression import ContextCompressor
 from tinyCode.conversation.summarizer import StructuredSummarizer
 from tinyCode.notes.manager import AutoNoteManager
+from tinyCode.multimodal import extract_text_content
 from tinyCode.hooks.engine import HookEngine
 from tinyCode.hooks.models import HookEvent
 from tinyCode.skills.registry import SkillRegistry
@@ -1211,7 +1212,7 @@ class AgentLoop:
         for message in reversed(history.get_messages()):
             if message.get("role") != "user":
                 break
-            if isinstance(message.get("content"), str):
+            if extract_text_content(message.get("content")):
                 trailing_users.append(message)
         if trailing_users:
             isolated = ConversationHistory()
@@ -2079,8 +2080,10 @@ class AgentLoop:
     @staticmethod
     def _latest_user_text(history: ConversationHistory) -> str:
         for message in reversed(history.get_messages()):
-            if message.get("role") == "user" and isinstance(message.get("content"), str):
-                return message["content"]
+            if message.get("role") == "user":
+                text = extract_text_content(message.get("content"))
+                if text:
+                    return text
         return ""
 
     @classmethod

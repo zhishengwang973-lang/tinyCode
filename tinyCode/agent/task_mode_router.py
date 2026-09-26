@@ -12,6 +12,7 @@ import httpx
 from tinyCode.agent.task_mode import TaskMode, classify_task_mode_rule
 from tinyCode.config.models import TaskModeRoutingConfig
 from tinyCode.network import detect_proxy_route
+from tinyCode.multimodal import extract_text_content
 from tinyCode.providers.base import (
     BaseProvider,
     CacheUsage,
@@ -284,12 +285,15 @@ class TaskModeRouter:
         for message in reversed(messages):
             role = message.get("role")
             content = message.get("content")
-            if role not in {"user", "assistant"} or not isinstance(content, str):
+            if role not in {"user", "assistant"}:
+                continue
+            text = extract_text_content(content)
+            if not text:
                 continue
             remaining = _MAX_ROUTING_STATE_CHARS - total
             if remaining <= 0:
                 break
-            clipped = content[-remaining:]
+            clipped = text[-remaining:]
             excerpt.append({"role": role, "content": clipped})
             total += len(clipped)
             if len(excerpt) >= 6:

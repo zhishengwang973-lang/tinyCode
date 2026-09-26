@@ -882,6 +882,70 @@ class OpenAIProviderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeepSeekProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_current_and_legacy_flash_names_support_images(self):
+        for model in (
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ):
+            with self.subTest(model=model):
+                provider = DeepSeekProvider(ProviderConfig(
+                    name="deepseek", protocol="deepseek", model=model,
+                    base_url="https://api.deepseek.com", api_key="test-key",
+                ))
+                self.assertTrue(provider.supports_images())
+
+    async def test_non_vision_model_rejects_image_before_network_request(self):
+        provider = DeepSeekProvider(
+            ProviderConfig(
+                name="deepseek", protocol="deepseek", model="deepseek-chat",
+                base_url="https://api.deepseek.com", api_key="test-key",
+            )
+        )
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"},
+                },
+            ],
+        }]
+
+        with self.assertRaises(ProviderError) as raised:
+            await _collect(provider.chat_stream(messages=messages))
+
+        self.assertEqual("image_not_supported", raised.exception.code)
+
+    async def test_vision_model_sends_openai_compatible_image_blocks(self):
+        _FakeAsyncClient.lines = ["data: [DONE]"]
+        provider = DeepSeekProvider(
+            ProviderConfig(
+                name="deepseek", protocol="deepseek", model="deepseek-flash",
+                base_url="https://api.deepseek.com", api_key="test-key",
+            )
+        )
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "描述图片"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/a.png", "detail": "low",
+                    },
+                },
+            ],
+        }]
+
+        with patch("tinyCode.providers.deepseek.httpx.AsyncClient", _FakeAsyncClient):
+            await _collect(provider.chat_stream(messages=messages))
+
+        sent = _FakeAsyncClient.last_stream_kwargs["json"]["messages"]
+        self.assertEqual("image_url", sent[0]["content"][1]["type"])
+        self.assertEqual("low", sent[0]["content"][1]["image_url"]["detail"])
+
     async def test_cache_usage_is_exposed_from_deepseek_counters(self):
         _FakeAsyncClient.lines = [
             'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_cache_hit_tokens":75,"prompt_cache_miss_tokens":25}}',

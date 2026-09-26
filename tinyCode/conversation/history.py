@@ -5,6 +5,7 @@ import math
 import json
 
 from tinyCode.providers.base import Message
+from tinyCode.multimodal import IMAGE_TOKEN_ESTIMATE
 
 CHARS_PER_TOKEN = 3.5
 
@@ -18,18 +19,6 @@ def estimate_text_tokens(text: str) -> int:
     return math.ceil(ascii_chars / 4.0 + non_ascii_chars)
 
 
-def _content_chars(content: object) -> int:
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        return sum(_content_chars(item) for item in content)
-    if isinstance(content, dict):
-        return sum(_content_chars(value) for value in content.values())
-    return len(str(content))
-
-
 class ConversationHistory:
     """Ordered message list (user, assistant, tool). No system prompt — that
     is managed by the PromptBuilder and AgentLoop."""
@@ -41,10 +30,10 @@ class ConversationHistory:
 
     # -- mutation ------------------------------------------------------------
 
-    def add_user_message(self, content: str) -> None:
+    def add_user_message(self, content: str | list[dict]) -> None:
         if not content:
             return
-        self._messages.append({"role": "user", "content": content})
+        self._messages.append({"role": "user", "content": deepcopy(content)})
 
     def defer_user_message(self, content: str) -> None:
         """Queue asynchronous context until the next protocol-safe boundary."""
@@ -142,15 +131,10 @@ class ConversationHistory:
         return result
 
     def estimated_token_count(self) -> int:
-        total_chars = 0
-        for msg in self._messages:
-            total_chars += _content_chars(msg.get("content"))
-            if "tool_calls" in msg:
-                total_chars += len(json.dumps(msg["tool_calls"], ensure_ascii=False))
         # Preserve message structure while estimating mixed-language content.
         total = 0
         for msg in self._messages:
-            total += estimate_text_tokens(str(msg.get("content", "")))
+            total += estimate_content_tokens(msg.get("content", ""))
             if "tool_calls" in msg:
                 total += estimate_text_tokens(
                     json.dumps(msg["tool_calls"], ensure_ascii=False)
@@ -163,3 +147,23 @@ class ConversationHistory:
 
     def __iter__(self):
         return iter(self._messages)
+
+
+def estimate_content_tokens(content: object) -> int:
+    if isinstance(content, str):
+        return estimate_text_tokens(content)
+    if not isinstance(content, list):
+        return estimate_text_tokens(str(content))
+    total = 0
+    for block in content:
+        if not isinstance(block, dict):
+            total += estimate_text_tokens(str(block))
+            continue
+        block_type = block.get("type")
+        if block_type in {"image_file", "image_url", "input_image", "image"}:
+            total += IMAGE_TOKEN_ESTIMATE
+        elif isinstance(block.get("text"), str):
+            total += estimate_text_tokens(block["text"])
+        else:
+            total += estimate_text_tokens(json.dumps(block, ensure_ascii=False))
+    return total

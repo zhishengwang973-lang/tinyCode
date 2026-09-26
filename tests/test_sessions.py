@@ -11,6 +11,35 @@ from tinyCode.storage.sessions import SessionStore
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_multimodal_user_message_survives_save_and_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = Path(tmp)
+            content = [
+                {"type": "text", "text": "分析截图"},
+                {
+                    "type": "image_file",
+                    "image_file": {
+                        "path": "/project/.tinyCode/attachments/a.png",
+                        "media_type": "image/png",
+                        "detail": "auto",
+                        "size": 12,
+                    },
+                },
+            ]
+            with patch.object(sessions, "SESSIONS_DIR", sessions_dir):
+                store = SessionStore()
+                sid = store.new_session()
+                history = ConversationHistory()
+                history.add_user_message(content)
+                store.save(history, "deepseek", "deepseek-flash")
+                loaded = SessionStore().load(sid)
+
+            self.assertIsNotNone(loaded)
+            restored, provider, model = loaded
+            self.assertEqual("deepseek", provider)
+            self.assertEqual("deepseek-flash", model)
+            self.assertEqual(content, restored.get_messages()[0]["content"])
+
     def test_time_gap_handles_mixed_legacy_naive_and_aware_timestamps(self):
         messages = [
             {

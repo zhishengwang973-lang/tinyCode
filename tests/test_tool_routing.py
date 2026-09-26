@@ -41,6 +41,20 @@ class ToolRoutingTests(unittest.TestCase):
                     {"role": "user", "content": prompt},
                 ]))
 
+    def test_multimodal_turn_is_classified_from_its_text_block(self):
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "根据这个截图修复当前项目的界面问题"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/screen.png"},
+                },
+            ],
+        }
+
+        self.assertIs(TaskMode.MODIFY, classify_task_mode([message]))
+
     def test_continuation_reuses_existing_project_tool_context(self):
         messages = [
             {"role": "user", "content": "检查这个项目"},

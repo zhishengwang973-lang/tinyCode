@@ -81,6 +81,7 @@ class StructuredSummarizerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         for model in (
+            "deepseek-flash",
             "deepseek-v4-pro",
             "deepseek-v4-flash",
             "deepseek-chat",

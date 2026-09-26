@@ -42,6 +42,7 @@ from tinyCode.agent.events import (
 )
 from tinyCode.agent.runtime import TurnRuntime
 from tinyCode.commands import CommandDispatcher, CommandRegistry, UIControl, register_builtins
+from tinyCode.multimodal import ImageInputError, build_image_user_content
 from tinyCode.providers.base import TokenUsage
 from tinyCode.security.models import HITLDecision, SecurityLevel
 from tinyCode.tui.render import STYLE
@@ -434,6 +435,7 @@ class TinyCodeTUI(UIControl):
         self._note_manager = note_manager
         self._skill_registry = skill_registry
         self._task_manager = task_manager
+        self._worktree_manager = worktree_manager
         self._provider_name = provider_name
         self._model = model
         self._mcp_server_count = mcp_server_count
@@ -541,6 +543,46 @@ class TinyCodeTUI(UIControl):
     def send_to_conversation(self, text: str) -> None:
         """Inject a prompt-command result into the foreground conversation."""
         self._start_user_input(text, display_user=False)
+
+    def supports_image_input(self) -> bool:
+        supports = getattr(self._agent_loop.provider, "supports_images", None)
+        return bool(callable(supports) and supports())
+
+    def send_image_to_conversation(
+        self, content: list[dict], display_text: str,
+    ) -> bool:
+        return self._start_user_input(
+            display_text,
+            display_user=True,
+            user_content=content,
+        )
+
+    def get_image_attachment_root(self) -> Path:
+        root = getattr(self._worktree_manager, "repo_root", None)
+        return root if isinstance(root, Path) else Path.cwd()
+
+    async def submit_image_source(self, source: str, prompt: str) -> bool:
+        """Validate, persist, and start a user-selected image turn."""
+        if not self.supports_image_input():
+            self._print_warning(
+                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+            )
+            return False
+        try:
+            content, label = await asyncio.to_thread(
+                build_image_user_content,
+                source,
+                prompt,
+                project_root=self.get_image_attachment_root(),
+            )
+        except ImageInputError as exc:
+            self._print_warning(str(exc))
+            return False
+        question = prompt.strip() or "请描述并分析这张图片。"
+        return self.send_image_to_conversation(
+            content,
+            f"[图片: {label}]\n{question}",
+        )
 
     def toggle_plan_mode(self) -> bool:
         return self._agent_loop.toggle_plan_only()
@@ -781,7 +823,13 @@ class TinyCodeTUI(UIControl):
 
     # -- message handling --------------------------------------------------
 
-    def _start_user_input(self, text: str, *, display_user: bool = True) -> bool:
+    def _start_user_input(
+        self,
+        text: str,
+        *,
+        display_user: bool = True,
+        user_content: str | list[dict] | None = None,
+    ) -> bool:
         """Reserve the foreground slot before scheduling an async turn."""
         if not self._runtime.reserve():
             self._print_warning("已有任务正在执行")
@@ -791,6 +839,7 @@ class TinyCodeTUI(UIControl):
             text,
             display_user=display_user,
             cancelled_note_task=note_task,
+            user_content=user_content,
         ))
         self._foreground_task = task
         task.add_done_callback(self._finish_foreground)
@@ -888,6 +937,7 @@ class TinyCodeTUI(UIControl):
         *,
         display_user: bool = True,
         cancelled_note_task: asyncio.Task | None = None,
+        user_content: str | list[dict] | None = None,
     ) -> None:
         if not self._runtime.active and not self._runtime.reserve():
             return
@@ -916,10 +966,14 @@ class TinyCodeTUI(UIControl):
                     model=self._model,
                     context_window=int(self._compressor.context_window),
                 )
-            auto_response = await self._try_auto_team(
-                text,
-                display_user=display_user,
-                stream_renderer=stream_renderer,
+            auto_response = (
+                await self._try_auto_team(
+                    text,
+                    display_user=display_user,
+                    stream_renderer=stream_renderer,
+                )
+                if user_content is None
+                else None
             )
             if auto_response is not None:
                 current_response = auto_response
@@ -954,7 +1008,9 @@ class TinyCodeTUI(UIControl):
             if display_user:
                 self._print_user(text)
             self._history.flush_deferred()
-            self._history.add_user_message(text)
+            self._history.add_user_message(
+                text if user_content is None else user_content
+            )
             self._save_checkpoint()
             if self._recovery_store is not None and self._active_recovery_task_id:
                 self._recovery_store.checkpoint(

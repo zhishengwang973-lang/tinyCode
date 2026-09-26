@@ -7,7 +7,8 @@ to stop auto-triggering on repeated failures.
 from dataclasses import dataclass
 import json
 
-from tinyCode.conversation.history import estimate_text_tokens
+from tinyCode.conversation.history import estimate_content_tokens, estimate_text_tokens
+from tinyCode.multimodal import describe_user_content
 from tinyCode.providers.base import BaseProvider, Message
 
 #: Fraction of context window that triggers summarization.
@@ -22,6 +23,7 @@ _MODEL_WINDOWS: dict[str, int] = {
     "gpt-4.1": 1_000_000, "gpt-3.5-turbo": 16_385,
     "o1": 200_000, "o3": 200_000, "o4": 200_000,
     "deepseek-v4-pro": 1_000_000, "deepseek-v4-flash": 1_000_000,
+    "deepseek-flash": 1_000_000,
     "deepseek-chat": 1_000_000, "deepseek-reasoner": 1_000_000,
 }
 DEFAULT_WINDOW = 128_000
@@ -272,7 +274,7 @@ class StructuredSummarizer:
     @staticmethod
     def _estimate_tokens(messages: list[Message]) -> int:
         return sum(
-            estimate_text_tokens(str(m.get("content", "")))
+            estimate_content_tokens(m.get("content", ""))
             + (
                 estimate_text_tokens(json.dumps(m["tool_calls"], ensure_ascii=False))
                 if "tool_calls" in m else 0
@@ -318,7 +320,7 @@ def _format_for_summary(
             if other_remaining <= 0:
                 omitted += 1
                 continue
-            rendered = str(content)
+            rendered = describe_user_content(content) or str(content)
             take = min(3000, other_remaining)
             text = rendered[:take]
             other_remaining -= take

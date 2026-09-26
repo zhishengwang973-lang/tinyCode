@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from tinyCode.conversation.history import ConversationHistory
+from tinyCode.multimodal import extract_text_content
 from tinyCode.storage.journal import JSONLJournal, atomic_write_text as _atomic_write_text
 from tinyCode.time_utils import beijing_now_iso
 
@@ -644,7 +645,7 @@ class SessionStore:
     def _guess_title(messages: list[dict]) -> str:
         for m in messages:
             if m.get("role") == "user":
-                content = m.get("content", "")
-                if isinstance(content, str):
+                content = extract_text_content(m.get("content", ""))
+                if content:
                     return content[:60]
         return "未命名会话"

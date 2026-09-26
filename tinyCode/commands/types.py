@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 
 class CommandType(Enum):
@@ -28,7 +29,7 @@ class CommandMeta:
     aliases: list[str] = field(default_factory=list)
     params: list[ParamHint] = field(default_factory=list)
     hidden: bool = False
-    handler: Callable[[list[str]], Awaitable[str]] | None = None
+    handler: Callable[[list[str]], Awaitable[str | None]] | None = None
 
 
 class UIControl(ABC):
@@ -44,6 +45,20 @@ class UIControl(ABC):
     def send_to_conversation(self, text: str) -> None:
         """Inject text into the conversation as a user message (triggers AI)."""
         ...
+
+    def supports_image_input(self) -> bool:
+        """Whether the active provider/model accepts image input."""
+        return False
+
+    def send_image_to_conversation(
+        self, content: list[dict], display_text: str,
+    ) -> bool:
+        """Start a multimodal user turn. Return whether it was scheduled."""
+        return False
+
+    def get_image_attachment_root(self) -> Path:
+        """Return durable project storage for copied image attachments."""
+        return Path.cwd()
 
     @abstractmethod
     def toggle_plan_mode(self) -> bool:

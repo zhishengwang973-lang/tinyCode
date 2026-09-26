@@ -12,6 +12,7 @@ import io
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 from rich.console import Console
@@ -26,6 +27,11 @@ from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tui.metrics import TurnMetrics
 from tinyCode.tui.workspace_changes import WorkspaceChanges
+from tinyCode.multimodal import (
+    ImageInputError,
+    describe_user_content,
+    select_local_image,
+)
 
 
 class _FullscreenStreamSink:
@@ -381,6 +387,15 @@ class _TinyCodeFullscreenApp(App[None]):
         width: 100%; height: 1; padding: 0 1;
         color: $text-disabled; background: transparent;
     }
+    #attachment-row {
+        display: none; width: 100%; height: 2; padding: 0 1;
+        color: $text-muted; background: $surface;
+    }
+    #attachment-label { width: 1fr; height: 1; }
+    #remove-attachment {
+        width: 5; min-width: 5; height: 1; padding: 0;
+        color: $text-muted; background: transparent; border: none;
+    }
     #composer-row {
         width: 100%; height: auto; align-vertical: bottom;
     }
@@ -399,6 +414,16 @@ class _TinyCodeFullscreenApp(App[None]):
         width: 1fr; height: 1; min-height: 1; max-height: 7;
         padding: 0 1; border: none; background: transparent;
     }
+    #attach-button {
+        width: 5; min-width: 5; height: 3;
+        margin: 0; padding: 0;
+        color: $text-muted; background: transparent; border: none;
+        text-style: bold;
+    }
+    #attach-button:hover, #attach-button:focus {
+        color: $text; background: $surface; border: round $panel-lighten-2;
+    }
+    #attach-button:disabled { color: $text-disabled; }
     #stop-button {
         display: none; width: 5; min-width: 5; height: 3;
         margin: 0 1 0 0; padding: 0;
@@ -420,6 +445,7 @@ class _TinyCodeFullscreenApp(App[None]):
         self.follow_tail = True
         self.command_candidates: list[str] = []
         self.command_index = 0
+        self.pending_image_source = ""
 
     def compose(self) -> ComposeResult:
         yield Static(self.owner._header_text(), id="topbar", markup=False)
@@ -433,10 +459,20 @@ class _TinyCodeFullscreenApp(App[None]):
                 markup=False,
             )
             with Vertical(id="composer-frame"):
+                with Horizontal(id="attachment-row"):
+                    yield Static("", id="attachment-label", markup=False)
+                    yield Button(
+                        "×", id="remove-attachment", tooltip="移除待发送图片",
+                    )
                 yield Static(
                     self.owner._input_placeholder(), id="composer-hint", markup=False,
                 )
                 with Horizontal(id="composer-row"):
+                    yield Button(
+                        "+",
+                        id="attach-button",
+                        tooltip="附加图片",
+                    )
                     yield _Composer(
                         id="composer", soft_wrap=True, show_line_numbers=False,
                     )
@@ -446,7 +482,7 @@ class _TinyCodeFullscreenApp(App[None]):
                         tooltip="中断当前任务",
                     )
         yield Static(
-            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · 拖拽选择/⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程 · Ctrl-C 取消/退出",
+            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · + 图片 · 拖拽选择/⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程",
             id="helpbar",
             markup=False,
         )
@@ -459,11 +495,16 @@ class _TinyCodeFullscreenApp(App[None]):
     @on(_Composer.Submitted, "#composer")
     def _on_submit(self, event: _Composer.Submitted) -> None:
         text = event.value.strip()
+        image_source = self.pending_image_source
         event.composer.clear()
+        self._clear_pending_image()
         self._hide_command_menu()
         self._resize_composer(event.composer)
-        if text:
-            self.run_worker(self.owner._submit_input(text), exclusive=False)
+        if text or image_source:
+            self.run_worker(
+                self.owner._submit_input(text, image_source=image_source),
+                exclusive=False,
+            )
 
     @on(TextArea.Changed, "#composer")
     def _on_input_changed(self, event: TextArea.Changed) -> None:
@@ -491,6 +532,48 @@ class _TinyCodeFullscreenApp(App[None]):
         if self.owner.cancel_active_turn():
             self.refresh_composer()
         self.query_one("#composer", _Composer).focus()
+
+    @on(Button.Pressed, "#attach-button")
+    def _on_attach_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.run_worker(
+            self._choose_image(),
+            name="image-file-picker",
+            group="image-file-picker",
+            exclusive=True,
+        )
+
+    @on(Button.Pressed, "#remove-attachment")
+    def _on_remove_attachment_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._clear_pending_image()
+        self.query_one("#composer", _Composer).focus()
+
+    async def _choose_image(self) -> None:
+        try:
+            selected = await select_local_image()
+        except ImageInputError as exc:
+            self.owner._print_warning(str(exc))
+            return
+        if not selected:
+            return
+        self.pending_image_source = selected
+        self._refresh_attachment()
+        self.query_one("#composer", _Composer).focus()
+
+    def _clear_pending_image(self) -> None:
+        self.pending_image_source = ""
+        if self.is_mounted:
+            self._refresh_attachment()
+
+    def _refresh_attachment(self) -> None:
+        row = self.query_one("#attachment-row", Horizontal)
+        label = self.query_one("#attachment-label", Static)
+        row.display = bool(self.pending_image_source)
+        label.update(
+            f"图片 · {Path(self.pending_image_source).name}"
+            if self.pending_image_source else ""
+        )
 
     @on(events.TextSelected)
     def _on_text_selected(self) -> None:
@@ -584,11 +667,16 @@ class _TinyCodeFullscreenApp(App[None]):
             self.owner._input_placeholder()
         )
         stop_button = self.query_one("#stop-button", Button)
+        attach_button = self.query_one("#attach-button", Button)
         task_active = self.owner._runtime.active
         cancelling = self.owner._status_text == "正在取消当前任务"
         stop_button.display = task_active
         stop_button.disabled = not task_active or cancelling
         stop_button.label = "…" if cancelling else "■"
+        attach_button.disabled = (
+            task_active or not self.owner.supports_image_input()
+        )
+        self._refresh_attachment()
 
     @staticmethod
     def _resize_composer(composer: _Composer) -> None:
@@ -690,10 +778,13 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         for message in get_messages():
             role = message.get("role")
             content = message.get("content")
-            if role == "user" and isinstance(content, str) and content:
+            if role == "user":
+                user_text = describe_user_content(content)
+                if not user_text:
+                    continue
                 if active is not None:
                     active.finished = True
-                active = _ConversationTurn(user_text=content)
+                active = _ConversationTurn(user_text=user_text)
                 self._turns.append(active)
             elif role == "assistant" and isinstance(content, str) and content:
                 if active is None:
@@ -908,8 +999,15 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._start_progress("已收到回答 · 继续执行")
             return answer
 
-    async def _submit_input(self, text: str) -> None:
-        if self._runtime.active and self._is_cancel_command(text):
+    async def _submit_input(
+        self, text: str, *, image_source: str = "",
+    ) -> None:
+        if image_source:
+            if self._runtime.active:
+                self._print_warning("任务执行期间不能添加图片，请等待当前任务结束")
+            else:
+                await self.submit_image_source(image_source, text)
+        elif self._runtime.active and self._is_cancel_command(text):
             await self._handle_cancel_input(text)
         elif self._pending_control_input is not None and not self._pending_control_input.future.done():
             self._pending_control_input.future.set_result(text)

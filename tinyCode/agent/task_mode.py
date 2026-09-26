@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from tinyCode.providers.base import Message
+from tinyCode.multimodal import extract_text_content
 
 
 class TaskMode(str, Enum):
@@ -450,8 +451,9 @@ def _latest_user_message(messages: list[Message]) -> tuple[int | None, str]:
         if message.get("role") != "user":
             continue
         content = message.get("content")
-        if isinstance(content, str):
-            return index, content
+        text = extract_text_content(content)
+        if text:
+            return index, text
     return None, ""
 
 

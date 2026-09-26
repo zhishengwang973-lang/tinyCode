@@ -23,6 +23,14 @@ providers:
     api_key_env: DEEPSEEK_API_KEY
     context_window: 1000000
 
+  # DeepSeek 图片理解模型（/image 命令）
+  - name: deepseek-vision
+    protocol: deepseek
+    model: deepseek-flash
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    context_window: 1000000
+
   - name: deepseek-r1
     protocol: deepseek
     model: deepseek-reasoner

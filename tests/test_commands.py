@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from tinyCode.commands.builtin import (
     config_cmd,
     cancel_cmd,
     exit_cmd,
+    image_cmd,
     prompt_cmd,
     memory_cmd,
     session_cmd,
@@ -206,6 +208,7 @@ class BuiltinCommandPackageTests(unittest.TestCase):
             "exit_cmd",
             "prompt_cmd",
             "help_cmd",
+            "image_cmd",
             "memory_cmd",
             "mode_cmd",
             "permission_cmd",
@@ -231,12 +234,27 @@ class FakeUI(UIControl):
         self.round_limit_action = "ask"
         self.exit_requested = False
         self.cancelled = False
+        self.image_supported = False
+        self.images: list[tuple[list[dict], str]] = []
+        self.image_attachment_root = Path.cwd()
 
     def show_system_message(self, text: str) -> None:
         pass
 
     def send_to_conversation(self, text: str) -> None:
         self.injected.append(text)
+
+    def supports_image_input(self) -> bool:
+        return self.image_supported
+
+    def send_image_to_conversation(
+        self, content: list[dict], display_text: str,
+    ) -> bool:
+        self.images.append((content, display_text))
+        return True
+
+    def get_image_attachment_root(self) -> Path:
+        return self.image_attachment_root
 
     def toggle_plan_mode(self) -> bool:
         return False
@@ -543,6 +561,43 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(registry.lookup("config"))
         self.assertIs(registry.lookup("config"), registry.lookup("cfg"))
         self.assertIsNotNone(registry.lookup("cancel"))
+        self.assertIsNotNone(registry.lookup("image"))
+
+    async def test_image_command_builds_multimodal_turn_for_vision_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "screen.png"
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            ui = FakeUI()
+            ui.image_supported = True
+            ui.image_attachment_root = root
+            registry = CommandRegistry()
+            registry.register(image_cmd.create(ui))
+            dispatcher = CommandDispatcher(registry, ui=ui)
+
+            was_command, result = await dispatcher.dispatch(
+                f'/image --detail low "{image_path}" 分析这个截图'
+            )
+
+        self.assertTrue(was_command)
+        self.assertIsNone(result)
+        self.assertEqual(1, len(ui.images))
+        content, display = ui.images[0]
+        self.assertEqual("image_file", content[1]["type"])
+        self.assertEqual("low", content[1]["image_file"]["detail"])
+        self.assertIn("screen.png", display)
+        self.assertIn("分析这个截图", display)
+
+    async def test_image_command_explains_unsupported_model(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(image_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, result = await dispatcher.dispatch("/image screenshot.png 看一下")
+
+        self.assertIn("deepseek-flash", result)
+        self.assertEqual([], ui.images)
 
     async def test_trace_command_controls_and_renders_recorder(self):
         class FakeTraceRecorder:

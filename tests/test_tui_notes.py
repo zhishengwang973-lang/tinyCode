@@ -5,14 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from prompt_toolkit.document import Document
 from rich.console import Console
 from textual import events
 from textual.containers import VerticalScroll
 from textual.selection import SELECT_ALL
-from textual.widgets import Button, TextArea
+from textual.widgets import Button, Static, TextArea
 
 from tinyCode.agent.events import (
     AgentDoneEvent,
@@ -480,6 +480,61 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([True], tui._compressor.force_values)
         self.assertIn("上下文已压缩", result)
+
+    async def test_image_turn_keeps_structured_content_in_history(self):
+        class VisionProvider:
+            def supports_images(self):
+                return True
+
+        loop = FakeAgentLoop("看到了截图")
+        loop.provider = VisionProvider()
+        tui, output = self._make_tui(loop)
+        content = [
+            {"type": "text", "text": "分析截图"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/screen.png"},
+            },
+        ]
+
+        scheduled = tui.send_image_to_conversation(
+            content, "[图片: screen.png]\n分析截图",
+        )
+        await tui._wait_for_foreground()
+
+        self.assertTrue(scheduled)
+        self.assertEqual(content, tui._history.user_messages[0])
+        self.assertIn("screen.png", output.getvalue())
+        self.assertIn("看到了截图", output.getvalue())
+
+    async def test_selected_local_image_is_persisted_then_sent(self):
+        class VisionProvider:
+            def supports_images(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "screen.png"
+            source.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            loop = FakeAgentLoop("图片分析完成")
+            loop.provider = VisionProvider()
+            tui, _output = self._make_tui(loop)
+            tui._worktree_manager = SimpleNamespace(repo_root=root)
+
+            scheduled = await tui.submit_image_source(
+                str(source), "分析这个截图",
+            )
+            await tui._wait_for_foreground()
+
+            self.assertTrue(scheduled)
+            content = tui._history.user_messages[0]
+            self.assertEqual("image_file", content[1]["type"])
+            stored = Path(content[1]["image_file"]["path"])
+            self.assertTrue(stored.is_file())
+            self.assertEqual(
+                (root / ".tinyCode" / "attachments").resolve(),
+                stored.parent.resolve(),
+            )
 
     async def test_prompt_command_prints_snapshot_without_starting_turn(self):
         tui, output = self._make_tui(answers=["/prompt base", "/exit"])
@@ -949,6 +1004,37 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("# 修复完成", view.turn.answer)
             self.assertIn("已编辑 2 个文件", view.turn.workspace_summary)
 
+    async def test_fullscreen_attach_button_opens_picker_and_stages_image(self):
+        loop = FakeAgentLoop()
+        loop.provider = SimpleNamespace(supports_images=lambda: True)
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="deepseek",
+            model="deepseek-flash",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            with patch(
+                "tinyCode.tui.fullscreen_textual.select_local_image",
+                new=AsyncMock(return_value="/tmp/screen.png"),
+            ):
+                await pilot.click("#attach-button")
+                await pilot.pause()
+
+            composer = app.query_one("#composer", _Composer)
+            self.assertEqual("", composer.text)
+            self.assertEqual("/tmp/screen.png", app.pending_image_source)
+            self.assertTrue(app.query_one("#attachment-row").display)
+            self.assertIn(
+                "screen.png",
+                str(app.query_one("#attachment-label", Static).content),
+            )
+            self.assertFalse(app.query_one("#attach-button", Button).disabled)
+
     async def test_fullscreen_reasoning_indicator_animates_and_stops(self):
         tui = FullscreenTinyCodeTUI(
             agent_loop=FakeAgentLoop(),
@@ -967,8 +1053,8 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
             view = app.query_one(_TurnView)
             self.assertTrue(tui._active_turn.activity_active)
-            self.assertIn("◐ Reasoning", view.process_text.content)
             first_frame = str(view.process_text.content)
+            self.assertRegex(first_frame, r"[◐◓◑◒] Reasoning")
             view._advance_process_spinner()
             self.assertNotEqual(first_frame, str(view.process_text.content))
 

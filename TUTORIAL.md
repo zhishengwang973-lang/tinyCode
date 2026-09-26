@@ -135,6 +135,12 @@ providers:
     model: deepseek-chat
     api_key_env: DEEPSEEK_API_KEY
 
+  # DeepSeek 图片理解
+  - name: deepseek-vision
+    protocol: deepseek
+    model: deepseek-flash
+    api_key_env: DEEPSEEK_API_KEY
+
   # DeepSeek 推理模型
   - name: deepseek-r1
     protocol: deepseek
@@ -231,6 +237,20 @@ API 地址或指定密钥。
 
 **DeepSeek Reasoner**：`deepseek-reasoner` 模型的推理过程自动以 `[Reasoning]` 标签渲染。
 
+**DeepSeek 图片输入**：将 `active_provider` 切换为使用 `deepseek-flash` 的 Provider。
+全屏 TUI 点击输入框左侧的 `+` 会直接打开系统文件选择器；选择后图片显示在输入框
+上方，输入问题并按 Enter 即可一起发送。也可以通过终端命令发送图片：
+
+```text
+/image ./screenshot.png 分析这个界面为什么错位
+/image --detail low https://example.com/chart.webp 总结图表趋势
+```
+
+支持 JPEG、PNG、GIF、WebP，本地图片最大 32 MiB。`low` 会先缩放到 512×512，
+速度更快、Token 更少；`high`、`original` 和 `auto` 保留原图。本地图片会按内容摘要
+复制到项目 `.tinyCode/attachments/`，会话只保存引用，重启后仍可继续，不会把 Base64
+写入会话文件。图片当前只能在没有前台任务运行时作为新一轮输入发送。
+
 ---
 
 ## 4. 工具系统
@@ -292,6 +312,7 @@ TinyCode: 找到了两个文件：src/cli.py:42 和 src/server.py:15
 | `/memory [show\|clear\|edit]` | `mem notes` | 管理自动笔记 |
 | `/permission` | `perm acl` | 安全权限状态 |
 | `/review [路径]` | `cr audit` | 请求代码审查 |
+| `/image [--detail ...] <路径或URL> [问题]` | `img` | 向视觉模型发送图片 |
 | `/skill [list\|reload\|clear]` | `skills` | Skill 管理 |
 | `/tasks [list\|detail\|kill]` | `bg` | 后台任务管理 |
 | `/worktree [status\|list\|create\|enter\|exit]` | `wt` | Git 工作目录 |

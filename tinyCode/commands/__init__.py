@@ -44,6 +44,7 @@ def register_builtins(
     from tinyCode.commands.builtin.worktree_cmd import create as _worktree
     from tinyCode.commands.builtin.team_cmd import create as _team
     from tinyCode.commands.builtin.trace_cmd import create as _trace
+    from tinyCode.commands.builtin.image_cmd import create as _image
 
     registry.register(_help(registry))
     registry.register(_compress(ui))
@@ -57,6 +58,7 @@ def register_builtins(
     registry.register(_cancel(ui))
     registry.register(_prompt(ui))
     registry.register(_review())
+    registry.register(_image(ui))
     if skill_registry:
         registry.register(_skill(skill_registry, ui))
     if note_manager:
