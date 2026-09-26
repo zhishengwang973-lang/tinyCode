@@ -41,6 +41,7 @@ from tinyCode.tui.fullscreen_textual import (
     _Composer,
     _TinyCodeFullscreenApp,
     _TurnView,
+    _image_path_from_paste,
 )
 from tinyCode.tui.workspace_changes import WorkspaceChanges
 from tinyCode.config.models import TracingConfig
@@ -1034,6 +1035,119 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
                 str(app.query_one("#attachment-label", Static).content),
             )
             self.assertFalse(app.query_one("#attach-button", Button).disabled)
+
+    def test_pasted_image_path_is_detected_without_matching_normal_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "screen shot.png"
+            image.write_bytes(b"image")
+
+            self.assertEqual(image.resolve(), _image_path_from_paste(str(image)))
+            self.assertEqual(
+                image.resolve(),
+                _image_path_from_paste(image.as_uri()),
+            )
+            self.assertIsNone(_image_path_from_paste("请分析这段普通文字"))
+
+    async def test_fullscreen_pasted_image_path_becomes_attachment(self):
+        loop = FakeAgentLoop()
+        loop.provider = SimpleNamespace(supports_images=lambda: True)
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="deepseek",
+            model="deepseek-flash",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "pasted.png"
+            image.write_bytes(b"image")
+            async with app.run_test(size=(100, 36)) as pilot:
+                composer = app.query_one("#composer", _Composer)
+                app.post_message(events.Paste(str(image)))
+                await pilot.pause()
+
+                self.assertEqual(str(image.resolve()), app.pending_image_source)
+                self.assertEqual("", composer.text)
+
+    async def test_fullscreen_normal_pasted_text_is_inserted_once(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            composer = app.query_one("#composer", _Composer)
+            app.post_message(events.Paste("普通文字"))
+            await pilot.pause()
+
+            self.assertEqual("普通文字", composer.text)
+
+    async def test_fullscreen_ctrl_v_stages_clipboard_image(self):
+        loop = FakeAgentLoop()
+        loop.provider = SimpleNamespace(supports_images=lambda: True)
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="deepseek",
+            model="deepseek-flash",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            with patch(
+                "tinyCode.tui.fullscreen_textual.paste_clipboard_image",
+                new=AsyncMock(return_value="/tmp/clipboard.png"),
+            ) as paste_image:
+                await pilot.press("ctrl+v")
+                await pilot.pause()
+
+            paste_image.assert_awaited_once()
+            self.assertEqual("/tmp/clipboard.png", app.pending_image_source)
+            self.assertTrue(app.query_one("#attachment-row").display)
+            self.assertIn(
+                "clipboard.png",
+                str(app.query_one("#attachment-label", Static).content),
+            )
+
+    async def test_fullscreen_image_shortcut_preserves_text_paste_fallback(self):
+        loop = FakeAgentLoop()
+        loop.provider = SimpleNamespace(supports_images=lambda: True)
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=loop,
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="deepseek",
+            model="deepseek-flash",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+        async with app.run_test(size=(100, 36)) as pilot:
+            with (
+                patch(
+                    "tinyCode.tui.fullscreen_textual.paste_clipboard_image",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch(
+                    "tinyCode.tui.fullscreen_textual.read_clipboard_text",
+                    new=AsyncMock(return_value="普通文字"),
+                ),
+            ):
+                await pilot.press("ctrl+v")
+                await pilot.pause()
+
+            composer = app.query_one("#composer", _Composer)
+            self.assertEqual("普通文字", composer.text)
 
     async def test_fullscreen_reasoning_indicator_animates_and_stops(self):
         tui = FullscreenTinyCodeTUI(

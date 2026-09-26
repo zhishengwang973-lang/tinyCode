@@ -34,6 +34,37 @@ class ImageInputError(ValueError):
     """A user-correctable image attachment error."""
 
 
+_MACOS_CLIPBOARD_IMAGE_SCRIPT = r'''
+on run argv
+    set targetPath to item 1 of argv
+    try
+        set imageData to the clipboard as «class PNGf»
+        set imageFormat to "png"
+    on error
+        try
+            set imageData to the clipboard as TIFF picture
+            set imageFormat to "tiff"
+        on error
+            return "no-image"
+        end try
+    end try
+
+    set targetFile to open for access POSIX file targetPath with write permission
+    try
+        set eof targetFile to 0
+        write imageData to targetFile
+        close access targetFile
+    on error errorMessage
+        try
+            close access targetFile
+        end try
+        error errorMessage
+    end try
+    return imageFormat
+end run
+'''
+
+
 async def select_local_image() -> str | None:
     """Open the platform-native file chooser and return one selected path."""
     if sys.platform == "darwin":
@@ -95,6 +126,147 @@ async def select_local_image() -> str | None:
         raise ImageInputError(error or "图片文件选择器异常退出")
     selected = stdout.decode("utf-8", errors="replace").strip()
     return selected or None
+
+
+async def paste_clipboard_image(project_root: Path | None = None) -> str | None:
+    """Persist an OS clipboard image and return its durable local path.
+
+    A terminal paste only transports text. This function deliberately reads
+    the native pasteboard when the TUI receives its explicit paste-image
+    shortcut. ``None`` means the clipboard currently has no image flavor.
+    """
+    if sys.platform != "darwin":
+        raise ImageInputError(
+            "当前系统暂不支持直接读取图片剪贴板，请使用 + 选择图片"
+        )
+
+    root = (project_root or Path.cwd()).resolve()
+    attachment_dir = root / ".tinyCode" / "attachments"
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = attachment_dir / f".clipboard-{uuid4().hex}.raw"
+    converted_path = attachment_dir / f".clipboard-{uuid4().hex}.png"
+    selected_path = raw_path
+    try:
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/osascript",
+                "-e",
+                _MACOS_CLIPBOARD_IMAGE_SCRIPT,
+                str(raw_path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=10.0,
+            )
+        except asyncio.TimeoutError as exc:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise ImageInputError("读取系统图片剪贴板超时") from exc
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        except OSError as exc:
+            raise ImageInputError(f"无法读取系统图片剪贴板: {exc}") from exc
+
+        if process.returncode != 0:
+            error = stderr.decode("utf-8", errors="replace").strip()
+            raise ImageInputError(error or "读取系统图片剪贴板失败")
+        image_format = stdout.decode("utf-8", errors="replace").strip().casefold()
+        if image_format == "no-image":
+            return None
+        if image_format == "tiff":
+            selected_path = converted_path
+            await _convert_macos_tiff_to_png(raw_path, converted_path)
+        elif image_format != "png":
+            raise ImageInputError("系统剪贴板返回了无法识别的图片格式")
+
+        content, _ = await asyncio.to_thread(
+            build_image_user_content,
+            str(selected_path),
+            "",
+            project_root=root,
+        )
+        image = content[-1].get("image_file", {})
+        path = image.get("path") if isinstance(image, dict) else None
+        if not isinstance(path, str) or not path:
+            raise ImageInputError("保存剪贴板图片失败")
+        return path
+    finally:
+        for temporary in (raw_path, converted_path):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def read_clipboard_text() -> str:
+    """Read native clipboard text for paste-image shortcut fallback."""
+    if sys.platform != "darwin":
+        return ""
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/pbpaste",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=3.0)
+    except asyncio.TimeoutError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        return ""
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except OSError:
+        return ""
+    if process.returncode != 0:
+        return ""
+    return stdout.decode("utf-8", errors="replace")
+
+
+async def _convert_macos_tiff_to_png(source: Path, destination: Path) -> None:
+    process: asyncio.subprocess.Process | None = None
+    stderr = b""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/sips",
+            "-s",
+            "format",
+            "png",
+            str(source),
+            "--out",
+            str(destination),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
+    except asyncio.TimeoutError as exc:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise ImageInputError("转换剪贴板图片超时") from exc
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except OSError as exc:
+        raise ImageInputError(f"转换剪贴板图片失败: {exc}") from exc
+    if process is None or process.returncode != 0:
+        error = stderr.decode("utf-8", errors="replace").strip()
+        raise ImageInputError(error or "无法将剪贴板图片转换为 PNG")
 
 
 def build_image_user_content(

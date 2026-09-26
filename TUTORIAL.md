@@ -238,8 +238,11 @@ API 地址或指定密钥。
 **DeepSeek Reasoner**：`deepseek-reasoner` 模型的推理过程自动以 `[Reasoning]` 标签渲染。
 
 **DeepSeek 图片输入**：将 `active_provider` 切换为使用 `deepseek-flash` 的 Provider。
-全屏 TUI 点击输入框左侧的 `+` 会直接打开系统文件选择器；选择后图片显示在输入框
-上方，输入问题并按 Enter 即可一起发送。也可以通过终端命令发送图片：
+全屏 TUI 点击输入框左侧的 `+` 会直接打开系统文件选择器；在 macOS 中也可以按
+`Ctrl-V` 直接读取系统剪贴板里的图片。选择或粘贴后，图片会显示在输入框上方，输入
+问题并按 Enter 即可一起发送。如果终端支持传递 Command 修饰键，`⌘V` 也能触发；
+macOS Terminal 通常会吞掉图片剪贴板的 `⌘V`，此时请使用 `Ctrl-V`。也可以通过终端
+命令发送图片：
 
 ```text
 /image ./screenshot.png 分析这个界面为什么错位

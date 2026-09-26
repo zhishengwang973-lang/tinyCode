@@ -5,7 +5,7 @@
 ## 特性
 
 - **多 Provider 支持**：Anthropic Claude / OpenAI / DeepSeek，通过 YAML 配置切换
-- **图片输入**：全屏 TUI 的 `+` 按钮可唤起本地文件选择器，也可用 `/image` 发送路径或 URL；本地附件支持会话恢复
+- **图片输入**：全屏 TUI 支持 `+` 选择文件、`Ctrl-V` 粘贴剪贴板图片，也可用 `/image` 发送路径或 URL；本地附件支持会话恢复
 - **流式 TUI**：Rich 连续输出 + Prompt Toolkit 输入补全；进度瞬时刷新，不混入回答正文
 - **内置工具体系**：读/写/编辑/删除文件、多文件 `apply_patch`、执行命令、Glob/Grep、用户输入以及受限的公网搜索/读取，并在运行时接入 Skill 和子 Agent 工具
 - **执行 Trace 可观测性**：项目本地 JSONL 追踪、TUI 树形回放和离线 HTML 时间线；记录模型首 Token、重试、工具、Token、上下文及文件变化

@@ -11,6 +11,7 @@ from tinyCode.multimodal import (
     build_image_user_content,
     describe_user_content,
     materialize_deepseek_images,
+    paste_clipboard_image,
     select_local_image,
 )
 
@@ -121,3 +122,37 @@ class NativeImagePickerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("/tmp/screen.png", selected)
         self.assertEqual("/usr/bin/osascript", create.await_args.args[0])
+
+    async def test_macos_clipboard_image_is_persisted_as_attachment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            process = type("ClipboardProcess", (), {
+                "returncode": 0,
+                "communicate": AsyncMock(return_value=(b"png\n", b"")),
+            })()
+
+            async def create_process(*args, **kwargs):
+                del kwargs
+                Path(args[-1]).write_bytes(_PNG)
+                return process
+
+            with (
+                patch("tinyCode.multimodal.sys.platform", "darwin"),
+                patch(
+                    "tinyCode.multimodal.asyncio.create_subprocess_exec",
+                    new=AsyncMock(side_effect=create_process),
+                ),
+            ):
+                selected = await paste_clipboard_image(root)
+
+            attachment = Path(selected or "")
+            self.assertTrue(attachment.is_file())
+            self.assertEqual(_PNG, attachment.read_bytes())
+            self.assertEqual(
+                (root / ".tinyCode" / "attachments").resolve(),
+                attachment.parent,
+            )
+            self.assertFalse(any(
+                path.name.startswith(".clipboard-")
+                for path in attachment.parent.iterdir()
+            ))

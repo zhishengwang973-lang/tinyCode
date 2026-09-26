@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ClassVar
+from urllib.parse import unquote, urlsplit
 
 from rich.console import Console
 from rich.text import Text
@@ -30,8 +32,43 @@ from tinyCode.tui.workspace_changes import WorkspaceChanges
 from tinyCode.multimodal import (
     ImageInputError,
     describe_user_content,
+    paste_clipboard_image,
+    read_clipboard_text,
     select_local_image,
 )
+
+
+def _image_path_from_paste(value: str) -> Path | None:
+    """Resolve a pasted local image path without treating arbitrary text as one."""
+    stripped = value.strip()
+    if not stripped or "\n" in stripped or "\r" in stripped:
+        return None
+    parsed = urlsplit(stripped)
+    candidates: list[str] = []
+    if parsed.scheme == "file":
+        candidates.append(unquote(parsed.path))
+    elif parsed.scheme:
+        return None
+    else:
+        candidates.append(stripped)
+        try:
+            parts = shlex.split(stripped)
+        except ValueError:
+            parts = []
+        if len(parts) == 1 and parts[0] != stripped:
+            candidates.append(parts[0])
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.suffix.casefold() not in {
+            ".jpg", ".jpeg", ".png", ".gif", ".webp",
+        }:
+            continue
+        try:
+            if path.is_file():
+                return path.resolve()
+        except OSError:
+            continue
+    return None
 
 
 class _FullscreenStreamSink:
@@ -296,6 +333,18 @@ class _Composer(TextArea):
         else:
             self.action_cursor_down()
 
+    async def _on_paste(self, event: events.Paste) -> None:
+        app = self.app
+        if (
+            isinstance(app, _TinyCodeFullscreenApp)
+            and app._stage_pasted_image_path(event.text)
+        ):
+            event.prevent_default()
+            event.stop()
+            return
+        event.prevent_default()
+        await TextArea._on_paste(self, event)
+
 
 class _TinyCodeFullscreenApp(App[None]):
     """Textual shell; all task decisions stay in the owner TUI."""
@@ -307,6 +356,8 @@ class _TinyCodeFullscreenApp(App[None]):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "cancel_or_exit", "取消/退出", priority=True),
         Binding("super+c", "copy_selection", "复制", priority=True),
+        Binding("ctrl+v", "paste_image", "粘贴图片", priority=True),
+        Binding("super+v", "paste_image", "粘贴", priority=True),
         Binding("ctrl+e", "toggle_process", "执行过程", priority=True),
         Binding("pageup", "history_up", "历史上翻", priority=True),
         Binding("pagedown", "history_down", "回到最新", priority=True),
@@ -482,7 +533,7 @@ class _TinyCodeFullscreenApp(App[None]):
                         tooltip="中断当前任务",
                     )
         yield Static(
-            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · + 图片 · 拖拽选择/⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程",
+            "Enter 发送 · Shift-Enter/Ctrl-J 换行 · + 选择图片 · Ctrl-V 粘贴图片 · ⌘C 复制 · PgUp/PgDn 历史 · Ctrl-E 过程",
             id="helpbar",
             markup=False,
         )
@@ -557,7 +608,61 @@ class _TinyCodeFullscreenApp(App[None]):
             return
         if not selected:
             return
-        self.pending_image_source = selected
+        self._stage_image_source(selected)
+
+    def action_paste_image(self) -> None:
+        self.run_worker(
+            self._paste_image(),
+            name="clipboard-image-paste",
+            group="clipboard-image-paste",
+            exclusive=True,
+        )
+
+    async def _paste_image(self) -> None:
+        if self.owner._runtime.active:
+            self.owner._print_warning("任务执行期间不能粘贴图片")
+            return
+        if not self.owner.supports_image_input():
+            self.owner._print_warning(
+                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+            )
+            return
+        try:
+            selected = await paste_clipboard_image(
+                self.owner.get_image_attachment_root()
+            )
+        except ImageInputError as exc:
+            self.owner._print_warning(str(exc))
+            return
+        if selected:
+            self._stage_image_source(selected)
+            return
+
+        # Enhanced terminal protocols may forward Command-V to Textual instead
+        # of creating a bracketed-paste event. Preserve normal text pasting.
+        text = await read_clipboard_text()
+        if text:
+            self.query_one("#composer", _Composer).insert(text)
+        else:
+            self.owner._print_warning("剪贴板中没有可粘贴的图片或文字")
+
+    def _stage_pasted_image_path(self, value: str) -> bool:
+        path = _image_path_from_paste(value)
+        if path is None:
+            return False
+        if self.owner._runtime.active:
+            self.owner._print_warning("任务执行期间不能添加图片，请等待当前任务结束")
+            return True
+        if not self.owner.supports_image_input():
+            self.owner._print_warning(
+                "当前模型不支持图片输入；DeepSeek 请切换到 deepseek-flash"
+            )
+            return True
+        self._stage_image_source(str(path))
+        return True
+
+    def _stage_image_source(self, source: str) -> None:
+        self.pending_image_source = source
         self._refresh_attachment()
         self.query_one("#composer", _Composer).focus()
 
