@@ -53,6 +53,7 @@ from tinyCode.tools import (
 from tinyCode.tui import create_tui, fullscreen_supported
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tracing import TraceRecorder
+from tinyCode.tasking import TaskPlanListTool, TaskPlanStore, TaskPlanUpdateTool, TaskPlanningService
 
 
 class _CleanupStack:
@@ -120,6 +121,7 @@ async def _choose_interrupted_task(
 
 def _create_tool_registry(
     tool_result_storage_dir: Path | None = None,
+    task_planning_service: TaskPlanningService | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ReadFileTool())
@@ -135,6 +137,12 @@ def _create_tool_registry(
     registry.register(RequestUserInputTool())
     registry.register(WebSearchTool())
     registry.register(WebFetchTool())
+    if task_planning_service is not None:
+        # Stable schemas are always registered for tool-enabled turns. Their
+        # implementation simply reports no active plan for ordinary tasks,
+        # avoiding per-round tool-schema churn and cache misses.
+        registry.register(TaskPlanListTool(task_planning_service))
+        registry.register(TaskPlanUpdateTool(task_planning_service))
     return registry
 
 
@@ -263,7 +271,16 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
             print(f"笔记初始化: {error}", file=sys.stderr)
 
     # 7. Tool registry (create early — needed by skills MCP subagent)
-    tool_registry = _create_tool_registry(truncator.storage_dir)
+    task_plan_store = TaskPlanStore(Path.cwd())
+    interrupted_plans = task_plan_store.mark_interrupted_active_plans()
+    if interrupted_plans:
+        print(f"任务计划: 已标记 {interrupted_plans} 个中断计划待核验", file=sys.stderr)
+    task_planning_service = TaskPlanningService(
+        app_config.task_planning, provider, task_plan_store,
+    )
+    tool_registry = _create_tool_registry(
+        truncator.storage_dir, task_planning_service,
+    )
     trace_recorder = TraceRecorder(app_config.tracing, Path.cwd())
 
     # 7.5. Skills (needs tool_registry for whitelist validation)
@@ -535,6 +552,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         recovery_store=recovery_store,
         startup_recovery_prompt=startup_recovery_prompt,
         startup_recovery_task_id=startup_recovery_task_id,
+        task_planning_service=task_planning_service,
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui

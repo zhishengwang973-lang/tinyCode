@@ -50,6 +50,9 @@ class AutoTeamRoutingTests(unittest.TestCase):
     def test_explicit_team_and_opt_out_are_respected(self):
         self.assertIsNotNone(self._service().propose("请用多个 Agent 并行检查三个模块"))
         self.assertIsNone(self._service("team").propose("不要使用 Team，修复这个问题"))
+        self.assertIsNone(self._service("team").propose(
+            "先不要使用 Agent Team；如存在可独立任务，可以使用 Subagent"
+        ))
 
 
 class AutoTeamReviewFlowTests(unittest.IsolatedAsyncioTestCase):

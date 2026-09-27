@@ -15,6 +15,7 @@ from tinyCode.config.models import (
     ProviderConfig,
     TeamAutomationConfig,
     TaskModeRoutingConfig,
+    TaskPlanningConfig,
     TracingConfig,
 )
 from tinyCode.config.constants import (
@@ -33,6 +34,9 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_MODE_ROUTING_MODEL,
     DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT,
     DEFAULT_TASK_MODE_ROUTING_TIMEOUT,
+    DEFAULT_TASK_PLANNING_ENABLED,
+    DEFAULT_TASK_PLANNING_MAX_TASKS,
+    DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
     DEFAULT_UI_MODE,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_ROUND_LIMIT_ACTIONS,
@@ -141,6 +145,12 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["team"] = global_raw["team"]
     else:
         merged.pop("team", None)
+    # Task planning changes how a user turn is executed and adds a model
+    # request. Keep that choice user-global rather than repository-controlled.
+    if "task_planning" in global_raw:
+        merged["task_planning"] = global_raw["task_planning"]
+    else:
+        merged.pop("task_planning", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -547,6 +557,31 @@ def load_config() -> AppConfig:
                 f"task_mode_routing 所需环境变量 api_key_env 未设置"
             )
 
+    planning_raw = raw.get("task_planning", {})
+    if not isinstance(planning_raw, dict):
+        raise ConfigError("task_planning 必须是对象（mapping）")
+    planning_enabled = planning_raw.get("enabled", DEFAULT_TASK_PLANNING_ENABLED)
+    if not isinstance(planning_enabled, bool):
+        raise ConfigError("task_planning.enabled 必须是 true 或 false")
+    planning_max_tasks = planning_raw.get(
+        "max_tasks", DEFAULT_TASK_PLANNING_MAX_TASKS,
+    )
+    if (
+        isinstance(planning_max_tasks, bool)
+        or not isinstance(planning_max_tasks, int)
+        or not 2 <= planning_max_tasks <= 8
+    ):
+        raise ConfigError("task_planning.max_tasks 必须是 2 到 8 之间的整数")
+    planning_min_chars = planning_raw.get(
+        "min_task_chars", DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
+    )
+    if (
+        isinstance(planning_min_chars, bool)
+        or not isinstance(planning_min_chars, int)
+        or not 1 <= planning_min_chars <= 2_000
+    ):
+        raise ConfigError("task_planning.min_task_chars 必须是 1 到 2000 之间的整数")
+
     team_raw = raw.get("team", {})
     if not isinstance(team_raw, dict):
         raise ConfigError("team 必须是对象（mapping）")
@@ -633,6 +668,11 @@ def load_config() -> AppConfig:
             timeout_seconds=float(routing_timeout),
             llm_timeout_seconds=float(llm_timeout),
             llm_fallback=llm_fallback,
+        ),
+        task_planning=TaskPlanningConfig(
+            enabled=planning_enabled,
+            max_tasks=planning_max_tasks,
+            min_task_chars=planning_min_chars,
         ),
         team=TeamAutomationConfig(
             mode=team_mode,

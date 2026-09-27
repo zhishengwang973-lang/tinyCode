@@ -24,6 +24,7 @@ def register_builtins(
     team_runner=None,
     team_review_service=None,
     trace_recorder=None,
+    task_planning_service=None,
 ) -> None:
     """Register all built-in commands with the given registry."""
     from tinyCode.commands.builtin.help_cmd import create as _help
@@ -64,7 +65,7 @@ def register_builtins(
     if note_manager:
         registry.register(_memory(note_manager))
     if task_manager:
-        registry.register(_tasks(task_manager))
+        registry.register(_tasks(task_manager, task_planning_service))
     if worktree_manager:
         registry.register(_worktree(worktree_manager, workspace_changed=ui.workspace_changed))
     registry.register(_team(

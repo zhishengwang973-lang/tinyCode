@@ -179,6 +179,8 @@ class ToolRoutingTests(unittest.TestCase):
             "补1、4、5",
             "运行测试，但不要修改代码",
             "run the test suite without editing files",
+            "先不要使用 Agent Team；如存在可独立的只读分析任务，可以使用 Subagent。"
+            "新增批处理模块并编写测试、文档和示例，实际运行测试并修复失败。",
         )
         self._assert_modes(TaskMode.MODIFY, prompts)
 

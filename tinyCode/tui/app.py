@@ -41,6 +41,7 @@ from tinyCode.agent.events import (
     ContextCompressionEvent,
 )
 from tinyCode.agent.runtime import TurnRuntime
+from tinyCode.agent.task_mode import classify_task_mode
 from tinyCode.commands import CommandDispatcher, CommandRegistry, UIControl, register_builtins
 from tinyCode.multimodal import ImageInputError, build_image_user_content
 from tinyCode.providers.base import TokenUsage
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     from tinyCode.skills.registry import SkillRegistry
     from tinyCode.storage.sessions import SessionStore
     from tinyCode.storage.recovery import TaskRecoveryStore
+    from tinyCode.tasking.planner import TaskPlanningService
 
 
 class _StreamTextNormalizer:
@@ -424,6 +426,7 @@ class TinyCodeTUI(UIControl):
         recovery_store: "TaskRecoveryStore | None" = None,
         startup_recovery_prompt: str = "",
         startup_recovery_task_id: str | None = None,
+        task_planning_service: "TaskPlanningService | None" = None,
         console: Console | None = None,
         prompt_session: Any | None = None,
     ) -> None:
@@ -445,6 +448,7 @@ class TinyCodeTUI(UIControl):
         self._resume_recovery_task_id = startup_recovery_task_id
         self._active_recovery_task_id: str | None = None
         self._auto_team_service = auto_team_service
+        self._task_planning_service = task_planning_service
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -457,6 +461,7 @@ class TinyCodeTUI(UIControl):
             team_runner=team_runner,
             team_review_service=auto_team_service,
             trace_recorder=trace_recorder,
+            task_planning_service=task_planning_service,
         )
         if skill_registry:
             for meta in skill_registry.list_available():
@@ -955,6 +960,10 @@ class TinyCodeTUI(UIControl):
         stream_normalizer = _StreamTextNormalizer()
         stream_renderer = self._create_stream_renderer()
         recovery_terminal_state = "failed"
+        planning_requests = 0
+        planning_tokens = 0
+        planning_tokens_available = False
+        planning_outcome = "failed"
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
@@ -1013,6 +1022,47 @@ class TinyCodeTUI(UIControl):
                 text if user_content is None else user_content
             )
             self._save_checkpoint()
+            if self._task_planning_service is not None:
+                planning_mode = classify_task_mode([{
+                    "role": "user", "content": text if user_content is None else user_content,
+                }])
+                planning_requested = self._task_planning_service.should_plan(
+                    text, planning_mode,
+                )
+                if planning_requested:
+                    # Planning is its own model request and may take longer
+                    # than the first agent round. Surface it immediately so
+                    # both TUIs never present an apparently frozen blank turn.
+                    self._start_progress("正在规划任务")
+                planning_scope = (
+                    self._trace_recorder.span(
+                        "task_planning", "planning", {"mode": planning_mode.value},
+                    )
+                    if self._trace_recorder is not None else nullcontext(None)
+                )
+                with planning_scope as plan_span:
+                    planning = await self._task_planning_service.create_if_needed(
+                        text, planning_mode,
+                    )
+                    if plan_span is not None:
+                        plan_span.finish(
+                            "ok" if planning.plan is not None else "skipped",
+                            {
+                                "source": planning.source,
+                                "model_requests": planning.model_requests,
+                                "error": planning.error,
+                            },
+                        )
+                planning_requests = planning.model_requests
+                planning_tokens = planning.tokens
+                planning_tokens_available = planning.tokens_available
+                if planning.plan is not None:
+                    self._show_task_plan(planning.plan)
+                    self._agent_loop.queue_task_plan(planning.plan.prompt_context())
+                elif planning.error:
+                    self._print_warning(
+                        "任务计划不可用，已继续使用普通执行流程：" + planning.error
+                    )
             if self._recovery_store is not None and self._active_recovery_task_id:
                 self._recovery_store.checkpoint(
                     self._active_recovery_task_id,
@@ -1104,6 +1154,16 @@ class TinyCodeTUI(UIControl):
 
                 elif isinstance(event, ToolResultEvent):
                     metrics.record_tool_result(event.result.success)
+                    if event.result.success and self._task_planning_service is not None:
+                        changed_plan = (
+                            self._task_planning_service.active_plan
+                            if event.tool_name == "task_plan_update"
+                            else self._task_planning_service.observe_successful_workspace_write(
+                                event.tool_name,
+                            )
+                        )
+                        if changed_plan is not None:
+                            self._show_task_plan(changed_plan)
                     if self._trace_recorder is not None:
                         self._trace_recorder.record(
                             "tool_result",
@@ -1411,6 +1471,11 @@ class TinyCodeTUI(UIControl):
                         if event.reason == "cancelled"
                         else "paused"
                     )
+                    planning_outcome = (
+                        "completed" if event.reason == "no_tool_call"
+                        else "cancelled" if event.reason == "cancelled"
+                        else "failed"
+                    )
                     self._stop_progress()
                     stream_renderer.close_line()
                     self._finalize_response(current_response)
@@ -1442,7 +1507,9 @@ class TinyCodeTUI(UIControl):
                         metrics=metrics,
                         model_requests=getattr(
                             self._agent_loop, "turn_model_requests", 0
-                        ),
+                        ) + planning_requests,
+                        extra_tokens=planning_tokens,
+                        extra_tokens_available=planning_tokens_available,
                     )
                     if current_response:
                         self._agent_loop.record_round(text, current_response)
@@ -1466,13 +1533,16 @@ class TinyCodeTUI(UIControl):
                         metrics=metrics,
                         model_requests=getattr(
                             self._agent_loop, "turn_model_requests", 0
-                        ),
+                        ) + planning_requests,
+                        extra_tokens=planning_tokens,
+                        extra_tokens_available=planning_tokens_available,
                     )
                     break
 
         except asyncio.CancelledError:
             trace_status = "cancelled"
             recovery_terminal_state = "cancelled"
+            planning_outcome = "cancelled"
             self._stop_progress()
             stream_renderer.close_line()
             self._status_text = "就绪 · 本轮已取消"
@@ -1481,6 +1551,7 @@ class TinyCodeTUI(UIControl):
         except Exception as exc:
             trace_status = "error"
             trace_error = f"{type(exc).__name__}: {exc}"
+            planning_outcome = "failed"
             recovery_terminal_state = "failed"
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
@@ -1489,6 +1560,14 @@ class TinyCodeTUI(UIControl):
             self._status_text = "就绪 · 上一轮失败"
             self._print_error(f"对话执行失败: {type(exc).__name__}: {exc}")
         finally:
+            completed_plan = (
+                self._task_planning_service.clear_active(outcome=planning_outcome)
+                if self._task_planning_service is not None else None
+            )
+            if completed_plan is not None and completed_plan.status.value != "completed":
+                self._print_warning(
+                    "任务计划待核验 · " + completed_plan.render().split("\n", 1)[0]
+                )
             if self._trace_recorder is not None:
                 usage = getattr(self._agent_loop, "turn_usage", None)
                 self._trace_recorder.finish_task(
@@ -1498,10 +1577,10 @@ class TinyCodeTUI(UIControl):
                         "turns": metrics.turns,
                         "model_requests": max(
                             0, getattr(self._agent_loop, "turn_model_requests", 0),
-                        ),
+                        ) + planning_requests,
                         "tool_calls": metrics.tool_calls,
                         "successful_tool_calls": metrics.successful_tool_calls,
-                        "total_tokens": max(0, getattr(usage, "total_tokens", 0)),
+                        "total_tokens": max(0, getattr(usage, "total_tokens", 0)) + planning_tokens,
                         "error": trace_error,
                     },
                 )
@@ -1782,6 +1861,10 @@ class TinyCodeTUI(UIControl):
     def _print_info(self, text: str) -> None:
         self._console.print(text, style="dim", markup=False, highlight=False)
 
+    def _show_task_plan(self, plan: Any) -> None:
+        """Render a plan snapshot; rich renderers may refresh it in place."""
+        self._print_info(plan.render())
+
     def _clear_display(self) -> None:
         self._console.clear()
 
@@ -1818,10 +1901,17 @@ class TinyCodeTUI(UIControl):
         *,
         metrics: TurnMetrics,
         model_requests: int,
+        extra_tokens: int = 0,
+        extra_tokens_available: bool = False,
     ) -> None:
         usage = getattr(self._agent_loop, "turn_usage", None)
-        if usage is not None and getattr(usage, "available", False):
-            token_text = f"{getattr(usage, 'total_tokens', 0):,}"
+        usage_available = usage is not None and getattr(usage, "available", False)
+        if usage_available or extra_tokens_available:
+            total_tokens = (
+                (getattr(usage, "total_tokens", 0) if usage_available else 0)
+                + max(0, extra_tokens)
+            )
+            token_text = f"{total_tokens:,}"
         else:
             token_text = "不可用"
 

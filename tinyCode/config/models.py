@@ -18,6 +18,9 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_MODE_ROUTING_MODEL,
     DEFAULT_TASK_MODE_ROUTING_LLM_TIMEOUT,
     DEFAULT_TASK_MODE_ROUTING_TIMEOUT,
+    DEFAULT_TASK_PLANNING_ENABLED,
+    DEFAULT_TASK_PLANNING_MAX_TASKS,
+    DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
     DEFAULT_UI_MODE,
 )
 
@@ -81,6 +84,14 @@ class TeamAutomationConfig(BaseModel):
     allow_llm_conflict_resolution: bool = False
 
 
+class TaskPlanningConfig(BaseModel):
+    """Policy for the durable DAG created before complex normal turns."""
+
+    enabled: bool = DEFAULT_TASK_PLANNING_ENABLED
+    max_tasks: int = DEFAULT_TASK_PLANNING_MAX_TASKS
+    min_task_chars: int = DEFAULT_TASK_PLANNING_MIN_TASK_CHARS
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -99,3 +110,4 @@ class AppConfig(BaseModel):
         default_factory=TaskModeRoutingConfig,
     )
     team: TeamAutomationConfig = Field(default_factory=TeamAutomationConfig)
+    task_planning: TaskPlanningConfig = Field(default_factory=TaskPlanningConfig)

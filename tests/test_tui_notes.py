@@ -28,12 +28,16 @@ from tinyCode.agent.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from tinyCode.agent.task_mode import TaskMode
 from tinyCode.conversation.compression import CompressionResult
 from tinyCode.conversation.history import ConversationHistory
 from tinyCode.security.models import HITLDecision
 from tinyCode.security.models import SecurityLevel
 from tinyCode.providers.base import CacheUsage, TokenUsage, ToolCall
 from tinyCode.tools.base import ToolResult
+from tinyCode.config.models import TaskPlanningConfig
+from tinyCode.tasking.planner import TaskPlanningService
+from tinyCode.tasking.store import TaskPlanStore
 from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
 from tinyCode.tui.factory import create_tui
 from tinyCode.tui.fullscreen_textual import (
@@ -211,6 +215,15 @@ class FailingOnceAgentLoop(FakeAgentLoop):
             raise RuntimeError("provider connection dropped")
         yield TextDeltaEvent(self.response)
         yield AgentDoneEvent("no_tool_call")
+
+
+class PlanningAgentLoop(FakeAgentLoop):
+    def __init__(self) -> None:
+        super().__init__("planned answer")
+        self.plans: list[str] = []
+
+    def queue_task_plan(self, plan_context: str) -> None:
+        self.plans.append(plan_context)
 
 
 class SequentialAgentLoop(FakeAgentLoop):
@@ -507,6 +520,83 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content, tui._history.user_messages[0])
         self.assertIn("screen.png", output.getvalue())
         self.assertIn("看到了截图", output.getvalue())
+
+    async def test_complex_turn_injects_and_persists_task_plan(self):
+        class PlannerProvider:
+            last_usage = {}
+
+            def begin_request(self):
+                pass
+
+            async def chat_stream(self, messages):
+                del messages
+                yield (
+                    '[{"id":"inspect","title":"检查","description":"检查范围",'
+                    '"depends_on":[],"read_scope":[],"write_scope":[],'
+                    '"acceptance":["已确认"],"executor":"main"},'
+                    '{"id":"finish","title":"完成","description":"完成任务",'
+                    '"depends_on":["inspect"],"read_scope":[],"write_scope":[],'
+                    '"acceptance":["已完成"],"executor":"main"}]'
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = PlanningAgentLoop()
+            output = io.StringIO()
+            service = TaskPlanningService(
+                TaskPlanningConfig(enabled=True, max_tasks=6, min_task_chars=1),
+                PlannerProvider(), TaskPlanStore(Path(tmp)),
+            )
+            tui = TinyCodeTUI(
+                agent_loop=loop, history=FakeHistory(), compressor=FakeCompressor(),
+                session_store=FakeSessionStore(), note_manager=None,
+                provider_name="fake", model="fake", task_planning_service=service,
+                console=Console(file=output, force_terminal=False, color_system=None),
+                prompt_session=FakePromptSession(),
+            )
+            await tui._on_user_input("请对整个项目进行重构、实现、测试和文档验证")
+
+            self.assertEqual(1, len(loop.plans))
+            self.assertIn("任务计划", loop.plans[0])
+            self.assertIn("任务计划 ·", output.getvalue())
+            self.assertTrue(list((Path(tmp) / ".tinyCode" / "task_plans").glob("*.json")))
+
+    async def test_fullscreen_task_plan_refreshes_existing_process_block(self):
+        class PlannerProvider:
+            last_usage = {}
+
+            def begin_request(self):
+                pass
+
+            async def chat_stream(self, messages):
+                del messages
+                yield "not-json"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = TaskPlanningService(
+                TaskPlanningConfig(enabled=True, max_tasks=6, min_task_chars=1),
+                PlannerProvider(), TaskPlanStore(Path(tmp)),
+            )
+            planning = await service.create_if_needed(
+                "请对整个项目进行重构、实现、测试和文档验证", TaskMode.MODIFY,
+            )
+            assert planning.plan is not None
+            tui = FullscreenTinyCodeTUI(
+                agent_loop=FakeAgentLoop(), history=FakeHistory(), compressor=FakeCompressor(),
+                session_store=FakeSessionStore(), note_manager=None,
+                provider_name="fake", model="fake", task_planning_service=service,
+            )
+            tui._print_user("复杂任务")
+            tui._show_task_plan(planning.plan)
+            service.update_task("scope", "in_progress")
+            service.update_task("scope", "completed")
+            tui._show_task_plan(service.active_plan)
+
+            plan_blocks = [
+                line for line in tui._process_lines if line.startswith("任务计划 ·")
+            ]
+            self.assertEqual(1, len(plan_blocks))
+            self.assertIn("1/3 完成", plan_blocks[0])
+            self.assertIn("✓ 1.", plan_blocks[0])
 
     async def test_selected_local_image_is_persisted_then_sent(self):
         class VisionProvider:

@@ -868,6 +868,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._metric_summary = ""
         self._workspace_summary = ""
         self._last_process_progress = ""
+        self._task_plan_process_index: int | None = None
+        self._task_plan_id = ""
         self._shutting_down = False
         self._hydrate_saved_history()
 
@@ -921,6 +923,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._metric_summary = ""
         self._workspace_summary = ""
         self._last_process_progress = ""
+        self._task_plan_process_index = None
+        self._task_plan_id = ""
         if self._app is not None:
             self._app.call_later(self._mount_turn, turn)
 
@@ -965,6 +969,34 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._add_notice("approval", "安全确认结果", text.removeprefix("安全确认："))
             return
         self._append_process(text)
+
+    def _show_task_plan(self, plan: Any) -> None:
+        """Keep one live plan block in the process disclosure area."""
+        rendered = plan.render()
+        plan_id = getattr(plan, "id", "")
+        index = self._task_plan_process_index
+        if (
+            index is None
+            or index >= len(self._process_lines)
+            or self._task_plan_id != plan_id
+            or not self._process_lines[index].startswith("任务计划 ·")
+        ):
+            index = next(
+                (
+                    candidate for candidate in range(len(self._process_lines) - 1, -1, -1)
+                    if self._process_lines[candidate].startswith("任务计划 ·")
+                    and (not plan_id or plan_id in self._process_lines[candidate])
+                ),
+                None,
+            )
+        if index is None:
+            self._append_process(rendered)
+            self._task_plan_process_index = len(self._process_lines) - 1
+        else:
+            self._process_lines[index] = rendered
+            self._task_plan_process_index = index
+            self._sync_active_view()
+        self._task_plan_id = plan_id
 
     def _print_warning(self, text: str) -> None:
         if self._command_active and not self._runtime.active:
@@ -1016,13 +1048,23 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._active_turn.workspace_summary = self._workspace_summary
         self._sync_active_view()
 
-    def _print_turn_metrics(self, *, metrics: TurnMetrics, model_requests: int) -> None:
+    def _print_turn_metrics(
+        self,
+        *,
+        metrics: TurnMetrics,
+        model_requests: int,
+        extra_tokens: int = 0,
+        extra_tokens_available: bool = False,
+    ) -> None:
         usage = getattr(self._agent_loop, "turn_usage", None)
-        token_text = (
-            f"{getattr(usage, 'total_tokens', 0):,}"
-            if usage is not None and getattr(usage, "available", False)
-            else "不可用"
-        )
+        usage_available = usage is not None and getattr(usage, "available", False)
+        token_text = "不可用"
+        if usage_available or extra_tokens_available:
+            total_tokens = (
+                (getattr(usage, "total_tokens", 0) if usage_available else 0)
+                + max(0, extra_tokens)
+            )
+            token_text = f"{total_tokens:,}"
         resources = [f"Token {token_text}"]
         cache = self._format_cache_summary()
         if cache:

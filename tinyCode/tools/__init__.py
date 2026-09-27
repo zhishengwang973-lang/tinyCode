@@ -16,6 +16,7 @@ from tinyCode.tools.tool_result_read import ToolResultReadTool
 from tinyCode.tools.request_user_input import RequestUserInputTool
 from tinyCode.tools.web_search import WebSearchTool
 from tinyCode.tools.web_fetch import WebFetchTool
+from tinyCode.tasking.tools import TaskPlanListTool, TaskPlanUpdateTool
 
 __all__ = [
     "BaseTool",
@@ -37,4 +38,6 @@ __all__ = [
     "RequestUserInputTool",
     "WebSearchTool",
     "WebFetchTool",
+    "TaskPlanListTool",
+    "TaskPlanUpdateTool",
 ]

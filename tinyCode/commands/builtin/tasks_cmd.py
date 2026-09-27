@@ -3,13 +3,22 @@
 from tinyCode.commands.types import CommandMeta, CommandType
 from tinyCode.subagent.manager import BackgroundTaskManager
 from tinyCode.time_utils import format_beijing_time
+from tinyCode.tasking.planner import TaskPlanningService
 
 
-def create(task_manager: BackgroundTaskManager) -> CommandMeta:
+def create(
+    task_manager: BackgroundTaskManager,
+    task_planning_service: TaskPlanningService | None = None,
+) -> CommandMeta:
     async def handler(args: list[str]) -> str:
         sub = args[0].lower() if args else "list"
         if sub == "list":
             return task_manager.get_status_summary()
+
+        if sub == "plan":
+            if task_planning_service is None:
+                return "当前未启用任务计划"
+            return task_planning_service.render_plan(args[1] if len(args) > 1 else "")
 
         elif sub == "detail":
             if len(args) < 2:
@@ -39,13 +48,13 @@ def create(task_manager: BackgroundTaskManager) -> CommandMeta:
                 return f"任务 {args[1]} 已取消"
             return f"任务 {args[1]} 不存在或已完成"
 
-        return f"未知子命令: {args[0]}。可用: list, detail, kill"
+        return f"未知子命令: {args[0]}。可用: list, detail, kill, plan [计划ID]"
 
     return CommandMeta(
         name="tasks",
         aliases=["bg"],
-        description="管理后台任务（list / detail / kill）",
-        usage="/tasks [list | detail <id> | kill <id>]",
+        description="管理后台任务和任务计划（list / detail / kill / plan）",
+        usage="/tasks [list | detail <id> | kill <id> | plan [计划ID]]",
         cmd_type=CommandType.LOCAL,
         handler=handler,
     )

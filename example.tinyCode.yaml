@@ -82,6 +82,13 @@ tracing:
   retention_days: 14
   max_files: 100
 
+# 复杂任务的通用任务计划（仅在全局 ~/.tinyCode/config.yaml 中生效）
+# 会先生成可恢复的 DAG；简单问答不会触发。计划状态可通过 /tasks plan 查看。
+task_planning:
+  enabled: true
+  max_tasks: 6
+  min_task_chars: 80
+
 # 自动 Agent Team（仅在全局 ~/.tinyCode/config.yaml 中生效）
 # auto 仅对明确复杂且可并行的任务提出方案；single 永不自动启用；team 总是提出。
 team:

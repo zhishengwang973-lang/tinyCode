@@ -362,6 +362,11 @@ class AgentLoop:
     def reset_cancel(self) -> None:
         self._cancel_event.clear()
 
+    def queue_task_plan(self, plan_context: str) -> None:
+        """Append one durable execution-plan instruction to the next turn."""
+        if plan_context.strip():
+            self._prompt_injector.queue_injection(plan_context)
+
     async def run(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         """Run one user turn and keep history valid if the pipeline fails."""
         history.flush_deferred()

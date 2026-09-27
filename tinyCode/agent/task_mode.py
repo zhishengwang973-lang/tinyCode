@@ -114,6 +114,15 @@ _READ_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A request may explicitly reserve an *independent Subagent* for read-only
+# reconnaissance while still asking the main agent to implement changes.  That
+# is an execution constraint, not a request to downgrade the entire turn.
+_READ_ONLY_SUBAGENT_RE = re.compile(
+    r"(?:只读|read[ -]?only).{0,40}?(?:sub[ -]?agent|子(?:agent|智能体))"
+    r"|(?:sub[ -]?agent|子(?:agent|智能体)).{0,40}?(?:只读|read[ -]?only)",
+    re.IGNORECASE,
+)
+
 _COMMAND_REQUEST_RE = re.compile(
     r"(?:运行|执行|启动|构建|编译|测试|验证|安装|提交|推送)"
     r"|\b(?:run|execute|start|build|compile|test|verify|install|commit|push)\b",
@@ -307,6 +316,8 @@ def classify_task_mode(messages: list[Message]) -> TaskMode:
         re.IGNORECASE,
     ))
     if rejects_analysis_only and mutation:
+        read_only = False
+    if mutation and _READ_ONLY_SUBAGENT_RE.search(latest):
         read_only = False
 
     if explicit_direct and read_only and not workspace and not fresh_information:

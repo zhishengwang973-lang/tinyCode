@@ -113,6 +113,7 @@ async def run_team(
         for tool in tool_registry.list_tools():
             if tool.name in {
                 "sub_agent", "skill_loader", "request_user_input",
+                "task_plan_list", "task_plan_update",
             } or tool.name.startswith("team_") or tool.name not in allowed_tools:
                 continue
             if tool.name == "tool_result_read":

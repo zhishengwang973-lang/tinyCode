@@ -83,7 +83,8 @@ class AutoTeamService:
         re.IGNORECASE,
     )
     _OPT_OUT = re.compile(
-        r"(?:不要|不使用|禁用|别用).{0,8}(?:team|多智能体|多个\s*agent)|"
+        r"(?:不要|不使用|禁用|别用|避免).{0,32}?"
+        r"(?:agent\s*team|team|多智能体|多个\s*agent)|"
         r"(?:单\s*(?:agent|智能体)|single[- ]?agent)",
         re.IGNORECASE,
     )
