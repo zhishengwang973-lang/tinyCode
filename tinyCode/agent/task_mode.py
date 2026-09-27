@@ -8,6 +8,7 @@ from enum import Enum
 
 from tinyCode.providers.base import Message
 from tinyCode.multimodal import extract_text_content
+from tinyCode.agent.intent_constraints import ModePolicy, extract_intent_constraints
 
 
 class TaskMode(str, Enum):
@@ -280,6 +281,7 @@ def classify_task_mode(messages: list[Message]) -> TaskMode:
 
     normalized = " ".join(latest.casefold().split()).strip(" ，,。.!！?")
     previous = messages[:latest_index]
+    constraints = extract_intent_constraints(latest)
 
     if normalized in _NEUTRAL_CONTINUATION:
         return _previous_task_mode(previous)
@@ -296,6 +298,14 @@ def classify_task_mode(messages: list[Message]) -> TaskMode:
         return TaskMode.MODIFY if prior_mode is not TaskMode.DIRECT else TaskMode.DIRECT
     if normalized in _SMALL_TALK:
         return TaskMode.DIRECT
+
+    if not constraints.uncertain:
+        if constraints.mode is ModePolicy.DIRECT:
+            return TaskMode.DIRECT
+        if constraints.mode is ModePolicy.INSPECT:
+            return TaskMode.INSPECT
+        if constraints.mode is ModePolicy.MODIFY:
+            return TaskMode.MODIFY
 
     project_anchor = bool(_WORKSPACE_RE.search(latest))
     file_reference = bool(_FILE_REFERENCE_RE.search(latest))
@@ -387,6 +397,7 @@ def classify_task_mode_rule(messages: list[Message]) -> RuleTaskModeDecision:
         return RuleTaskModeDecision(mode, True)
 
     normalized = " ".join(latest.casefold().split()).strip(" ，,。.!！?")
+    constraints = extract_intent_constraints(latest)
     if normalized in (
         _SMALL_TALK
         | _ACKNOWLEDGEMENTS
@@ -395,6 +406,9 @@ def classify_task_mode_rule(messages: list[Message]) -> RuleTaskModeDecision:
     ):
         return RuleTaskModeDecision(mode, True)
     if _EXECUTE_CONTINUATION_RE.fullmatch(normalized):
+        return RuleTaskModeDecision(mode, True)
+
+    if not constraints.uncertain and constraints.mode is not ModePolicy.AUTO:
         return RuleTaskModeDecision(mode, True)
 
     workspace = bool(_WORKSPACE_RE.search(latest) or _FILE_REFERENCE_RE.search(latest))

@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from tinyCode.agent.task_mode import TaskMode
+from tinyCode.agent.intent_constraints import PlanningPolicy, SubagentPolicy, extract_intent_constraints
 from tinyCode.config.models import TaskPlanningConfig
 from tinyCode.providers.base import BaseProvider, TokenUsage
 from tinyCode.tasking.models import ExecutorKind, TaskNode, TaskNodeStatus, TaskPlan, TaskPlanStatus
@@ -52,6 +53,11 @@ class TaskPlanningService:
     def should_plan(self, text: str, mode: TaskMode) -> bool:
         if not self.config.enabled or mode is TaskMode.DIRECT:
             return False
+        constraints = extract_intent_constraints(text)
+        if constraints.planning is PlanningPolicy.DENY:
+            return False
+        if constraints.planning is PlanningPolicy.FORCE:
+            return True
         normalized = text.strip()
         if any(marker in normalized for marker in _EXPLICIT_MARKERS):
             return True
@@ -187,11 +193,13 @@ class TaskPlanningService:
     async def _request_plan(
         self, text: str, mode: TaskMode,
     ) -> tuple[list[TaskNode], str, int, bool]:
+        constraints = extract_intent_constraints(text)
+        executors = "main" if constraints.subagent is SubagentPolicy.DENY else "main 或 subagent"
         prompt = (
             "你是 TinyCode 的任务规划器。将用户目标拆成 2 至 8 个有向无环任务。"
             "只输出 JSON 数组，禁止 Markdown、解释或工具调用。每项包含："
             "id、title、description、depends_on、read_scope、write_scope、acceptance、executor。"
-            "depends_on 只能引用前面任务的 id。executor 只能是 main 或 subagent；"
+            f"depends_on 只能引用前面任务的 id。executor 只能是 {executors}；"
             "subagent 仅用于独立只读分析，任何写入任务一律 main。"
             "文件范围只能基于用户已明确提供的信息；不确定就使用空数组，不能编造路径。"
             "避免重叠写入范围；最终验证必须依赖所有写入任务。"

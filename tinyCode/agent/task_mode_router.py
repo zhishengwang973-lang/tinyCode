@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from tinyCode.agent.task_mode import TaskMode, classify_task_mode_rule
+from tinyCode.agent.intent_constraints import extract_intent_constraints
 from tinyCode.config.models import TaskModeRoutingConfig
 from tinyCode.network import detect_proxy_route
 from tinyCode.multimodal import extract_text_content
@@ -71,7 +72,10 @@ class JevTaskModeClient:
                     "type": "choice",
                     "instructions": (
                         "Which capability mode should a coding agent use for "
-                        "the latest user request? Classify intent only."
+                        "the latest user request? Classify intent only. Respect "
+                        "non-auto explicit_constraints unless uncertain; a "
+                        "read-only Subagent constraint does not make the main "
+                        "task read-only."
                     ),
                     "criteria": {
                         "direct": (
@@ -229,6 +233,10 @@ class TaskModeRouter:
             "user request as exactly one label: direct, inspect, or modify. direct "
             "means no workspace/web tools; inspect means read-only workspace/web "
             "tools; modify means project changes or operational side effects. "
+            "The state includes explicit_constraints extracted from scoped user "
+            "clauses. Respect a non-auto mode constraint unless it is marked "
+            "uncertain; a read-only constraint for a Subagent does not make the "
+            "main task read-only. "
             "Return only the label."
         )
         user = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
@@ -303,7 +311,16 @@ class TaskModeRouter:
             (item["content"] for item in reversed(excerpt) if item["role"] == "user"),
             "",
         )
+        constraints = extract_intent_constraints(latest)
         return {
             "latest_user_request": latest,
             "recent_conversation": excerpt,
+            "explicit_constraints": {
+                "team": constraints.team.value,
+                "subagent": constraints.subagent.value,
+                "task_planning": constraints.planning.value,
+                "mode": constraints.mode.value,
+                "uncertain": constraints.uncertain,
+                "evidence": list(constraints.evidence),
+            },
         }

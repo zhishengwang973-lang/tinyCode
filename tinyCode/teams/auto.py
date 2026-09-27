@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from tinyCode.config.models import TeamAutomationConfig
+from tinyCode.agent.intent_constraints import TeamPolicy, extract_intent_constraints
 from tinyCode.teams.merger import GitMerger
 from tinyCode.teams.models import MemberDef, TeamDef
 from tinyCode.teams.orchestrator import run_team
@@ -82,12 +83,6 @@ class AutoTeamService:
         r"多智能体|团队协作|并行(?:处理|开发|实现|排查))",
         re.IGNORECASE,
     )
-    _OPT_OUT = re.compile(
-        r"(?:不要|不使用|禁用|别用|避免).{0,32}?"
-        r"(?:agent\s*team|team|多智能体|多个\s*agent)|"
-        r"(?:单\s*(?:agent|智能体)|single[- ]?agent)",
-        re.IGNORECASE,
-    )
     _COMPLEXITY = (
         "全量", "整个项目", "跨模块", "多模块", "架构", "重构", "迁移",
         "端到端", "完整实现", "系统性", "全面审查", "并发", "恢复机制",
@@ -130,9 +125,17 @@ class AutoTeamService:
 
     def propose(self, text: str) -> TeamProposal | None:
         goal = text.strip()
-        if not goal or self.config.mode == "single" or self._OPT_OUT.search(goal):
+        constraints = extract_intent_constraints(goal)
+        if (
+            not goal
+            or self.config.mode == "single"
+            or constraints.team is TeamPolicy.DENY
+        ):
             return None
-        explicit = bool(self._EXPLICIT_TEAM.search(goal))
+        explicit = (
+            constraints.team is TeamPolicy.FORCE
+            or bool(self._EXPLICIT_TEAM.search(goal))
+        )
         if self.config.mode == "auto" and not explicit:
             if self._SIMPLE.search(goal) or len(goal) < 20:
                 return None
