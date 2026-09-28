@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from tinyCode.storage.sessions import SessionStore
     from tinyCode.storage.recovery import TaskRecoveryStore
     from tinyCode.tasking.planner import TaskPlanningService
+    from tinyCode.goals.service import GoalService
 
 
 class _StreamTextNormalizer:
@@ -427,6 +428,7 @@ class TinyCodeTUI(UIControl):
         startup_recovery_prompt: str = "",
         startup_recovery_task_id: str | None = None,
         task_planning_service: "TaskPlanningService | None" = None,
+        goal_service: "GoalService | None" = None,
         console: Console | None = None,
         prompt_session: Any | None = None,
     ) -> None:
@@ -449,6 +451,7 @@ class TinyCodeTUI(UIControl):
         self._active_recovery_task_id: str | None = None
         self._auto_team_service = auto_team_service
         self._task_planning_service = task_planning_service
+        self._goal_service = goal_service
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -610,6 +613,8 @@ class TinyCodeTUI(UIControl):
         if self._skill_registry:
             self._skill_registry.clear_activated()
         self._clear_display()
+        if self._goal_service is not None:
+            self._goal_service.clear()
         self._do_save()
 
     async def trigger_compress(self) -> str:
@@ -649,12 +654,19 @@ class TinyCodeTUI(UIControl):
         restored_history, _provider, _model = restored
         self._history.replace_messages(restored_history.get_messages())
         self._clear_display()
-        return f"已加载会话 {session_id[:8]} ({len(restored_history)} 条消息)"
+        restored_goal = (
+            self._goal_service.bind_session(self._session_store.current_id or "")
+            if self._goal_service is not None else None
+        )
+        suffix = " · 已恢复 Goal" if restored_goal is not None else ""
+        return f"已加载会话 {session_id[:8]} ({len(restored_history)} 条消息){suffix}"
 
     def new_session(self) -> str:
         sid = self._session_store.new_session()
         self._history.clear()
         self._clear_display()
+        if self._goal_service is not None:
+            self._goal_service.bind_session(sid)
         return f"新会话已创建: {sid}"
 
     def delete_session(self, session_id: str) -> str:
@@ -677,6 +689,68 @@ class TinyCodeTUI(UIControl):
                 snapshot.last_outcome.value if snapshot.last_outcome else "none"
             ),
         }
+
+    def start_goal(self, objective: str) -> str:
+        if self._goal_service is None:
+            return "Goal 功能未启用"
+        if self._runtime.active:
+            return "当前任务仍在执行；请先使用 /goal pause 或 /cancel"
+        try:
+            goal = self._goal_service.start(objective)
+        except (RuntimeError, ValueError, OSError) as exc:
+            return f"创建 Goal 失败: {exc}"
+        self._refresh_goal_display()
+        # Create the visible turn before the command handler returns.  In the
+        # fullscreen renderer this prevents the command acknowledgement from
+        # being appended to the previous conversation card.
+        self._print_user(goal.objective)
+        if not self._start_user_input(goal.objective, display_user=False):
+            self._goal_service.pause("未能启动首个 Goal 回合")
+            return "Goal 已创建，但首个执行回合未能启动；可用 /goal resume 重试"
+        return (
+            f"Goal 已启动 · 预算 {goal.max_turns} 个执行回合\n"
+            "完成必须由可复核证据支持；可用 /goal 查看、暂停或清除。"
+        )
+
+    def get_goal_status(self) -> str:
+        return self._goal_service.render() if self._goal_service is not None else "Goal 功能未启用"
+
+    def pause_goal(self) -> str:
+        if self._goal_service is None:
+            return "Goal 功能未启用"
+        goal = self._goal_service.pause()
+        if goal is None:
+            return "当前没有进行中的 Goal"
+        self._refresh_goal_display()
+        if self._runtime.active:
+            self.cancel_active_turn()
+        return "Goal 已暂停；已请求取消当前执行"
+
+    def resume_goal(self, additional_turns: int = 0) -> str:
+        if self._goal_service is None:
+            return "Goal 功能未启用"
+        if self._runtime.active:
+            return "当前任务仍在执行；无需重复恢复"
+        try:
+            goal = self._goal_service.resume(additional_turns=additional_turns)
+        except (ValueError, OSError) as exc:
+            return str(exc)
+        if goal is None:
+            return "当前会话没有可恢复的 Goal"
+        self._refresh_goal_display()
+        self._start_goal_continuation()
+        return f"Goal 已恢复 · 剩余预算 {goal.remaining_turns} 个执行回合"
+
+    def clear_goal(self) -> str:
+        if self._goal_service is None:
+            return "Goal 功能未启用"
+        goal = self._goal_service.clear()
+        if goal is None:
+            return "当前会话没有 Goal"
+        self._refresh_goal_display()
+        if self._runtime.active:
+            self.cancel_active_turn()
+        return "Goal 已清除；之后的输入将按普通任务处理"
 
     def get_max_rounds(self) -> int:
         return self._agent_loop.max_rounds
@@ -708,6 +782,9 @@ class TinyCodeTUI(UIControl):
     def cancel_active_turn(self) -> bool:
         cancelled = self._runtime.cancel()
         if cancelled:
+            if self._goal_service is not None and self._goal_service.active:
+                self._goal_service.pause("当前执行被用户取消")
+                self._refresh_goal_display()
             discarded = self._history.discard_steering_messages()
             if self._trace_recorder is not None:
                 self._trace_recorder.record(
@@ -851,6 +928,21 @@ class TinyCodeTUI(UIControl):
         task.add_done_callback(self._finish_foreground)
         return True
 
+    def _start_goal_continuation(self) -> bool:
+        """Schedule a Goal continuation without forging a new user message."""
+        goal = self._goal_service.current if self._goal_service is not None else None
+        if goal is None or not self._goal_service.active:
+            return False
+        if not self._runtime.reserve():
+            return False
+        task = self._spawn(self._on_user_input(
+            "", display_user=False, goal_continuation=True,
+        ))
+        self._foreground_task = task
+        task.add_done_callback(self._finish_foreground)
+        self._status_text = "Goal 继续执行中"
+        return True
+
     def _finish_foreground(self, task: asyncio.Task) -> None:
         if self._foreground_task is task:
             self._foreground_task = None
@@ -902,10 +994,18 @@ class TinyCodeTUI(UIControl):
     def _is_cancel_command(text: str) -> bool:
         return text.strip().lower() == "/cancel"
 
+    @staticmethod
+    def _is_goal_control_command(text: str) -> bool:
+        normalized = text.strip().lower()
+        return normalized in {"/goal pause", "/g pause", "/goal clear", "/g clear"}
+
     async def _handle_active_input(self, text: str) -> None:
+        if self._is_goal_control_command(text):
+            await self._handle_command(text)
+            return
         if self._cmd_dispatcher.is_command(text):
             self._print_warning(
-                "任务执行中仅支持 /cancel；普通文字会作为追加指令排队"
+                "任务执行中仅支持 /cancel、/goal pause、/goal clear；普通文字会作为追加指令排队"
             )
             return
         self._history.queue_steering_message(text)
@@ -944,6 +1044,7 @@ class TinyCodeTUI(UIControl):
         display_user: bool = True,
         cancelled_note_task: asyncio.Task | None = None,
         user_content: str | list[dict] | None = None,
+        goal_continuation: bool = False,
     ) -> None:
         if not self._runtime.active and not self._runtime.reserve():
             return
@@ -964,12 +1065,20 @@ class TinyCodeTUI(UIControl):
         planning_tokens = 0
         planning_tokens_available = False
         planning_outcome = "failed"
+        goal_should_continue = False
+        goal_turn = bool(
+            self._goal_service is not None and self._goal_service.active
+        )
+        effective_text = text
+        if goal_turn and not effective_text:
+            goal = self._goal_service.current
+            effective_text = goal.objective if goal is not None else "继续当前 Goal"
         try:
             note_task = cancelled_note_task or self._cancel_note_update()
             await self._join_note_update(note_task)
             if self._trace_recorder is not None:
                 trace_handle = self._trace_recorder.begin_task(
-                    text,
+                    effective_text,
                     session_id=str(
                         getattr(self._session_store, "current_id", "") or ""
                     ),
@@ -978,11 +1087,11 @@ class TinyCodeTUI(UIControl):
                 )
             auto_response = (
                 await self._try_auto_team(
-                    text,
+                    effective_text,
                     display_user=display_user,
                     stream_renderer=stream_renderer,
                 )
-                if user_content is None
+                if user_content is None and not goal_turn
                 else None
             )
             if auto_response is not None:
@@ -1015,16 +1124,21 @@ class TinyCodeTUI(UIControl):
                     recovery_task_id = str(recovery_task["task_id"])
                 self._active_recovery_task_id = recovery_task_id
                 self._agent_loop.set_recovery_task(recovery_task_id)
-            if display_user:
-                self._print_user(text)
+            if display_user and not goal_continuation:
+                self._print_user(effective_text)
             self._history.flush_deferred()
-            self._history.add_user_message(
-                text if user_content is None else user_content
-            )
+            if not goal_continuation:
+                self._history.add_user_message(
+                    effective_text if user_content is None else user_content
+                )
             self._save_checkpoint()
-            if self._task_planning_service is not None:
+            if goal_turn and self._goal_service is not None:
+                self._agent_loop.set_goal_context(self._goal_service.prompt_context())
+                if goal_continuation:
+                    self._start_progress("Goal 仍在进行 · 继续核验目标")
+            if self._task_planning_service is not None and not goal_turn:
                 planning_mode = classify_task_mode([{
-                    "role": "user", "content": text if user_content is None else user_content,
+                    "role": "user", "content": effective_text if user_content is None else user_content,
                 }])
                 planning_requested = self._task_planning_service.should_plan(
                     text, planning_mode,
@@ -1107,7 +1221,7 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(event.label)
 
                 elif isinstance(event, ToolCallEvent):
-                    self._before_tool_call()
+                    self._before_tool_call(event.tool_call.name)
                     may_modify = getattr(
                         self._agent_loop, "tool_may_modify_workspace", None,
                     )
@@ -1503,6 +1617,49 @@ class TinyCodeTUI(UIControl):
                     else:
                         self._status_text = "就绪 · 上一轮已正常完成"
                         self._print_success()
+                    if goal_turn and self._goal_service is not None:
+                        goal = self._goal_service.record_turn(
+                            model_requests=max(
+                                0, getattr(self._agent_loop, "turn_model_requests", 0),
+                            ),
+                            tool_calls=metrics.tool_calls,
+                            reason=event.reason,
+                        )
+                        automatically_completed = None
+                        if event.reason == "no_tool_call":
+                            automatically_completed = (
+                                self._goal_service.complete_from_final_response(
+                                    current_response,
+                                )
+                            )
+                            goal = automatically_completed or goal
+                        goal_should_continue = self._goal_service.should_continue(
+                            tool_calls=metrics.tool_calls,
+                            terminal_reason=event.reason,
+                            has_pending_user_input=bool(
+                                getattr(self._history, "steering_count", 0),
+                            ),
+                        )
+                        if self._trace_recorder is not None and goal is not None:
+                            self._trace_recorder.record(
+                                "goal_turn",
+                                status=goal.status.value,
+                                attributes={
+                                    "goal_id": goal.id,
+                                    "terminal_reason": event.reason,
+                                    "tool_calls": metrics.tool_calls,
+                                    "completed_turns": goal.completed_turns,
+                                    "max_turns": goal.max_turns,
+                                    "will_continue": goal_should_continue,
+                                },
+                            )
+                        self._refresh_goal_display()
+                        if goal is not None and goal.status.value == "budget_limited":
+                            self._print_warning(
+                                "Goal 已达到执行预算；可用 /goal resume <新增回合数> 继续"
+                            )
+                        elif automatically_completed is not None:
+                            self._print_info("Goal 已随最终回答自动结束")
                     self._print_turn_metrics(
                         metrics=metrics,
                         model_requests=getattr(
@@ -1614,6 +1771,13 @@ class TinyCodeTUI(UIControl):
                 finally:
                     self._agent_loop.set_recovery_task(None)
                     self._active_recovery_task_id = None
+            if goal_should_continue and self._goal_service is not None:
+                # Runtime has been released and the task checkpoint persisted:
+                # this is the only safe boundary for automatic continuation.
+                if self._start_goal_continuation():
+                    if self._trace_recorder is not None:
+                        self._trace_recorder.record("goal_continuation_scheduled")
+                    self._print_info("↻ Goal 未完成，依据本轮工具结果继续执行")
 
     async def _try_auto_team(
         self,
@@ -1842,6 +2006,9 @@ class TinyCodeTUI(UIControl):
         line.append(text)
         self._console.print(line, highlight=False)
 
+    def _refresh_goal_display(self) -> None:
+        """Allow fullscreen renderers to refresh their Goal lifecycle UI."""
+
     def _print_ai_prefix(self) -> None:
         self._console.print()
         self._console.print("TinyCode: ", style="bold blue", end="", highlight=False)
@@ -1849,8 +2016,9 @@ class TinyCodeTUI(UIControl):
     def _create_stream_renderer(self) -> _StreamingMarkdownRenderer:
         return _StreamingMarkdownRenderer(self._console)
 
-    def _before_tool_call(self) -> None:
+    def _before_tool_call(self, tool_name: str = "") -> None:
         """Allow alternate renderers to reclassify a pre-tool text draft."""
+        del tool_name
 
     def _finalize_response(self, response: str) -> None:
         """Allow alternate renderers to guarantee a visible final response."""

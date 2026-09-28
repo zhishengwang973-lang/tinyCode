@@ -164,3 +164,20 @@ class UIControl(ABC):
     def update_progress(self, text: str) -> None:
         """Update transient progress without appending conversation output."""
         return None
+
+    def start_goal(self, objective: str) -> str:
+        """Create a Goal and schedule its first foreground turn."""
+        raise NotImplementedError
+
+    def get_goal_status(self) -> str:
+        """Render the Goal bound to the active session."""
+        raise NotImplementedError
+
+    def pause_goal(self) -> str:
+        raise NotImplementedError
+
+    def resume_goal(self, additional_turns: int = 0) -> str:
+        raise NotImplementedError
+
+    def clear_goal(self) -> str:
+        raise NotImplementedError

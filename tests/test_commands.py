@@ -20,6 +20,7 @@ from tinyCode.commands.builtin import (
     trace_cmd,
     worktree_cmd,
     mode_cmd,
+    goal_cmd,
 )
 from tinyCode.commands.parser import is_command, parse
 from tinyCode.commands.registry import CommandRegistry
@@ -220,6 +221,7 @@ class BuiltinCommandPackageTests(unittest.TestCase):
             "team_cmd",
             "trace_cmd",
             "worktree_cmd",
+            "goal_cmd",
         }
 
         self.assertEqual(expected, set(builtin_commands.__all__))
@@ -237,6 +239,7 @@ class FakeUI(UIControl):
         self.image_supported = False
         self.images: list[tuple[list[dict], str]] = []
         self.image_attachment_root = Path.cwd()
+        self.goal_actions: list[tuple[str, object]] = []
 
     def show_system_message(self, text: str) -> None:
         pass
@@ -323,6 +326,26 @@ class FakeUI(UIControl):
 
     async def confirm_action(self, prompt: str) -> bool:
         return True
+
+    def start_goal(self, objective: str) -> str:
+        self.goal_actions.append(("start", objective))
+        return f"started:{objective}"
+
+    def get_goal_status(self) -> str:
+        self.goal_actions.append(("status", ""))
+        return "goal-status"
+
+    def pause_goal(self) -> str:
+        self.goal_actions.append(("pause", ""))
+        return "goal-paused"
+
+    def resume_goal(self, additional_turns: int = 0) -> str:
+        self.goal_actions.append(("resume", additional_turns))
+        return "goal-resumed"
+
+    def clear_goal(self) -> str:
+        self.goal_actions.append(("clear", ""))
+        return "goal-cleared"
 
 
 class FakeNoteManager:
@@ -416,6 +439,33 @@ class FakeWorktreeManager:
 
 
 class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_goal_command_routes_lifecycle_and_preserves_objective(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(goal_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, started = await dispatcher.dispatch("/goal 修复登录超时并运行测试")
+        _, paused = await dispatcher.dispatch("/g pause")
+        _, resumed = await dispatcher.dispatch("/goal resume 5")
+        _, status = await dispatcher.dispatch("/goal")
+        _, cleared = await dispatcher.dispatch("/goal clear")
+
+        self.assertEqual("started:修复登录超时并运行测试", started)
+        self.assertEqual("goal-paused", paused)
+        self.assertEqual("goal-resumed", resumed)
+        self.assertEqual("goal-status", status)
+        self.assertEqual("goal-cleared", cleared)
+        self.assertEqual(
+            [
+                ("start", "修复登录超时并运行测试"),
+                ("pause", ""),
+                ("resume", 5),
+                ("status", ""),
+                ("clear", ""),
+            ],
+            ui.goal_actions,
+        )
     async def test_mode_security_rejects_invalid_level_explicitly(self):
         ui = FakeUI()
         registry = CommandRegistry()

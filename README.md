@@ -19,6 +19,7 @@
 - **Git Worktree 隔离**：子 Agent 在独立工作目录中操作，退出自动清理
 - **两层 Token 管理**：工具结果截断（层1）+ 结构化 LLM 摘要（层2）
 - **弹性轮次预算**：软预算分段续跑、多信号无进展检测、策略恢复和绝对硬上限
+- **持久 Goal**：`/goal` 将可验收目标绑定到当前会话；基于工具证据安全续跑、支持预算、暂停、恢复和清除
 - **任务中追加指令**：模型或工具执行期间继续接收 steering 输入，在协议安全边界注入；`/cancel` 可立即取消当前任务
 - **任务级崩溃恢复**：JSONL 会话、运行态清单、工具预写日志和副作用核对后续跑
 
@@ -39,6 +40,34 @@ tinyCode
 超长工具结果缓存在当前项目的 `.tinyCode/tool_results/`，该运行时目录默认应被 Git 忽略。
 执行 Trace 保存在 `.tinyCode/traces/`；使用 `/trace last` 查看树形回放，或使用
 `/trace open` 生成并打开本地 HTML 时间线。默认不保存完整提示词和工具参数。
+
+## Goal
+
+对需要多次验证的长期任务，可使用线程级 Goal：
+
+```text
+/goal 将登录接口的 p95 延迟降至 120ms 以下，运行相关基准和完整测试验证，且不回归正确性
+```
+
+Goal 保存于当前项目 `.tinyCode/goals/<会话ID>.json`。只有模型调用工具取得进展、线程空闲且
+没有排队用户输入时才会自动续跑；没有工具动作的回合不会自动空转。模型必须调用
+`goal_complete` 并提交可复核证据才会标记完成。
+
+```text
+/goal                 # 查看当前 Goal
+/goal pause           # 暂停当前 Goal 和正在执行的回合
+/goal resume          # 恢复暂停的 Goal
+/goal resume 5        # 为预算耗尽的 Goal 新增 5 个执行回合并恢复
+/goal clear           # 清除当前 Goal
+```
+
+可在配置中调整默认预算或关闭功能：
+
+```yaml
+goals:
+  enabled: true
+  max_turns: 12
+```
 
 评测集示例在 [evals/README.md](evals/README.md)。执行模型和评测模型必须不同：
 

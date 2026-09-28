@@ -21,6 +21,8 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_PLANNING_ENABLED,
     DEFAULT_TASK_PLANNING_MAX_TASKS,
     DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
+    DEFAULT_GOALS_ENABLED,
+    DEFAULT_GOAL_MAX_TURNS,
     DEFAULT_UI_MODE,
 )
 
@@ -92,6 +94,13 @@ class TaskPlanningConfig(BaseModel):
     min_task_chars: int = DEFAULT_TASK_PLANNING_MIN_TASK_CHARS
 
 
+class GoalConfig(BaseModel):
+    """Policy for persistent, thread-scoped Goal execution."""
+
+    enabled: bool = DEFAULT_GOALS_ENABLED
+    max_turns: int = Field(default=DEFAULT_GOAL_MAX_TURNS, ge=1, le=100)
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -111,3 +120,4 @@ class AppConfig(BaseModel):
     )
     team: TeamAutomationConfig = Field(default_factory=TeamAutomationConfig)
     task_planning: TaskPlanningConfig = Field(default_factory=TaskPlanningConfig)
+    goals: GoalConfig = Field(default_factory=GoalConfig)

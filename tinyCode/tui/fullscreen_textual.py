@@ -29,6 +29,7 @@ from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tui.metrics import TurnMetrics
 from tinyCode.tui.workspace_changes import WorkspaceChanges
+from tinyCode.time_utils import beijing_now, to_beijing
 from tinyCode.multimodal import (
     ImageInputError,
     describe_user_content,
@@ -112,6 +113,7 @@ class _ConversationTurn:
     activity_text: str = ""
     activity_active: bool = False
     notices: list[_SystemNotice] = field(default_factory=list)
+    goal_source: bool = False
 
 
 class _TurnView(Vertical):
@@ -124,6 +126,12 @@ class _TurnView(Vertical):
         self.turn = turn
         self.user = Static(turn.user_text, classes="user-bubble", markup=False)
         self.user_row = Horizontal(self.user, classes="user-row")
+        self.goal_source_label = Static(
+            "◎ 设为目标", classes="goal-source-label", markup=False,
+        )
+        self.goal_source_row = Horizontal(
+            self.goal_source_label, classes="goal-source-row",
+        )
         self.process_text = Static("", classes="process-text", markup=False)
         self.process = Collapsible(
             self.process_text,
@@ -153,6 +161,7 @@ class _TurnView(Vertical):
 
     def compose(self) -> ComposeResult:
         yield self.user_row
+        yield self.goal_source_row
         yield self.process
         yield self.notice_list
         yield self.agent_label
@@ -175,6 +184,7 @@ class _TurnView(Vertical):
     def sync(self) -> None:
         turn = self.turn
         self.user_row.display = bool(turn.user_text)
+        self.goal_source_row.display = turn.goal_source
         self._sync_process_spinner()
         self.process.title = f"执行过程 · {len(turn.process_lines)} 个事件"
         self.process.collapsed = turn.process_collapsed
@@ -197,6 +207,12 @@ class _TurnView(Vertical):
                 exit_on_error=False,
             )
         if self.notice_list.is_mounted:
+            # A transient interactive notice (for example request_user_input)
+            # may be dismissed after a valid answer. Rebuild only when the
+            # logical list shrinks; ordinary notices still append cheaply.
+            if self._rendered_notice_count > len(turn.notices):
+                self.notice_list.remove_children()
+                self._rendered_notice_count = 0
             for notice in turn.notices[self._rendered_notice_count:]:
                 self.notice_list.mount(self._notice_widget(notice))
                 self._rendered_notice_count += 1
@@ -381,6 +397,14 @@ class _TinyCodeFullscreenApp(App[None]):
         width: auto; max-width: 70%; height: auto; padding: 1 2;
         color: $text; background: $boost; border: round $panel-lighten-2;
     }
+    .goal-source-row {
+        display: none; width: 100%; height: 1; margin: 0 0 1 0;
+        align-horizontal: right;
+    }
+    .goal-source-label {
+        width: auto; height: 1; margin: 0 1 0 0; padding: 0 1;
+        color: $text-muted; background: transparent;
+    }
     .process-block {
         width: 100%; height: auto; margin: 0 0 1 0; color: $text-muted;
         border: none; background: transparent;
@@ -429,6 +453,22 @@ class _TinyCodeFullscreenApp(App[None]):
     }
     #composer-shell {
         height: auto; min-height: 3; padding: 0 1 1 1; background: $background;
+    }
+    #goal-strip {
+        display: none; width: 100%; height: 3; margin: 0 0 1 0; padding: 0 1;
+        align-vertical: middle;
+        color: $text-muted; background: $surface;
+        border: round $panel-lighten-2;
+    }
+    #goal-text {
+        width: 1fr; height: 1; padding: 0 1; color: $text;
+    }
+    #goal-pause, #goal-clear {
+        width: 5; min-width: 5; height: 1; margin: 0 0 0 1; padding: 0;
+        color: $text-muted; background: transparent; border: none;
+    }
+    #goal-pause:hover, #goal-pause:focus, #goal-clear:hover, #goal-clear:focus {
+        color: $text; background: $boost; border: round $panel-lighten-2;
     }
     #composer-frame {
         width: 100%; height: auto; min-height: 4; max-height: 10;
@@ -509,6 +549,10 @@ class _TinyCodeFullscreenApp(App[None]):
                 id="new-output",
                 markup=False,
             )
+            with Horizontal(id="goal-strip"):
+                yield Static("", id="goal-text", markup=False)
+                yield Button("Ⅱ", id="goal-pause", tooltip="暂停 Goal")
+                yield Button("⌫", id="goal-clear", tooltip="清除 Goal")
             with Vertical(id="composer-frame"):
                 with Horizontal(id="attachment-row"):
                     yield Static("", id="attachment-label", markup=False)
@@ -541,6 +585,8 @@ class _TinyCodeFullscreenApp(App[None]):
     def on_mount(self) -> None:
         self.owner._textual_ready(self)
         self.refresh_composer()
+        self.refresh_goal_strip()
+        self.set_interval(1.0, self.refresh_goal_strip, name="goal-elapsed")
         self.query_one("#composer", _Composer).focus()
 
     @on(_Composer.Submitted, "#composer")
@@ -582,6 +628,25 @@ class _TinyCodeFullscreenApp(App[None]):
         event.stop()
         if self.owner.cancel_active_turn():
             self.refresh_composer()
+        self.query_one("#composer", _Composer).focus()
+
+    @on(Button.Pressed, "#goal-pause")
+    def _on_goal_pause_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if self.owner._runtime.active:
+            self.owner.pause_goal()
+        else:
+            self.owner.resume_goal()
+        self.refresh_goal_strip()
+        self.refresh_composer()
+        self.query_one("#composer", _Composer).focus()
+
+    @on(Button.Pressed, "#goal-clear")
+    def _on_goal_clear_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.owner.clear_goal()
+        self.refresh_goal_strip()
+        self.refresh_composer()
         self.query_one("#composer", _Composer).focus()
 
     @on(Button.Pressed, "#attach-button")
@@ -785,6 +850,23 @@ class _TinyCodeFullscreenApp(App[None]):
         )
         self._refresh_attachment()
 
+    def refresh_goal_strip(self) -> None:
+        strip = self.query_one("#goal-strip", Horizontal)
+        text = self.query_one("#goal-text", Static)
+        pause = self.query_one("#goal-pause", Button)
+        clear = self.query_one("#goal-clear", Button)
+        data = self.owner._goal_strip_data()
+        strip.display = data is not None
+        if data is None:
+            return
+        label, runtime_active = data
+        text.update(label)
+        pause.label = "Ⅱ" if runtime_active else "▶"
+        pause.tooltip = "暂停 Goal" if runtime_active else "继续 Goal"
+        pause.disabled = False
+        clear.disabled = False
+
+
     @staticmethod
     def _resize_composer(composer: _Composer) -> None:
         visual_lines = max(1, composer.text.count("\n") + 1)
@@ -907,6 +989,20 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._process_lines = active.process_lines
             self._assistant_draft = active.answer
             self._process_collapsed = active.process_collapsed
+        goal = self._goal_service.current if self._goal_service is not None else None
+        if goal is not None:
+            for turn in reversed(self._turns):
+                if turn.user_text == goal.objective:
+                    turn.goal_source = True
+                    break
+
+    def start_goal(self, objective: str) -> str:
+        result = super().start_goal(objective)
+        if self._goal_service is not None and self._goal_service.active:
+            if self._active_turn is not None and self._active_turn.user_text == objective:
+                self._active_turn.goal_source = True
+                self._sync_active_view()
+        return result
 
     def _print_user(self, text: str) -> None:
         if self._active_turn is not None:
@@ -934,7 +1030,13 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
     def _create_stream_renderer(self) -> _FullscreenStreamSink:
         return _FullscreenStreamSink(self._append_assistant_text)
 
-    def _before_tool_call(self) -> None:
+    def _before_tool_call(self, tool_name: str = "") -> None:
+        # goal_complete is a lifecycle acknowledgement, not substantive work.
+        # Models commonly stream their real deliverable first and invoke this
+        # tool last; moving that text into the collapsed process disclosure
+        # would make the final answer look truncated.
+        if tool_name == "goal_complete":
+            return
         if self._assistant_draft:
             self._append_process("模型前置说明：\n" + self._assistant_draft)
             self._assistant_draft = ""
@@ -1128,7 +1230,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._stop_progress()
         lines = [f"需要你确认：{question}"]
         lines.extend(f"  {index}. {option}" for index, option in enumerate(options, 1))
-        self._add_notice("approval", "需要你的选择", "\n".join(lines))
+        notice = self._add_notice("approval", "需要你的选择", "\n".join(lines))
         prompt = "请输入选项序号或答案 › " if options else "请回答 › "
         while True:
             try:
@@ -1145,6 +1247,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
                 else:
                     self._print_warning(f"请输入 1–{len(options)} 的序号，或直接输入答案")
                     continue
+            self._remove_notice(notice)
             self._start_progress("已收到回答 · 继续执行")
             return answer
 
@@ -1225,7 +1328,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         if self._app is not None:
             self._app.call_later(self._mount_turn, turn)
 
-    def _add_notice(self, kind: str, title: str, text: str) -> None:
+    def _add_notice(self, kind: str, title: str, text: str) -> _SystemNotice:
         if self._active_turn is None:
             turn = _ConversationTurn(user_text="")
             self._turns.append(turn)
@@ -1233,8 +1336,21 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._process_lines = turn.process_lines
             if self._app is not None:
                 self._app.call_later(self._mount_turn, turn)
-        self._active_turn.notices.append(_SystemNotice(kind, title, text))
+        notice = _SystemNotice(kind, title, text)
+        self._active_turn.notices.append(notice)
         self._sync_active_view()
+        return notice
+
+    def _remove_notice(self, notice: _SystemNotice) -> None:
+        """Dismiss a transient notice without touching durable turn output."""
+        for turn in reversed(self._turns):
+            try:
+                turn.notices.remove(notice)
+            except ValueError:
+                continue
+            if turn is self._active_turn:
+                self._sync_active_view()
+            return
 
     def _append_process(self, text: str) -> None:
         if self._active_turn is None:
@@ -1263,12 +1379,37 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         mcp = f" · MCP {self._mcp_server_count}" if self._mcp_server_count else ""
         return f"TinyCode · {self._provider_name}/{self._model}{mcp} · {self._status_text}"
 
+    def _goal_strip_data(self) -> tuple[str, bool] | None:
+        service = self._goal_service
+        goal = service.current if service is not None else None
+        if goal is None or not service.active:
+            return None
+        created = to_beijing(goal.created_at)
+        elapsed = max(0, int((beijing_now() - created).total_seconds())) if created else 0
+        if elapsed < 60:
+            elapsed_text = f"{elapsed} 秒"
+        elif elapsed < 3_600:
+            elapsed_text = f"{elapsed // 60} 分 {elapsed % 60} 秒"
+        else:
+            elapsed_text = f"{elapsed // 3_600} 小时 {(elapsed % 3_600) // 60} 分"
+        objective = " ".join(goal.objective.split())
+        if len(objective) > 72:
+            objective = objective[:71] + "…"
+        return (
+            f"◎ 进行中的目标  {objective} · {elapsed_text}",
+            self._runtime.active,
+        )
+
     def _input_placeholder(self) -> str:
         return "".join(text for _style, text in self._input_prompt())
 
     def _refresh_chrome(self) -> None:
         if self._app is not None and self._app.is_running:
             self._app.refresh_header()
+
+    def _refresh_goal_display(self) -> None:
+        if self._app is not None and self._app.is_running:
+            self._app.refresh_goal_strip()
 
     def _invalidate_input_prompt(self) -> None:
         if self._app is not None and self._app.is_running:

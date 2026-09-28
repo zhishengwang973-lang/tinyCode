@@ -54,6 +54,7 @@ from tinyCode.tui import create_tui, fullscreen_supported
 from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tracing import TraceRecorder
 from tinyCode.tasking import TaskPlanListTool, TaskPlanStore, TaskPlanUpdateTool, TaskPlanningService
+from tinyCode.goals import GoalCompleteTool, GoalService, GoalStatusTool, GoalStore
 
 
 class _CleanupStack:
@@ -122,6 +123,7 @@ async def _choose_interrupted_task(
 def _create_tool_registry(
     tool_result_storage_dir: Path | None = None,
     task_planning_service: TaskPlanningService | None = None,
+    goal_service: GoalService | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ReadFileTool())
@@ -143,6 +145,11 @@ def _create_tool_registry(
         # avoiding per-round tool-schema churn and cache misses.
         registry.register(TaskPlanListTool(task_planning_service))
         registry.register(TaskPlanUpdateTool(task_planning_service))
+    if goal_service is not None:
+        # These schemas stay stable for every tool-enabled task. Outside an
+        # active Goal they return an explicit no-Goal response.
+        registry.register(GoalStatusTool(goal_service))
+        registry.register(GoalCompleteTool(goal_service))
     return registry
 
 
@@ -278,8 +285,14 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
     task_planning_service = TaskPlanningService(
         app_config.task_planning, provider, task_plan_store,
     )
+    goal_service = (
+        GoalService(
+            GoalStore(Path.cwd()), default_max_turns=app_config.goals.max_turns,
+        )
+        if app_config.goals.enabled else None
+    )
     tool_registry = _create_tool_registry(
-        truncator.storage_dir, task_planning_service,
+        truncator.storage_dir, task_planning_service, goal_service,
     )
     trace_recorder = TraceRecorder(app_config.tracing, Path.cwd())
 
@@ -446,6 +459,8 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
                 file=sys.stderr,
             )
             return 2
+    if goal_service is not None:
+        goal_service.bind_session(session_store.current_id or "")
 
     task_mode_router = (
         TaskModeRouter(provider, app_config.task_mode_routing)
@@ -553,6 +568,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         startup_recovery_prompt=startup_recovery_prompt,
         startup_recovery_task_id=startup_recovery_task_id,
         task_planning_service=task_planning_service,
+        goal_service=goal_service,
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui

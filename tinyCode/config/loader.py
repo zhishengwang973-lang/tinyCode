@@ -16,6 +16,7 @@ from tinyCode.config.models import (
     TeamAutomationConfig,
     TaskModeRoutingConfig,
     TaskPlanningConfig,
+    GoalConfig,
     TracingConfig,
 )
 from tinyCode.config.constants import (
@@ -37,6 +38,8 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_PLANNING_ENABLED,
     DEFAULT_TASK_PLANNING_MAX_TASKS,
     DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
+    DEFAULT_GOALS_ENABLED,
+    DEFAULT_GOAL_MAX_TURNS,
     DEFAULT_UI_MODE,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_ROUND_LIMIT_ACTIONS,
@@ -151,6 +154,12 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["task_planning"] = global_raw["task_planning"]
     else:
         merged.pop("task_planning", None)
+    # Goals can keep a thread working and issue further model requests, so
+    # their enablement and budget are user-level execution policy as well.
+    if "goals" in global_raw:
+        merged["goals"] = global_raw["goals"]
+    else:
+        merged.pop("goals", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -582,6 +591,22 @@ def load_config() -> AppConfig:
     ):
         raise ConfigError("task_planning.min_task_chars 必须是 1 到 2000 之间的整数")
 
+    goals_raw = raw.get("goals", {})
+    if not isinstance(goals_raw, dict):
+        raise ConfigError("goals 必须是对象（mapping）")
+    goals_enabled = goals_raw.get("enabled", DEFAULT_GOALS_ENABLED)
+    if not isinstance(goals_enabled, bool):
+        raise ConfigError("goals.enabled 必须是 true 或 false")
+    goal_max_turns = goals_raw.get("max_turns", DEFAULT_GOAL_MAX_TURNS)
+    if (
+        isinstance(goal_max_turns, bool)
+        or not isinstance(goal_max_turns, int)
+        or not 1 <= goal_max_turns <= MAX_ALLOWED_ROUNDS
+    ):
+        raise ConfigError(
+            f"goals.max_turns 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数"
+        )
+
     team_raw = raw.get("team", {})
     if not isinstance(team_raw, dict):
         raise ConfigError("team 必须是对象（mapping）")
@@ -674,6 +699,7 @@ def load_config() -> AppConfig:
             max_tasks=planning_max_tasks,
             min_task_chars=planning_min_chars,
         ),
+        goals=GoalConfig(enabled=goals_enabled, max_turns=goal_max_turns),
         team=TeamAutomationConfig(
             mode=team_mode,
             max_members=team_max_members,

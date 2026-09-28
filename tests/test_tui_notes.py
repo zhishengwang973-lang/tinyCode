@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from prompt_toolkit.document import Document
 from rich.console import Console
 from textual import events
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.selection import SELECT_ALL
 from textual.widgets import Button, Static, TextArea
 
@@ -38,6 +38,7 @@ from tinyCode.tools.base import ToolResult
 from tinyCode.config.models import TaskPlanningConfig
 from tinyCode.tasking.planner import TaskPlanningService
 from tinyCode.tasking.store import TaskPlanStore
+from tinyCode.goals import GoalService, GoalStore
 from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
 from tinyCode.tui.factory import create_tui
 from tinyCode.tui.fullscreen_textual import (
@@ -305,6 +306,40 @@ class ReadOnlyAgentLoop(FakeAgentLoop):
         yield AgentDoneEvent("no_tool_call")
 
 
+class GoalAgentLoop(FakeAgentLoop):
+    """First Goal turn is productive; the second deliberately is not."""
+
+    def __init__(self) -> None:
+        super().__init__("goal response")
+        self.calls = 0
+        self.goal_contexts: list[str] = []
+
+    def set_goal_context(self, context: str) -> None:
+        self.goal_contexts.append(context)
+
+    def tool_may_modify_workspace(self, _tool_name: str, _params=None) -> bool:
+        return False
+
+    async def run(self, history):
+        self.calls += 1
+        if self.calls == 1:
+            yield ToolCallEvent(ToolCall("goal-read", "read_file", {"path": "README.md"}))
+            yield ToolResultEvent(
+                tool_name="read_file", call_id="goal-read",
+                result=ToolResult(success=True, content="evidence"),
+            )
+        yield TextDeltaEvent(f"goal response {self.calls}")
+        yield AgentDoneEvent("no_tool_call")
+
+
+class QuietGoalAgentLoop(FakeAgentLoop):
+    def set_goal_context(self, context: str) -> None:
+        self.goal_context = context
+
+    async def run(self, history):
+        yield AgentDoneEvent("no_tool_call")
+
+
 class RoundReportingAgentLoop(FakeAgentLoop):
     def __init__(self) -> None:
         super().__init__()
@@ -494,6 +529,30 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([True], tui._compressor.force_values)
         self.assertIn("上下文已压缩", result)
+
+    async def test_goal_final_response_automatically_completes_when_tool_is_omitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = GoalAgentLoop()
+            goal_service = GoalService(GoalStore(Path(tmp)), default_max_turns=4)
+            goal_service.bind_session("goal-session")
+            goal_service.start("检查 README 并以证据完成任务")
+            tui, output = self._make_tui(loop)
+            tui._goal_service = goal_service
+
+            self.assertTrue(tui._start_user_input("检查 README", display_user=False))
+            for _ in range(8):
+                task = tui._foreground_task
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+                await asyncio.sleep(0)
+                if loop.calls >= 2 and not tui._runtime.active:
+                    break
+
+            self.assertEqual(1, loop.calls)
+            self.assertEqual(1, len(loop.goal_contexts))
+            self.assertEqual(1, goal_service.current.completed_turns)
+            self.assertFalse(goal_service.active)
+            self.assertIn("Goal 已随最终回答自动结束", output.getvalue())
 
     async def test_image_turn_keeps_structured_content_in_history(self):
         class VisionProvider:
@@ -1068,6 +1127,27 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("我先检查项目。", tui._assistant_draft)
         self.assertEqual("最终答案。", tui._assistant_draft)
         self.assertTrue(tui._process_collapsed)
+
+    def test_fullscreen_keeps_pre_goal_complete_text_in_final_answer(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        tui._print_user("完成任务")
+        sink = tui._create_stream_renderer()
+        sink.write("完整的交付说明。")
+        tui._before_tool_call("goal_complete")
+        sink.write("\n简短收尾。")
+        tui._print_success()
+
+        self.assertNotIn("模型前置说明", "\n".join(tui._process_lines))
+        self.assertEqual("完整的交付说明。\n简短收尾。", tui._assistant_draft)
+        self.assertEqual(tui._assistant_draft, tui._active_turn.answer)
 
     async def test_fullscreen_chat_feed_uses_independent_message_widgets(self):
         tui = FullscreenTinyCodeTUI(
@@ -1666,6 +1746,101 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             )
             view = list(app.query(_TurnView))[0]
             self.assertEqual(3, len(list(view.notice_list.children)))
+
+    async def test_fullscreen_tool_input_removes_choice_card_after_valid_answer(self):
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            tui._print_user("创建项目")
+            tui._read_control_input = AsyncMock(return_value="2")
+
+            answer = await tui.request_tool_input(
+                "选择数据库", ["PostgreSQL", "SQLite"],
+            )
+            await pilot.pause()
+
+            self.assertEqual("SQLite", answer)
+            self.assertEqual([], tui._active_turn.notices)
+            view = list(app.query(_TurnView))[0]
+            self.assertEqual(0, len(list(view.notice_list.children)))
+
+    async def test_fullscreen_shows_active_goal_strip_above_composer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = GoalService(GoalStore(Path(tmp)), default_max_turns=4)
+            service.bind_session("goal-strip-session")
+            service.start("搜索网上的资料，总结 agent 的能力")
+            tui = FullscreenTinyCodeTUI(
+                agent_loop=FakeAgentLoop(),
+                history=FakeHistory(),
+                compressor=FakeCompressor(),
+                session_store=FakeSessionStore(),
+                note_manager=None,
+                provider_name="fake",
+                model="fake",
+                goal_service=service,
+            )
+            app = _TinyCodeFullscreenApp(tui)
+
+            async with app.run_test(size=(100, 36)) as pilot:
+                await pilot.pause()
+                strip = app.query_one("#goal-strip", Horizontal)
+                label = app.query_one("#goal-text", Static)
+
+                self.assertTrue(strip.display)
+                self.assertIn("进行中的目标", str(label.render()))
+                self.assertIn("总结 agent 的能力", str(label.render()))
+
+            service.pause()
+            self.assertIsNone(tui._goal_strip_data())
+
+    async def test_fullscreen_marks_only_goal_source_message_with_static_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = GoalService(GoalStore(Path(tmp)), default_max_turns=4)
+            service.bind_session("goal-source-session")
+            history = FakeHistory()
+            tui = FullscreenTinyCodeTUI(
+                agent_loop=QuietGoalAgentLoop(),
+                history=history,
+                compressor=FakeCompressor(),
+                session_store=FakeSessionStore(),
+                note_manager=None,
+                provider_name="fake",
+                model="fake",
+                goal_service=service,
+            )
+            app = _TinyCodeFullscreenApp(tui)
+
+            async with app.run_test(size=(100, 36)) as pilot:
+                tui._print_user("普通用户消息")
+                await pilot.pause()
+                ordinary = app.query_one(_TurnView)
+                self.assertFalse(ordinary.goal_source_row.display)
+
+                self.assertIn("Goal 已启动", tui.start_goal("检查 README 并总结项目能力"))
+                for _ in range(8):
+                    task = tui._foreground_task
+                    if task is not None:
+                        await asyncio.gather(task, return_exceptions=True)
+                    await pilot.pause()
+                    if not tui._runtime.active:
+                        break
+
+                self.assertTrue(service.active)
+                views = list(app.query(_TurnView))
+                goal_view = views[-1]
+                self.assertTrue(goal_view.turn.goal_source)
+                self.assertTrue(goal_view.goal_source_row.display)
+                self.assertIsInstance(goal_view.goal_source_label, Static)
+                self.assertEqual(["检查 README 并总结项目能力"], history.user_messages)
 
     async def test_escaped_newlines_are_normalized_before_output_and_recording(self):
         loop = FakeAgentLoop("```java\\nclass QuickSort {}\\n```")

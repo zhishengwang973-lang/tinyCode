@@ -213,6 +213,7 @@ class AgentLoop:
         self._task_snapshot_version = 0
         self._task_is_direct_answer = False
         self._task_needs_time = False
+        self._goal_context = ""
         self._previous_request_cache_shape: dict[str, object] | None = None
 
     # -- public API -----------------------------------------------------------
@@ -366,6 +367,15 @@ class AgentLoop:
         """Append one durable execution-plan instruction to the next turn."""
         if plan_context.strip():
             self._prompt_injector.queue_injection(plan_context)
+
+    def set_goal_context(self, goal_context: str) -> None:
+        """Bind one persistent Goal contract to the next foreground task.
+
+        Goal turns need an evidence tool even when the user wording resembles a
+        direct question, so a direct route is conservatively upgraded to
+        inspect.  Workspace writes still require an ordinary modify route.
+        """
+        self._goal_context = goal_context.strip()
 
     async def run(self, history: ConversationHistory) -> AsyncIterator[AgentEvent]:
         """Run one user turn and keep history valid if the pipeline fails."""
@@ -1319,6 +1329,10 @@ class AgentLoop:
         self._task_snapshot_version += 1
         route = await self._route_task_mode(history.get_messages())
         self._apply_task_mode_route(route)
+        if self._goal_context and self._task_mode is TaskMode.DIRECT:
+            self._task_mode = TaskMode.INSPECT
+            self._task_mode_source = "goal"
+            self._task_mode_confidence = None
         if self._plan_only and self._task_mode is TaskMode.MODIFY:
             self._task_mode = TaskMode.INSPECT
         self._task_is_direct_answer = self._task_mode is TaskMode.DIRECT
@@ -1342,6 +1356,7 @@ class AgentLoop:
         )
         self._task_injection = "\n\n".join(filter(None, (
             self._prompt_injector.build_task_injection() or "",
+            self._goal_context,
             task_mode_instruction(self._task_mode),
         )))
 
@@ -1358,6 +1373,7 @@ class AgentLoop:
         self._task_mode_confidence = None
         self._task_is_direct_answer = False
         self._task_needs_time = False
+        self._goal_context = ""
         self._previous_request_cache_shape = None
 
     async def _refresh_task_mode_after_steering(
@@ -1385,6 +1401,7 @@ class AgentLoop:
             )
         self._task_injection = "\n\n".join(filter(None, (
             self._prompt_injector.build_task_injection() or "",
+            self._goal_context,
             task_mode_instruction(candidate),
         )))
 

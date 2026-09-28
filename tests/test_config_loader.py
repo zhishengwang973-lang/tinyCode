@@ -81,6 +81,28 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertFalse(config.task_mode_routing.enabled)
             self.assertEqual("auto", config.team.mode)
             self.assertEqual("review", config.team.merge_policy)
+            self.assertTrue(config.goals.enabled)
+            self.assertEqual(12, config.goals.max_turns)
+
+    def test_goals_are_configurable_and_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: gpt-test\n"
+                "    api_key: test-key\n"
+                "goals:\n"
+                "  enabled: false\n"
+                "  max_turns: 24\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertFalse(config.goals.enabled)
+        self.assertEqual(24, config.goals.max_turns)
 
     def test_team_automation_is_configurable(self):
         with tempfile.TemporaryDirectory() as tmp:
