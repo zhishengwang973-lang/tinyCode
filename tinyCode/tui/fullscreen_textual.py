@@ -113,6 +113,7 @@ class _ConversationTurn:
     activity_text: str = ""
     activity_active: bool = False
     notices: list[_SystemNotice] = field(default_factory=list)
+    delivery_verdict: _SystemNotice | None = None
     goal_source: bool = False
 
 
@@ -151,6 +152,8 @@ class _TurnView(Vertical):
         notice_widgets = [self._notice_widget(notice) for notice in turn.notices]
         self.notice_list = Vertical(*notice_widgets, classes="notice-list")
         self._rendered_notice_count = len(notice_widgets)
+        self.delivery_verdict_list = Vertical(classes="delivery-verdict-list")
+        self._rendered_delivery_verdict: _SystemNotice | None = None
         self._markdown_source = ""
         self._markdown_rendered = ""
         self._spinner_index = 0
@@ -167,6 +170,7 @@ class _TurnView(Vertical):
         yield self.agent_label
         yield self.answer
         yield self.plain_answer
+        yield self.delivery_verdict_list
         yield self.workspace
         yield self.metrics
 
@@ -216,6 +220,14 @@ class _TurnView(Vertical):
             for notice in turn.notices[self._rendered_notice_count:]:
                 self.notice_list.mount(self._notice_widget(notice))
                 self._rendered_notice_count += 1
+        if self.delivery_verdict_list.is_mounted:
+            verdict = turn.delivery_verdict
+            if verdict != self._rendered_delivery_verdict:
+                self.delivery_verdict_list.remove_children()
+                if verdict is not None:
+                    self.delivery_verdict_list.mount(self._notice_widget(verdict))
+                self._rendered_delivery_verdict = verdict
+            self.delivery_verdict_list.display = verdict is not None
         self.workspace.display = bool(turn.workspace_summary)
         workspace = Text()
         for index, line in enumerate(turn.workspace_summary.splitlines()):
@@ -428,7 +440,7 @@ class _TinyCodeFullscreenApp(App[None]):
     .command-answer { color: $text-muted; }
     .warning-answer { color: $warning; }
     .error-answer { color: $error; }
-    .notice-list { width: 100%; height: auto; }
+    .notice-list, .delivery-verdict-list { width: 100%; height: auto; }
     .system-card {
         width: 100%; height: auto; margin: 0 0 1 0; padding: 0 1;
         background: $surface;
@@ -436,6 +448,7 @@ class _TinyCodeFullscreenApp(App[None]):
     .warning-card { color: $warning; border-left: thick $warning; }
     .error-card { color: $error; border-left: thick $error; }
     .approval-card { color: $warning; border-left: thick $warning; }
+    .verification-card { color: $success; border-left: thick $success; }
     .agent-answer MarkdownH1, .agent-answer MarkdownH2, .agent-answer MarkdownH3 {
         width: 100%; height: auto; padding: 0; margin: 1 0;
         color: $text; background: transparent; text-align: left;
@@ -1117,6 +1130,25 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._add_notice("error", "错误", text)
         self._set_process_collapsed(True)
         self._refresh_chrome()
+
+    def _print_delivery_verdict(self, verdict) -> None:
+        if not verdict.available:
+            notice = _SystemNotice(
+                "warning", "独立交付验证不可用", verdict.error,
+            )
+        else:
+            lines = [verdict.rationale] if verdict.rationale else []
+            if verdict.requirements_met:
+                lines.append("已验证: " + "；".join(verdict.requirements_met))
+            if verdict.missing_or_risks:
+                lines.append("待确认/风险: " + "；".join(verdict.missing_or_risks))
+            notice = _SystemNotice(
+                "verification", f"独立交付验证 · {verdict.label}",
+                "\n".join(lines) or "验证模型未提供额外说明",
+            )
+        if self._active_turn is not None:
+            self._active_turn.delivery_verdict = notice
+            self._sync_active_view()
 
     def _clear_display(self) -> None:
         self._turns.clear()

@@ -20,6 +20,7 @@
 - **两层 Token 管理**：工具结果截断（层1）+ 结构化 LLM 摘要（层2）
 - **弹性轮次预算**：软预算分段续跑、多信号无进展检测、策略恢复和绝对硬上限
 - **持久 Goal**：`/goal` 将可验收目标绑定到当前会话；基于工具证据安全续跑、支持预算、暂停、恢复和清除
+- **独立交付验证**：复杂 Goal 结束后可由另一模型审查目标、diff、测试和运行产物，避免只信任主 Agent 的完成声明
 - **任务中追加指令**：模型或工具执行期间继续接收 steering 输入，在协议安全边界注入；`/cancel` 可立即取消当前任务
 - **任务级崩溃恢复**：JSONL 会话、运行态清单、工具预写日志和副作用核对后续跑
 
@@ -68,6 +69,22 @@ goals:
   enabled: true
   max_turns: 12
 ```
+
+复杂 Goal 的独立交付验证默认关闭。启用后会把经过截断和敏感路径过滤的目标、diff、工具结果、
+测试/运行产物发送给指定的独立模型；该 provider 的 model 必须不同于执行模型：
+
+```yaml
+delivery_verification:
+  enabled: true
+  provider: verifier
+  min_goal_chars: 120
+  min_tool_calls: 2
+  min_changed_files: 2
+  timeout_seconds: 45
+```
+
+验证器只对复杂 Goal 触发：目标达到长度阈值，且满足至少一项复杂度信号（多次工具调用、多个文件
+变更或跨多个 Goal 回合）。结论为“可交付 / 不可交付 / 需要人工确认”，并会写入执行 Trace。
 
 评测集示例在 [evals/README.md](evals/README.md)。执行模型和评测模型必须不同：
 

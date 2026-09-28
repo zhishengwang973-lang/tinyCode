@@ -17,6 +17,7 @@ from tinyCode.config.models import (
     TaskModeRoutingConfig,
     TaskPlanningConfig,
     GoalConfig,
+    DeliveryVerificationConfig,
     TracingConfig,
 )
 from tinyCode.config.constants import (
@@ -40,6 +41,11 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
     DEFAULT_GOALS_ENABLED,
     DEFAULT_GOAL_MAX_TURNS,
+    DEFAULT_DELIVERY_VERIFICATION_ENABLED,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_GOAL_CHARS,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_TOOL_CALLS,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_CHANGED_FILES,
+    DEFAULT_DELIVERY_VERIFICATION_TIMEOUT,
     DEFAULT_UI_MODE,
     MAX_ALLOWED_ROUNDS,
     SUPPORTED_ROUND_LIMIT_ACTIONS,
@@ -160,6 +166,12 @@ def _discover_raw_config() -> dict[str, Any]:
         merged["goals"] = global_raw["goals"]
     else:
         merged.pop("goals", None)
+    # Delivery verification uploads task evidence to a separately configured
+    # model, so a repository must not enable or redirect it.
+    if "delivery_verification" in global_raw:
+        merged["delivery_verification"] = global_raw["delivery_verification"]
+    else:
+        merged.pop("delivery_verification", None)
     # A repository-owned config may tighten a user-level security baseline,
     # but must not silently weaken it. Users can still make an explicit
     # process-local override with ``--mode``.
@@ -607,6 +619,46 @@ def load_config() -> AppConfig:
             f"goals.max_turns 必须是 1 到 {MAX_ALLOWED_ROUNDS} 之间的整数"
         )
 
+    delivery_raw = raw.get("delivery_verification", {})
+    if not isinstance(delivery_raw, dict):
+        raise ConfigError("delivery_verification 必须是对象（mapping）")
+    delivery_enabled = delivery_raw.get(
+        "enabled", DEFAULT_DELIVERY_VERIFICATION_ENABLED,
+    )
+    if not isinstance(delivery_enabled, bool):
+        raise ConfigError("delivery_verification.enabled 必须是 true 或 false")
+    delivery_provider = delivery_raw.get("provider", "")
+    if not isinstance(delivery_provider, str):
+        raise ConfigError("delivery_verification.provider 必须是字符串")
+    if delivery_enabled and not delivery_provider.strip():
+        raise ConfigError("启用 delivery_verification 时必须配置 provider")
+    delivery_min_goal_chars = delivery_raw.get(
+        "min_goal_chars", DEFAULT_DELIVERY_VERIFICATION_MIN_GOAL_CHARS,
+    )
+    delivery_min_tool_calls = delivery_raw.get(
+        "min_tool_calls", DEFAULT_DELIVERY_VERIFICATION_MIN_TOOL_CALLS,
+    )
+    delivery_min_changed_files = delivery_raw.get(
+        "min_changed_files", DEFAULT_DELIVERY_VERIFICATION_MIN_CHANGED_FILES,
+    )
+    for key, value, minimum, maximum in (
+        ("min_goal_chars", delivery_min_goal_chars, 1, 5_000),
+        ("min_tool_calls", delivery_min_tool_calls, 0, 100),
+        ("min_changed_files", delivery_min_changed_files, 0, 100),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise ConfigError(f"delivery_verification.{key} 必须是 {minimum} 到 {maximum} 之间的整数")
+    delivery_timeout = delivery_raw.get(
+        "timeout_seconds", DEFAULT_DELIVERY_VERIFICATION_TIMEOUT,
+    )
+    if (
+        isinstance(delivery_timeout, bool)
+        or not isinstance(delivery_timeout, (int, float))
+        or not math.isfinite(float(delivery_timeout))
+        or not 1 <= float(delivery_timeout) <= 180
+    ):
+        raise ConfigError("delivery_verification.timeout_seconds 必须是 1 到 180 之间的数字")
+
     team_raw = raw.get("team", {})
     if not isinstance(team_raw, dict):
         raise ConfigError("team 必须是对象（mapping）")
@@ -700,6 +752,14 @@ def load_config() -> AppConfig:
             min_task_chars=planning_min_chars,
         ),
         goals=GoalConfig(enabled=goals_enabled, max_turns=goal_max_turns),
+        delivery_verification=DeliveryVerificationConfig(
+            enabled=delivery_enabled,
+            provider=delivery_provider.strip(),
+            min_goal_chars=delivery_min_goal_chars,
+            min_tool_calls=delivery_min_tool_calls,
+            min_changed_files=delivery_min_changed_files,
+            timeout_seconds=float(delivery_timeout),
+        ),
         team=TeamAutomationConfig(
             mode=team_mode,
             max_members=team_max_members,

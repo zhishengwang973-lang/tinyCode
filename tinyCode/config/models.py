@@ -23,6 +23,11 @@ from tinyCode.config.constants import (
     DEFAULT_TASK_PLANNING_MIN_TASK_CHARS,
     DEFAULT_GOALS_ENABLED,
     DEFAULT_GOAL_MAX_TURNS,
+    DEFAULT_DELIVERY_VERIFICATION_ENABLED,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_GOAL_CHARS,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_TOOL_CALLS,
+    DEFAULT_DELIVERY_VERIFICATION_MIN_CHANGED_FILES,
+    DEFAULT_DELIVERY_VERIFICATION_TIMEOUT,
     DEFAULT_UI_MODE,
 )
 
@@ -101,6 +106,25 @@ class GoalConfig(BaseModel):
     max_turns: int = Field(default=DEFAULT_GOAL_MAX_TURNS, ge=1, le=100)
 
 
+class DeliveryVerificationConfig(BaseModel):
+    """Policy for an independent post-task delivery verifier."""
+
+    enabled: bool = DEFAULT_DELIVERY_VERIFICATION_ENABLED
+    provider: str = ""
+    min_goal_chars: int = Field(
+        default=DEFAULT_DELIVERY_VERIFICATION_MIN_GOAL_CHARS, ge=1, le=5_000,
+    )
+    min_tool_calls: int = Field(
+        default=DEFAULT_DELIVERY_VERIFICATION_MIN_TOOL_CALLS, ge=0, le=100,
+    )
+    min_changed_files: int = Field(
+        default=DEFAULT_DELIVERY_VERIFICATION_MIN_CHANGED_FILES, ge=0, le=100,
+    )
+    timeout_seconds: float = Field(
+        default=DEFAULT_DELIVERY_VERIFICATION_TIMEOUT, ge=1, le=180,
+    )
+
+
 class AppConfig(BaseModel):
     """Top-level application configuration."""
 
@@ -121,3 +145,6 @@ class AppConfig(BaseModel):
     team: TeamAutomationConfig = Field(default_factory=TeamAutomationConfig)
     task_planning: TaskPlanningConfig = Field(default_factory=TaskPlanningConfig)
     goals: GoalConfig = Field(default_factory=GoalConfig)
+    delivery_verification: DeliveryVerificationConfig = Field(
+        default_factory=DeliveryVerificationConfig,
+    )

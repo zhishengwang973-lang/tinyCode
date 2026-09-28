@@ -8,7 +8,7 @@ from pathlib import Path
 from tinyCode.agent.loop import AgentLoop
 from tinyCode.agent.task_mode_router import TaskModeRouter
 from tinyCode.cli import CLIOptions, parse_cli_args
-from tinyCode.config.loader import ConfigError, load_config
+from tinyCode.config.loader import ConfigError, load_config, load_provider_config
 from tinyCode.instructions import InstructionsLoader
 from tinyCode.mcp.manager import MCPManager
 from tinyCode.notes import AutoNoteManager, JevNoteRouter
@@ -55,6 +55,7 @@ from tinyCode.tui.app import TinyCodeTUI
 from tinyCode.tracing import TraceRecorder
 from tinyCode.tasking import TaskPlanListTool, TaskPlanStore, TaskPlanUpdateTool, TaskPlanningService
 from tinyCode.goals import GoalCompleteTool, GoalService, GoalStatusTool, GoalStore
+from tinyCode.verification import DeliveryVerifier
 
 
 class _CleanupStack:
@@ -194,6 +195,25 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         print(f"无法创建 provider: {e}", file=sys.stderr)
         return 2
     cleanup.add("provider", provider.close)
+
+    delivery_verifier = None
+    if app_config.delivery_verification.enabled:
+        try:
+            verifier_config = load_provider_config(
+                app_config.delivery_verification.provider,
+            )
+            if verifier_config.model == active_config.model:
+                raise ConfigError(
+                    "delivery_verification.provider 必须使用与执行模型不同的 model"
+                )
+            verifier_provider = create_provider(verifier_config)
+            delivery_verifier = DeliveryVerifier(
+                app_config.delivery_verification, verifier_provider,
+            )
+            cleanup.add("delivery verifier", verifier_provider.close)
+        except (ConfigError, ValueError) as exc:
+            print(f"交付验证器初始化失败: {exc}", file=sys.stderr)
+            return 2
 
     # 4. Conversation history + session store + migration
     history = ConversationHistory()
@@ -569,6 +589,7 @@ async def _run_application(options: CLIOptions, cleanup: _CleanupStack) -> int:
         startup_recovery_task_id=startup_recovery_task_id,
         task_planning_service=task_planning_service,
         goal_service=goal_service,
+        delivery_verifier=delivery_verifier,
     )
     cleanup.add("TUI", tui.shutdown)
     tui_ref["tui"] = tui

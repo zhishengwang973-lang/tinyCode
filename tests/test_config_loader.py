@@ -83,6 +83,53 @@ class ConfigLoaderTests(unittest.TestCase):
             self.assertEqual("review", config.team.merge_policy)
             self.assertTrue(config.goals.enabled)
             self.assertEqual(12, config.goals.max_turns)
+            self.assertFalse(config.delivery_verification.enabled)
+
+    def test_delivery_verification_requires_independent_provider_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: executor\n"
+                "    protocol: openai\n"
+                "    model: executor-model\n"
+                "    api_key: test-key\n"
+                "  - name: verifier\n"
+                "    protocol: openai\n"
+                "    model: verifier-model\n"
+                "    api_key: test-key\n"
+                "delivery_verification:\n"
+                "  enabled: true\n"
+                "  provider: verifier\n"
+                "  min_goal_chars: 160\n"
+                "  min_tool_calls: 3\n"
+                "  min_changed_files: 2\n"
+                "  timeout_seconds: 30\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                config = load_config()
+
+        self.assertTrue(config.delivery_verification.enabled)
+        self.assertEqual("verifier", config.delivery_verification.provider)
+        self.assertEqual(160, config.delivery_verification.min_goal_chars)
+
+    def test_delivery_verification_rejects_missing_provider_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  - name: openai\n"
+                "    protocol: openai\n"
+                "    model: test-model\n"
+                "    api_key: test-key\n"
+                "delivery_verification:\n"
+                "  enabled: true\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TINYCODE_CONFIG": str(config_path)}, clear=False):
+                with self.assertRaisesRegex(ConfigError, "必须配置 provider"):
+                    load_config()
 
     def test_goals_are_configurable_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:

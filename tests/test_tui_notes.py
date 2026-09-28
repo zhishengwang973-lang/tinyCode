@@ -39,6 +39,7 @@ from tinyCode.config.models import TaskPlanningConfig
 from tinyCode.tasking.planner import TaskPlanningService
 from tinyCode.tasking.store import TaskPlanStore
 from tinyCode.goals import GoalService, GoalStore
+from tinyCode.verification import DeliveryVerdict
 from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
 from tinyCode.tui.factory import create_tui
 from tinyCode.tui.fullscreen_textual import (
@@ -340,6 +341,31 @@ class QuietGoalAgentLoop(FakeAgentLoop):
         yield AgentDoneEvent("no_tool_call")
 
 
+class FakeDeliveryVerifier:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def should_track(self, goal) -> bool:
+        return goal is not None
+
+    def should_verify(self, goal, *, tool_calls: int, changes) -> bool:
+        del changes
+        return goal is not None and tool_calls >= 1
+
+    async def capture_workspace(self, workspace):
+        del workspace
+        return None
+
+    async def verify(self, goal, **kwargs) -> DeliveryVerdict:
+        self.calls.append({"goal": goal, **kwargs})
+        return DeliveryVerdict(
+            available=True,
+            verdict="pass",
+            rationale="测试产物支持交付",
+            requirements_met=("测试通过",),
+        )
+
+
 class RoundReportingAgentLoop(FakeAgentLoop):
     def __init__(self) -> None:
         super().__init__()
@@ -553,6 +579,44 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, goal_service.current.completed_turns)
             self.assertFalse(goal_service.active)
             self.assertIn("Goal 已随最终回答自动结束", output.getvalue())
+
+    async def test_complex_goal_runs_independent_delivery_verifier_after_completion(self):
+        class InspectingVerifier(FakeDeliveryVerifier):
+            def __init__(self, output) -> None:
+                super().__init__()
+                self.output = output
+                self.output_before_verdict = ""
+
+            async def verify(self, goal, **kwargs) -> DeliveryVerdict:
+                self.output_before_verdict = self.output.getvalue()
+                return await super().verify(goal, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            goal_service = GoalService(GoalStore(Path(tmp)), default_max_turns=4)
+            goal_service.bind_session("delivery-verifier-session")
+            goal_service.start("实现完整 healthcheck 模块，补齐边界测试与文档，并验证交付结果")
+            tui, output = self._make_tui(GoalAgentLoop())
+            verifier = InspectingVerifier(output)
+            tui._goal_service = goal_service
+            tui._delivery_verifier = verifier
+
+            self.assertTrue(tui._start_user_input("实现 healthcheck", display_user=False))
+            for _ in range(8):
+                task = tui._foreground_task
+                if task is not None:
+                    await asyncio.gather(task, return_exceptions=True)
+                await asyncio.sleep(0)
+                if not tui._runtime.active:
+                    break
+
+            self.assertEqual(1, len(verifier.calls))
+            self.assertEqual("read_file", verifier.calls[0]["tool_evidence"][0].name)
+            rendered = output.getvalue()
+            self.assertNotIn("goal response 1", verifier.output_before_verdict)
+            self.assertLess(
+                rendered.index("goal response 1"),
+                rendered.index("独立交付验证 · 可交付"),
+            )
 
     async def test_image_turn_keeps_structured_content_in_history(self):
         class VisionProvider:

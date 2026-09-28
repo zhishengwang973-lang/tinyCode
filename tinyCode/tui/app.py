@@ -50,6 +50,7 @@ from tinyCode.tui.render import STYLE
 from tinyCode.tui.metrics import TurnMetrics
 from tinyCode.tui.workspace_changes import WorkspaceChanges, WorkspaceSnapshot
 from tinyCode.tracing.recorder import TraceHandle, TraceRecorder
+from tinyCode.verification import DeliveryVerdict, DeliveryVerifier, ToolEvidence, VerificationSnapshot
 
 if TYPE_CHECKING:
     from tinyCode.agent.loop import AgentLoop
@@ -361,6 +362,58 @@ class _StreamingMarkdownRenderer:
         self._line_open = not plain.endswith("\n")
 
 
+class _DeferredResponseRenderer:
+    """Hold a verifiable Goal's visible response until its verdict is ready.
+
+    The agent may emit explanatory prose before tool calls.  Recording the
+    rendering operations (rather than just concatenating text) preserves the
+    fullscreen renderer's existing distinction between collapsed process text
+    and the final answer when we replay after verification.
+    """
+
+    def __init__(
+        self,
+        renderer: Any,
+        *,
+        print_prefix: Any,
+        before_tool_call: Any,
+    ) -> None:
+        self._renderer = renderer
+        self._print_prefix = print_prefix
+        self._before_tool_call = before_tool_call
+        self._events: list[tuple[str, str]] = []
+        self._replayed = False
+
+    def write(self, text: str) -> bool:
+        if text:
+            self._events.append(("text", text))
+        return bool(text and not text.endswith("\n"))
+
+    def close_line(self) -> bool:
+        self._events.append(("close", ""))
+        return False
+
+    def before_tool_call(self, tool_name: str) -> None:
+        self._events.append(("tool", tool_name))
+
+    def replay(self) -> None:
+        """Render queued operations once, after validation has completed."""
+        if self._replayed:
+            return
+        self._replayed = True
+        prefix_printed = False
+        for kind, value in self._events:
+            if kind == "text":
+                if not prefix_printed:
+                    self._print_prefix()
+                    prefix_printed = True
+                self._renderer.write(value)
+            elif kind == "tool":
+                self._before_tool_call(value)
+            else:
+                self._renderer.close_line()
+
+
 @dataclass
 class _PendingControlInput:
     prompt: list[tuple[str, str]]
@@ -429,6 +482,7 @@ class TinyCodeTUI(UIControl):
         startup_recovery_task_id: str | None = None,
         task_planning_service: "TaskPlanningService | None" = None,
         goal_service: "GoalService | None" = None,
+        delivery_verifier: DeliveryVerifier | None = None,
         console: Console | None = None,
         prompt_session: Any | None = None,
     ) -> None:
@@ -452,6 +506,7 @@ class TinyCodeTUI(UIControl):
         self._auto_team_service = auto_team_service
         self._task_planning_service = task_planning_service
         self._goal_service = goal_service
+        self._delivery_verifier = delivery_verifier
 
         self._cmd_registry = CommandRegistry()
         register_builtins(
@@ -1065,10 +1120,25 @@ class TinyCodeTUI(UIControl):
         planning_tokens = 0
         planning_tokens_available = False
         planning_outcome = "failed"
+        verification_snapshot: VerificationSnapshot | None = None
+        verification_evidence: list[ToolEvidence] = []
         goal_should_continue = False
         goal_turn = bool(
             self._goal_service is not None and self._goal_service.active
         )
+        active_goal = self._goal_service.current if goal_turn and self._goal_service else None
+        deferred_renderer: _DeferredResponseRenderer | None = None
+        if (
+            active_goal is not None
+            and self._delivery_verifier is not None
+            and self._delivery_verifier.should_track(active_goal)
+        ):
+            deferred_renderer = _DeferredResponseRenderer(
+                stream_renderer,
+                print_prefix=self._print_ai_prefix,
+                before_tool_call=self._before_tool_call,
+            )
+            stream_renderer = deferred_renderer
         effective_text = text
         if goal_turn and not effective_text:
             goal = self._goal_service.current
@@ -1208,7 +1278,8 @@ class TinyCodeTUI(UIControl):
                     self._stop_progress()
                     if not response_started:
                         response_started = True
-                        self._print_ai_prefix()
+                        if deferred_renderer is None:
+                            self._print_ai_prefix()
                     normalized = stream_normalizer.normalize(event.text)
                     current_response += normalized
                     stream_renderer.write(normalized)
@@ -1221,7 +1292,10 @@ class TinyCodeTUI(UIControl):
                     self._start_progress(event.label)
 
                 elif isinstance(event, ToolCallEvent):
-                    self._before_tool_call(event.tool_call.name)
+                    if deferred_renderer is not None:
+                        deferred_renderer.before_tool_call(event.tool_call.name)
+                    else:
+                        self._before_tool_call(event.tool_call.name)
                     may_modify = getattr(
                         self._agent_loop, "tool_may_modify_workspace", None,
                     )
@@ -1233,6 +1307,18 @@ class TinyCodeTUI(UIControl):
                             event.tool_call.input,
                         ))
                     )
+                    if (
+                        verification_snapshot is None
+                        and goal_turn
+                        and self._delivery_verifier is not None
+                        and self._delivery_verifier.should_track(
+                            self._goal_service.current if self._goal_service else None,
+                        )
+                        and should_capture
+                    ):
+                        verification_snapshot = (
+                            await self._delivery_verifier.capture_workspace(Path.cwd())
+                        )
                     if workspace_snapshot is None and should_capture:
                         trace_scope = (
                             self._trace_recorder.span(
@@ -1268,6 +1354,13 @@ class TinyCodeTUI(UIControl):
 
                 elif isinstance(event, ToolResultEvent):
                     metrics.record_tool_result(event.result.success)
+                    if goal_turn and self._delivery_verifier is not None:
+                        verification_evidence.append(ToolEvidence(
+                            name=event.tool_name,
+                            success=event.result.success,
+                            content=event.result.content,
+                            error=event.result.error,
+                        ))
                     if event.result.success and self._task_planning_service is not None:
                         changed_plan = (
                             self._task_planning_service.active_plan
@@ -1592,8 +1685,12 @@ class TinyCodeTUI(UIControl):
                     )
                     self._stop_progress()
                     stream_renderer.close_line()
-                    self._finalize_response(current_response)
-                    await self._print_workspace_changes(workspace_snapshot)
+                    if deferred_renderer is None:
+                        self._finalize_response(current_response)
+                    workspace_changes = await self._print_workspace_changes(
+                        workspace_snapshot, render=deferred_renderer is None,
+                    )
+                    delivery_verdict: DeliveryVerdict | None = None
                     if event.reason in {"max_rounds", "round_budget_stopped"}:
                         self._status_text = "就绪 · 任务因轮次预算暂停"
                         self._print_warning(
@@ -1660,6 +1757,46 @@ class TinyCodeTUI(UIControl):
                             )
                         elif automatically_completed is not None:
                             self._print_info("Goal 已随最终回答自动结束")
+                        if (
+                            goal is not None
+                            and self._delivery_verifier is not None
+                            and self._delivery_verifier.should_verify(
+                                goal,
+                                tool_calls=metrics.tool_calls,
+                                changes=workspace_changes,
+                            )
+                        ):
+                            self._start_progress("独立交付验证中")
+                            delivery_verdict = await self._delivery_verifier.verify(
+                                goal,
+                                final_answer=current_response,
+                                tool_evidence=verification_evidence,
+                                snapshot=verification_snapshot,
+                                changes=workspace_changes,
+                            )
+                            self._stop_progress()
+                            if self._trace_recorder is not None:
+                                self._trace_recorder.record(
+                                    "delivery_verification",
+                                    status=delivery_verdict.verdict,
+                                    attributes={
+                                        "available": delivery_verdict.available,
+                                        "rationale": delivery_verdict.rationale,
+                                        "risks": delivery_verdict.missing_or_risks,
+                                        "error": delivery_verdict.error,
+                                    },
+                                )
+                    if deferred_renderer is not None:
+                        deferred_renderer.replay()
+                        self._finalize_response(current_response)
+                    if delivery_verdict is not None:
+                        self._print_delivery_verdict(delivery_verdict)
+                    if (
+                        deferred_renderer is not None
+                        and workspace_changes is not None
+                        and workspace_changes.any
+                    ):
+                        self._render_workspace_changes(workspace_changes)
                     self._print_turn_metrics(
                         metrics=metrics,
                         model_requests=getattr(
@@ -1683,6 +1820,8 @@ class TinyCodeTUI(UIControl):
                     )
                     self._stop_progress()
                     stream_renderer.close_line()
+                    if deferred_renderer is not None:
+                        deferred_renderer.replay()
                     await self._print_workspace_changes(workspace_snapshot)
                     self._status_text = "就绪 · 上一轮失败"
                     self._print_error(event.message)
@@ -1702,6 +1841,8 @@ class TinyCodeTUI(UIControl):
             planning_outcome = "cancelled"
             self._stop_progress()
             stream_renderer.close_line()
+            if deferred_renderer is not None:
+                deferred_renderer.replay()
             self._status_text = "就绪 · 本轮已取消"
             await self._print_workspace_changes(workspace_snapshot)
             raise
@@ -1713,6 +1854,8 @@ class TinyCodeTUI(UIControl):
             self._runtime.fail_preparation(str(exc))
             self._stop_progress()
             stream_renderer.close_line()
+            if deferred_renderer is not None:
+                deferred_renderer.replay()
             await self._print_workspace_changes(workspace_snapshot)
             self._status_text = "就绪 · 上一轮失败"
             self._print_error(f"对话执行失败: {type(exc).__name__}: {exc}")
@@ -2064,6 +2207,17 @@ class TinyCodeTUI(UIControl):
             highlight=False,
         )
 
+    def _print_delivery_verdict(self, verdict: DeliveryVerdict) -> None:
+        if not verdict.available:
+            self._print_warning("独立交付验证不可用: " + verdict.error)
+            return
+        lines = [f"独立交付验证 · {verdict.label}"]
+        if verdict.rationale:
+            lines.append(verdict.rationale)
+        if verdict.missing_or_risks:
+            lines.append("待确认/风险: " + "；".join(verdict.missing_or_risks))
+        self._print_info("\n".join(lines))
+
     def _print_turn_metrics(
         self,
         *,
@@ -2129,9 +2283,11 @@ class TinyCodeTUI(UIControl):
     async def _print_workspace_changes(
         self,
         snapshot: WorkspaceSnapshot | None,
-    ) -> None:
+        *,
+        render: bool = True,
+    ) -> WorkspaceChanges | None:
         if snapshot is None:
-            return
+            return None
         trace_scope = (
             self._trace_recorder.span(
                 "workspace_snapshot",
@@ -2151,7 +2307,7 @@ class TinyCodeTUI(UIControl):
                     "deleted": len(changes.deleted),
                 })
         if not changes.any:
-            return
+            return changes
         if self._trace_recorder is not None:
             self._trace_recorder.record("file_changes", attributes={
                 "added": changes.added,
@@ -2161,7 +2317,9 @@ class TinyCodeTUI(UIControl):
                 "modified_count": len(changes.modified),
                 "deleted_count": len(changes.deleted),
             })
-        self._render_workspace_changes(changes)
+        if render:
+            self._render_workspace_changes(changes)
+        return changes
 
     def _render_workspace_changes(self, changes: WorkspaceChanges) -> None:
         counts: list[str] = []
