@@ -1,6 +1,8 @@
 """Permission command — show security rules."""
 
 from tinyCode.commands.types import CommandMeta, CommandType, UIControl
+
+
 def create(ui: UIControl) -> CommandMeta:
     async def handler(args: list[str]) -> str:
         return (
