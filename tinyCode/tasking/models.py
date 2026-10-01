@@ -26,11 +26,13 @@ class TaskNodeStatus(str, Enum):
 
 
 class TaskPlanStatus(str, Enum):
+    DRAFT = "draft"
     ACTIVE = "active"
     NEEDS_REVIEW = "needs_review"
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    DISCARDED = "discarded"
 
 
 @dataclass
@@ -134,14 +136,51 @@ class TaskPlan:
         }
         done = sum(task.status is TaskNodeStatus.COMPLETED for task in self.tasks)
         lines = [
-            f"任务计划 · {done}/{len(self.tasks)} 完成 · {self.id}",
+            f"任务计划 · {self.status.value} · {done}/{len(self.tasks)} 完成 · {self.id}",
         ]
+        if self.status is TaskPlanStatus.DRAFT:
+            lines.append("  等待审批：可用 /plan approve 开始执行，或 /plan revise <要求> 修订。")
         for index, task in enumerate(self.tasks, start=1):
             deps = f" ← {', '.join(task.depends_on)}" if task.depends_on else ""
             lines.append(
                 f"  {icons[task.status]} {index}. {task.title}"
                 f" [{task.executor.value}]{deps}"
             )
+        return "\n".join(lines)
+
+    def render_detail(self) -> str:
+        """Render the user-reviewable plan, including scope and acceptance."""
+        states = {
+            TaskPlanStatus.DRAFT: "草案，等待审批",
+            TaskPlanStatus.ACTIVE: "执行中",
+            TaskPlanStatus.NEEDS_REVIEW: "等待核验",
+            TaskPlanStatus.COMPLETED: "已完成",
+            TaskPlanStatus.FAILED: "执行失败",
+            TaskPlanStatus.INTERRUPTED: "已中断",
+            TaskPlanStatus.DISCARDED: "已丢弃",
+        }
+        lines = [
+            f"任务计划 · {states[self.status]} · {self.id}",
+            f"目标：{self.goal}",
+            f"规划来源：{self.source}",
+        ]
+        if self.error:
+            lines.append(f"说明：{self.error}")
+        for index, task in enumerate(self.tasks, start=1):
+            deps = ", ".join(task.depends_on) or "无"
+            read_scope = ", ".join(task.read_scope) or "未限定"
+            write_scope = ", ".join(task.write_scope) or "无（只读）"
+            acceptance = "；".join(task.acceptance) or "完成任务描述"
+            lines.extend((
+                f"\n{index}. [{task.status.value}] {task.title} · {task.executor.value}",
+                f"   内容：{task.description}",
+                f"   依赖：{deps}",
+                f"   读取范围：{read_scope}",
+                f"   写入范围：{write_scope}",
+                f"   验收：{acceptance}",
+            ))
+        if self.status is TaskPlanStatus.DRAFT:
+            lines.append("\n下一步：/plan revise <要求> 修订；/plan approve 批准执行；/plan discard 丢弃。")
         return "\n".join(lines)
 
     def prompt_context(self) -> str:

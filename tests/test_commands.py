@@ -21,6 +21,7 @@ from tinyCode.commands.builtin import (
     worktree_cmd,
     mode_cmd,
     goal_cmd,
+    plan_cmd,
 )
 from tinyCode.commands.parser import is_command, parse
 from tinyCode.commands.registry import CommandRegistry
@@ -222,6 +223,7 @@ class BuiltinCommandPackageTests(unittest.TestCase):
             "trace_cmd",
             "worktree_cmd",
             "goal_cmd",
+            "plan_cmd",
         }
 
         self.assertEqual(expected, set(builtin_commands.__all__))
@@ -240,6 +242,7 @@ class FakeUI(UIControl):
         self.images: list[tuple[list[dict], str]] = []
         self.image_attachment_root = Path.cwd()
         self.goal_actions: list[tuple[str, object]] = []
+        self.plan_actions: list[tuple[str, str]] = []
 
     def show_system_message(self, text: str) -> None:
         pass
@@ -282,6 +285,26 @@ class FakeUI(UIControl):
 
     def get_plan_only(self) -> bool:
         return False
+
+    async def create_plan_draft(self, objective: str) -> str:
+        self.plan_actions.append(("create", objective))
+        return "draft-created"
+
+    async def revise_plan_draft(self, request: str) -> str:
+        self.plan_actions.append(("revise", request))
+        return "draft-revised"
+
+    def show_plan_draft(self) -> str:
+        self.plan_actions.append(("show", ""))
+        return "draft-status"
+
+    def approve_plan_draft(self) -> str:
+        self.plan_actions.append(("approve", ""))
+        return "plan-approved"
+
+    def discard_plan_draft(self) -> str:
+        self.plan_actions.append(("discard", ""))
+        return "draft-discarded"
 
     def get_security_level(self) -> str:
         return "normal"
@@ -475,6 +498,34 @@ class CommandDispatcherTests(unittest.IsolatedAsyncioTestCase):
         _, result = await dispatcher.dispatch("/mode security unsafe")
 
         self.assertIn("必须是 strict、normal 或 permissive", result)
+
+    async def test_plan_command_has_explicit_draft_revision_and_approval_flow(self):
+        ui = FakeUI()
+        registry = CommandRegistry()
+        registry.register(plan_cmd.create(ui))
+        dispatcher = CommandDispatcher(registry, ui=ui)
+
+        _, created = await dispatcher.dispatch("/plan 重构认证模块并补测试")
+        _, revised = await dispatcher.dispatch("/plan revise 增加回滚方案")
+        _, approved = await dispatcher.dispatch("/p approve")
+        _, shown = await dispatcher.dispatch("/plan")
+        _, discarded = await dispatcher.dispatch("/plan discard")
+
+        self.assertEqual("draft-created", created)
+        self.assertEqual("draft-revised", revised)
+        self.assertEqual("plan-approved", approved)
+        self.assertEqual("draft-status", shown)
+        self.assertEqual("draft-discarded", discarded)
+        self.assertEqual(
+            [
+                ("create", "重构认证模块并补测试"),
+                ("revise", "增加回滚方案"),
+                ("approve", ""),
+                ("show", ""),
+                ("discard", ""),
+            ],
+            ui.plan_actions,
+        )
 
     async def test_prompt_command_reads_selected_section_without_model_injection(self):
         ui = FakeUI()

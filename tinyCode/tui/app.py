@@ -41,7 +41,7 @@ from tinyCode.agent.events import (
     ContextCompressionEvent,
 )
 from tinyCode.agent.runtime import TurnRuntime
-from tinyCode.agent.task_mode import classify_task_mode
+from tinyCode.agent.task_mode import TaskMode, classify_task_mode
 from tinyCode.commands import CommandDispatcher, CommandRegistry, UIControl, register_builtins
 from tinyCode.multimodal import ImageInputError, build_image_user_content
 from tinyCode.providers.base import TokenUsage
@@ -735,6 +735,84 @@ class TinyCodeTUI(UIControl):
     def get_security_level(self) -> str:
         return self._security_level.value
 
+    async def create_plan_draft(self, objective: str) -> str:
+        if self._runtime.active:
+            return "当前任务正在执行；请先完成或取消后再创建计划"
+        service = self._task_planning_service
+        if service is None:
+            return "任务计划服务不可用"
+        mode = classify_task_mode([{"role": "user", "content": objective}])
+        # An explicit /plan always describes work to prepare for.  A compact
+        # objective such as “解释配置” should still create a plan rather than
+        # being downgraded to a direct-answer route.
+        if mode is TaskMode.DIRECT:
+            mode = TaskMode.MODIFY
+        self._start_progress("正在生成计划草案")
+        try:
+            result = await service.create_draft(objective, mode)
+        finally:
+            if not self._runtime.active:
+                self._stop_progress()
+        if result.plan is None:
+            return "计划草案创建失败：" + (result.error or "未生成有效计划")
+        suffix = (
+            f"\n规划提示：{result.error}"
+            if result.error else ""
+        )
+        return (
+            "已创建计划草案（尚未执行）。\n"
+            + result.plan.render_detail()
+            + "\n\n可用 /plan revise <要求> 修订，或 /plan approve 批准并开始执行。"
+            + suffix
+        )
+
+    async def revise_plan_draft(self, request: str) -> str:
+        if self._runtime.active:
+            return "当前任务正在执行；不能修订计划"
+        service = self._task_planning_service
+        if service is None:
+            return "任务计划服务不可用"
+        self._start_progress("正在修订计划草案")
+        try:
+            result = await service.revise_draft(request)
+        finally:
+            if not self._runtime.active:
+                self._stop_progress()
+        if result.plan is None:
+            return "计划草案修订失败：" + (result.error or "未生成有效计划")
+        suffix = f"\n规划提示：{result.error}" if result.error else ""
+        return "计划草案已修订（尚未执行）。\n" + result.plan.render_detail() + suffix
+
+    def show_plan_draft(self) -> str:
+        service = self._task_planning_service
+        if service is None:
+            return "任务计划服务不可用"
+        return service.render_active()
+
+    def approve_plan_draft(self) -> str:
+        if self._runtime.active:
+            return "当前任务正在执行；不能批准另一份计划"
+        service = self._task_planning_service
+        if service is None:
+            return "任务计划服务不可用"
+        plan, message = service.approve_draft()
+        if plan is None:
+            return message
+        self._agent_loop.queue_task_plan(plan.prompt_context())
+        if not self._start_user_input(plan.goal, approved_plan=True):
+            # Keep the durable plan active. The user can retry approval after
+            # resolving the foreground state instead of losing their draft.
+            return "计划已批准，但尚未能启动执行；请稍后再次输入 /plan approve"
+        return f"{message} · {plan.id}"
+
+    def discard_plan_draft(self) -> str:
+        if self._runtime.active:
+            return "当前任务正在执行；不能丢弃正在使用的计划"
+        service = self._task_planning_service
+        if service is None:
+            return "任务计划服务不可用"
+        return service.discard_draft()
+
     def get_runtime_status(self) -> dict:
         snapshot = self._runtime.snapshot()
         return {
@@ -881,8 +959,10 @@ class TinyCodeTUI(UIControl):
 
         @bindings.add("c-p")
         def _toggle_plan(event) -> None:
-            enabled = self._agent_loop.toggle_plan_only()
-            self._print_info(f"Plan-only 模式: {'ON' if enabled else 'OFF'}")
+            del event
+            self._print_info(
+                "Plan-only 已废弃；请输入 /plan <目标> 创建可审批的任务计划"
+            )
 
         @bindings.add("c-s")
         def _cycle_security(event) -> None:
@@ -967,6 +1047,7 @@ class TinyCodeTUI(UIControl):
         *,
         display_user: bool = True,
         user_content: str | list[dict] | None = None,
+        approved_plan: bool = False,
     ) -> bool:
         """Reserve the foreground slot before scheduling an async turn."""
         if not self._runtime.reserve():
@@ -978,6 +1059,7 @@ class TinyCodeTUI(UIControl):
             display_user=display_user,
             cancelled_note_task=note_task,
             user_content=user_content,
+            approved_plan=approved_plan,
         ))
         self._foreground_task = task
         task.add_done_callback(self._finish_foreground)
@@ -1100,6 +1182,7 @@ class TinyCodeTUI(UIControl):
         cancelled_note_task: asyncio.Task | None = None,
         user_content: str | list[dict] | None = None,
         goal_continuation: bool = False,
+        approved_plan: bool = False,
     ) -> None:
         if not self._runtime.active and not self._runtime.reserve():
             return
@@ -1206,7 +1289,11 @@ class TinyCodeTUI(UIControl):
                 self._agent_loop.set_goal_context(self._goal_service.prompt_context())
                 if goal_continuation:
                     self._start_progress("Goal 仍在进行 · 继续核验目标")
-            if self._task_planning_service is not None and not goal_turn:
+            if (
+                self._task_planning_service is not None
+                and not goal_turn
+                and not approved_plan
+            ):
                 planning_mode = classify_task_mode([{
                     "role": "user", "content": effective_text if user_content is None else user_content,
                 }])

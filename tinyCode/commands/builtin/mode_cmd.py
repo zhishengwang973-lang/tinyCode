@@ -1,4 +1,4 @@
-"""Mode command — toggle plan-only or set security level."""
+"""Mode command — manage security policy only."""
 
 from tinyCode.commands.types import CommandMeta, CommandType, UIControl
 
@@ -8,17 +8,13 @@ def create(ui: UIControl) -> CommandMeta:
         if not args:
             return (
                 f"当前模式:\n"
-                f"  Plan-only: {'ON' if ui.get_plan_only() else 'OFF'}\n"
                 f"  安全等级: {ui.get_security_level()}\n"
-                f"\n用法: /mode plan | /mode security <strict|normal|permissive>"
+                f"\n用法: /mode security <strict|normal|permissive>"
             )
 
         sub = args[0].lower()
         if sub == "plan":
-            if len(args) != 1:
-                return "用法: /mode plan"
-            new_state = ui.toggle_plan_mode()
-            return f"Plan-only 模式: {'ON' if new_state else 'OFF'}"
+            return "Plan-only 已废弃；请使用 /plan <目标> 创建计划，并用 /plan approve 批准后执行。"
         elif sub == "security":
             if len(args) != 2:
                 return f"用法: /mode security <strict|normal|permissive>\n当前: {ui.get_security_level()}"
@@ -29,12 +25,12 @@ def create(ui: UIControl) -> CommandMeta:
                 )
             return f"安全等级: {ui.set_security_level(args[1])}"
         else:
-            return f"未知子命令: {sub}。可用: plan, security"
+            return f"未知子命令: {sub}。可用: security"
 
     return CommandMeta(
         name="mode",
-        description="切换模式（plan-only / security level）",
-        usage="/mode [plan | security <strict|normal|permissive>]",
+        description="设置安全等级",
+        usage="/mode [security <strict|normal|permissive>]",
         cmd_type=CommandType.UI,
         handler=handler,
     )

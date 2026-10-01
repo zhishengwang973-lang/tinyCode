@@ -44,7 +44,13 @@ class TaskPlanningService:
         self.config = config
         self._provider = provider
         self._store = store
-        self._active: TaskPlan | None = None
+        self._active = next(
+            (
+                plan for plan in self._store.list_recent(limit=20)
+                if plan.status is TaskPlanStatus.DRAFT
+            ),
+            None,
+        )
 
     @property
     def active_plan(self) -> TaskPlan | None:
@@ -70,8 +76,116 @@ class TaskPlanningService:
     async def create_if_needed(
         self, text: str, mode: TaskMode,
     ) -> TaskPlanningResult:
+        # A deliberately created draft is user-owned. Background auto-planning
+        # must never overwrite it merely because a later prompt looks complex.
+        if self._active is not None and self._active.status is TaskPlanStatus.DRAFT:
+            return TaskPlanningResult(source="pending_manual_draft")
         if not self.should_plan(text, mode):
             return TaskPlanningResult()
+        return await self._create_plan(text, mode, source_prefix="auto")
+
+    async def create_draft(
+        self, text: str, mode: TaskMode,
+    ) -> TaskPlanningResult:
+        """Create a user-requested plan that cannot execute before approval."""
+        if not text.strip():
+            return TaskPlanningResult(error="请提供需要规划的任务目标")
+        if self._active is not None and self._active.status is TaskPlanStatus.DRAFT:
+            return TaskPlanningResult(
+                error="当前已有计划草案；请先 /plan revise 修订、/plan approve 执行或 /plan discard 丢弃。"
+            )
+        return await self._create_plan(
+            text, mode, source_prefix="manual", draft=True,
+        )
+
+    async def revise_draft(self, request: str) -> TaskPlanningResult:
+        """Re-plan the active draft while retaining its durable identity."""
+        plan = self._active
+        if plan is None:
+            return TaskPlanningResult(error="当前没有可修订的计划草案")
+        if plan.status is not TaskPlanStatus.DRAFT:
+            return TaskPlanningResult(
+                error="当前计划已获批准或已结束，不能再修订；请先 /plan discard 后重新创建。"
+            )
+        if not request.strip():
+            return TaskPlanningResult(error="请说明需要如何修订计划")
+        try:
+            mode = TaskMode(plan.mode)
+        except ValueError:
+            mode = TaskMode.MODIFY
+        result = await self._create_plan(
+            f"{plan.goal}\n\n规划修订要求：{request.strip()}",
+            mode,
+            source_prefix="manual_revision",
+            draft=True,
+            plan_id=plan.id,
+            created_at=plan.created_at,
+        )
+        if result.plan is None:
+            return result
+        revised = result.plan
+        revised.goal = plan.goal
+        revised.source = "manual_revision"
+        try:
+            self._store.save(revised)
+        except OSError as exc:
+            return TaskPlanningResult(
+                model_requests=result.model_requests,
+                tokens=result.tokens,
+                tokens_available=result.tokens_available,
+                error=f"任务计划保存失败: {type(exc).__name__}: {exc}",
+            )
+        self._active = revised
+        return TaskPlanningResult(
+            plan=revised,
+            model_requests=result.model_requests,
+            tokens=result.tokens,
+            tokens_available=result.tokens_available,
+            source=revised.source,
+            error=result.error,
+        )
+
+    def approve_draft(self) -> tuple[TaskPlan | None, str]:
+        """Activate the draft and make it available to the execution loop."""
+        plan = self._active
+        if plan is None:
+            return None, "当前没有待审批计划"
+        if plan.status is not TaskPlanStatus.DRAFT:
+            return None, f"当前计划状态为 {plan.status.value}，不能重复审批"
+        plan.status = TaskPlanStatus.ACTIVE
+        self._start_next_ready(plan)
+        try:
+            self._store.save(plan)
+        except OSError as exc:
+            return None, f"任务计划保存失败: {type(exc).__name__}: {exc}"
+        return plan, "计划已批准，开始执行"
+
+    def discard_draft(self) -> str:
+        """Persist an explicit discard instead of silently dropping a draft."""
+        plan = self._active
+        if plan is None:
+            return "当前没有待处理计划"
+        if plan.status is not TaskPlanStatus.DRAFT:
+            return "只能丢弃尚未批准的计划草案"
+        plan.status = TaskPlanStatus.DISCARDED
+        plan.error = "用户已丢弃该计划草案。"
+        try:
+            self._store.save(plan)
+        except OSError as exc:
+            return f"任务计划保存失败: {type(exc).__name__}: {exc}"
+        self._active = None
+        return "计划草案已丢弃"
+
+    async def _create_plan(
+        self,
+        text: str,
+        mode: TaskMode,
+        *,
+        source_prefix: str,
+        draft: bool = False,
+        plan_id: str = "",
+        created_at: str = "",
+    ) -> TaskPlanningResult:
         nodes, error, tokens, tokens_available = await self._request_plan(text, mode)
         source = "model"
         if not nodes:
@@ -79,8 +193,16 @@ class TaskPlanningService:
             source = "fallback"
         try:
             plan = TaskPlan.create(text, nodes, mode=mode.value, source=source)
+            if plan_id:
+                plan.id = plan_id
+            if created_at:
+                plan.created_at = created_at
             self._validate_plan(plan)
-            self._start_next_ready(plan)
+            plan.source = source if source_prefix == "auto" else f"{source_prefix}_{source}"
+            if draft:
+                plan.status = TaskPlanStatus.DRAFT
+            else:
+                self._start_next_ready(plan)
             self._store.save(plan)
             self._active = plan
             return TaskPlanningResult(
@@ -117,14 +239,14 @@ class TaskPlanningService:
         return plan
 
     def render_active(self) -> str:
-        return self._active.render() if self._active is not None else "当前没有活动任务计划"
+        return self._active.render_detail() if self._active is not None else "当前没有活动任务计划"
 
     def render_plan(self, plan_id: str = "") -> str:
         if not plan_id and self._active is not None:
-            return self._active.render()
+            return self._active.render_detail()
         if plan_id:
             plan = self._store.load(plan_id)
-            return plan.render() if plan is not None else f"任务计划 {plan_id} 不存在"
+            return plan.render_detail() if plan is not None else f"任务计划 {plan_id} 不存在"
         plans = self._store.list_recent(limit=10)
         if not plans:
             return "尚无任务计划"
@@ -137,6 +259,10 @@ class TaskPlanningService:
         plan = self._active
         if plan is None:
             return "当前没有活动任务计划"
+        if plan.status is TaskPlanStatus.DRAFT:
+            return "当前计划尚未批准；请先由用户执行 /plan approve"
+        if plan.status is not TaskPlanStatus.ACTIVE:
+            return f"当前计划状态为 {plan.status.value}，不能更新节点"
         try:
             next_status = TaskNodeStatus(status)
         except ValueError:

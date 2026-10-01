@@ -61,11 +61,6 @@ class UIControl(ABC):
         return Path.cwd()
 
     @abstractmethod
-    def toggle_plan_mode(self) -> bool:
-        """Toggle plan-only mode; return new state."""
-        ...
-
-    @abstractmethod
     def set_security_level(self, level_name: str) -> str:
         """Set security level; return current level label."""
         ...
@@ -102,10 +97,6 @@ class UIControl(ABC):
     def delete_session(self, session_id: str) -> str:
         """Delete a saved session from disk."""
         raise NotImplementedError
-
-    @abstractmethod
-    def get_plan_only(self) -> bool:
-        ...
 
     @abstractmethod
     def get_security_level(self) -> str:
@@ -167,6 +158,22 @@ class UIControl(ABC):
 
     def start_goal(self, objective: str) -> str:
         """Create a Goal and schedule its first foreground turn."""
+        raise NotImplementedError
+
+    async def create_plan_draft(self, objective: str) -> str:
+        """Create a non-executing plan draft for an explicit user objective."""
+        raise NotImplementedError
+
+    async def revise_plan_draft(self, request: str) -> str:
+        raise NotImplementedError
+
+    def show_plan_draft(self) -> str:
+        raise NotImplementedError
+
+    def approve_plan_draft(self) -> str:
+        raise NotImplementedError
+
+    def discard_plan_draft(self) -> str:
         raise NotImplementedError
 
     def get_goal_status(self) -> str:

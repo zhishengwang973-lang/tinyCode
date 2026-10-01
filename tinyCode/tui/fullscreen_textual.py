@@ -23,6 +23,7 @@ from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 
@@ -864,13 +865,19 @@ class _TinyCodeFullscreenApp(App[None]):
         self._refresh_attachment()
 
     def refresh_goal_strip(self) -> None:
-        strip = self.query_one("#goal-strip", Horizontal)
-        text = self.query_one("#goal-text", Static)
-        pause = self.query_one("#goal-pause", Button)
-        clear = self.query_one("#goal-clear", Button)
-        data = self.owner._goal_strip_data()
-        strip.display = data is not None
-        if data is None:
+        # Textual may prune children of a hidden strip while a resize/layout
+        # pass is in flight.  The next refresh will populate the strip once
+        # they are mounted; never let that cosmetic race crash the app.
+        try:
+            strip = self.query_one("#goal-strip", Horizontal)
+            data = self.owner._goal_strip_data()
+            strip.display = data is not None
+            if data is None:
+                return
+            text = self.query_one("#goal-text", Static)
+            pause = self.query_one("#goal-pause", Button)
+            clear = self.query_one("#goal-clear", Button)
+        except NoMatches:
             return
         label, runtime_active = data
         text.update(label)

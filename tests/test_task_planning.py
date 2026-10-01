@@ -68,6 +68,69 @@ class TaskPlanningTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("completed", updated.tasks[0].status.value)
             self.assertEqual("in_progress", updated.tasks[1].status.value)
 
+    async def test_manual_draft_requires_approval_before_nodes_can_advance(self):
+        response = """[
+          {"id":"inspect","title":"检查","description":"读取现状","depends_on":[],"read_scope":["src/"],"write_scope":[],"acceptance":["确认范围"],"executor":"main"},
+          {"id":"implement","title":"实现","description":"修改代码","depends_on":["inspect"],"read_scope":[],"write_scope":["src/app.py"],"acceptance":["功能完成"],"executor":"main"}
+        ]"""
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(Path(tmp), response)
+            result = await service.create_draft("实现配置迁移并补测试", TaskMode.MODIFY)
+
+            self.assertIsNotNone(result.plan)
+            self.assertEqual("draft", result.plan.status.value)
+            self.assertTrue(all(task.status.value == "pending" for task in result.plan.tasks))
+            self.assertIn("尚未批准", service.update_task("inspect", "in_progress"))
+
+            plan, message = service.approve_draft()
+            self.assertIsNotNone(plan)
+            self.assertIn("开始执行", message)
+            self.assertEqual("active", plan.status.value)
+            self.assertEqual("in_progress", plan.tasks[0].status.value)
+
+    async def test_revision_keeps_draft_identity_and_discard_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(Path(tmp), "not-json")
+            draft = await service.create_draft("重构服务层并补测试", TaskMode.MODIFY)
+            self.assertIsNotNone(draft.plan)
+            original_id = draft.plan.id
+
+            revised = await service.revise_draft("增加迁移回滚步骤")
+            self.assertIsNotNone(revised.plan)
+            self.assertEqual(original_id, revised.plan.id)
+            self.assertEqual("draft", revised.plan.status.value)
+            self.assertEqual("计划草案已丢弃", service.discard_draft())
+            restored = TaskPlanStore(Path(tmp)).load(original_id)
+
+        self.assertIsNotNone(restored)
+        self.assertEqual("discarded", restored.status.value)
+
+    async def test_latest_draft_is_restored_but_not_interrupted_at_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = self._service(root, "not-json")
+            draft = await service.create_draft("实现可靠的配置迁移", TaskMode.MODIFY)
+            self.assertIsNotNone(draft.plan)
+
+            restored_service = self._service(root, "not-json")
+
+        self.assertIsNotNone(restored_service.active_plan)
+        self.assertEqual(draft.plan.id, restored_service.active_plan.id)
+        self.assertEqual("draft", restored_service.active_plan.status.value)
+
+    async def test_auto_planning_never_replaces_pending_manual_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = self._service(Path(tmp), "not-json")
+            draft = await service.create_draft("重构认证模块并补测试", TaskMode.MODIFY)
+            skipped = await service.create_if_needed(
+                "跨模块重构整个项目并补测试、文档和完整验证", TaskMode.MODIFY,
+            )
+
+        self.assertIsNotNone(draft.plan)
+        self.assertIsNone(skipped.plan)
+        self.assertEqual("pending_manual_draft", skipped.source)
+        self.assertEqual(draft.plan.id, service.active_plan.id)
+
     def test_overlapping_writes_require_a_dependency(self):
         plan = TaskPlan.create(
             "goal",

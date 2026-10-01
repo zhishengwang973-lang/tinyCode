@@ -527,7 +527,10 @@ class StalledAgentLoop(FakeAgentLoop):
 
 
 class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
-    def _make_tui(self, agent_loop=None, answers=(), trace_recorder=None):
+    def _make_tui(
+        self, agent_loop=None, answers=(), trace_recorder=None,
+        task_planning_service=None,
+    ):
         output = io.StringIO()
         tui = TinyCodeTUI(
             agent_loop=agent_loop or FakeAgentLoop(),
@@ -538,6 +541,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             provider_name="fake",
             model="fake",
             trace_recorder=trace_recorder,
+            task_planning_service=task_planning_service,
             console=Console(
                 file=output,
                 force_terminal=False,
@@ -547,6 +551,43 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
             prompt_session=FakePromptSession(answers),
         )
         return tui, output
+
+    async def test_approved_manual_plan_starts_once_without_auto_replanning(self):
+        class PlannerProvider:
+            def __init__(self) -> None:
+                self.requests = 0
+                self.last_usage = {}
+
+            def begin_request(self) -> None:
+                self.requests += 1
+
+            async def chat_stream(self, _messages):
+                yield """[
+                  {"id":"scope","title":"确认范围","description":"读取现状","depends_on":[],"read_scope":["src/"],"write_scope":[],"acceptance":["范围明确"],"executor":"main"},
+                  {"id":"implement","title":"实现","description":"完成改动","depends_on":["scope"],"read_scope":[],"write_scope":["src/app.py"],"acceptance":["功能完成"],"executor":"main"}
+                ]"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = PlannerProvider()
+            service = TaskPlanningService(
+                TaskPlanningConfig(enabled=True, max_tasks=6, min_task_chars=1),
+                provider,
+                TaskPlanStore(Path(tmp)),
+            )
+            loop = PlanningAgentLoop()
+            tui, _ = self._make_tui(
+                loop, task_planning_service=service,
+            )
+
+            created = await tui.create_plan_draft("为服务增加缓存并补齐测试")
+            started = tui.approve_plan_draft()
+            await tui._wait_for_foreground()
+
+        self.assertIn("尚未执行", created)
+        self.assertIn("开始执行", started)
+        self.assertEqual(1, provider.requests)
+        self.assertEqual(1, len(loop.plans))
+        self.assertIn("任务计划", loop.plans[0])
 
     async def test_manual_compress_command_bypasses_threshold(self):
         tui, _ = self._make_tui()

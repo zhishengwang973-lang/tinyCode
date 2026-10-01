@@ -10,7 +10,7 @@
 - **内置工具体系**：读/写/编辑/删除文件、多文件 `apply_patch`、执行命令、Glob/Grep、用户输入以及受限的公网搜索/读取，并在运行时接入 Skill 和子 Agent 工具
 - **执行 Trace 可观测性**：项目本地 JSONL 追踪、TUI 树形回放和离线 HTML 时间线；记录模型首 Token、重试、工具、Token、上下文及文件变化
 - **模型分离评测集**：隔离 Fixture 中运行真实 AgentLoop，以另一模型独立评分，并保留断言、Trace、Token 与工具指标
-- **内置斜杠命令**：`/help` `/clear` `/compress` `/mode` `/status` `/config` `/prompt` `/trace` `/cancel` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
+- **内置斜杠命令**：`/help` `/clear` `/compress` `/plan` `/mode` `/status` `/config` `/prompt` `/trace` `/cancel` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
 - **纵深安全防御**：黑名单拦截、路径沙箱、人在回路确认、三档权限模式
 - **MCP 协议**：支持 Stdio 和 HTTP 传输，连接外部工具服务器
 - **YAML+MD Skill 系统**：可编程 SOP 指令，三级优先级覆盖
@@ -41,6 +41,23 @@ tinyCode
 超长工具结果缓存在当前项目的 `.tinyCode/tool_results/`，该运行时目录默认应被 Git 忽略。
 执行 Trace 保存在 `.tinyCode/traces/`；使用 `/trace last` 查看树形回放，或使用
 `/trace open` 生成并打开本地 HTML 时间线。默认不保存完整提示词和工具参数。
+
+## 人工审批计划
+
+`/plan` 是任务绑定的审批工作流，不是全局只读开关。创建草案阶段只生成和保存计划，
+不会启动 Agent 或修改工作区；只有批准后才会执行。自动 `task_planning` 仍用于复杂任务的
+内部拆分，但不会覆盖已批准的用户计划。
+
+```text
+/plan 为认证模块增加 OAuth 登录、迁移现有会话并补齐测试
+/plan                         # 查看当前草案或执行中的计划
+/plan revise 增加灰度回滚与迁移验证步骤
+/plan approve                 # 批准并以该计划启动执行
+/plan discard                 # 丢弃尚未批准的草案
+```
+
+计划持久化在项目的 `.tinyCode/task_plans/`。`/mode` 现在仅管理安全等级；旧的
+`/mode plan` 会提示迁移到 `/plan`。
 
 ## Goal
 
