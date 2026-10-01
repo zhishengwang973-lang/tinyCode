@@ -38,6 +38,7 @@ from tinyCode.tools.base import ToolResult
 from tinyCode.config.models import TaskPlanningConfig
 from tinyCode.tasking.planner import TaskPlanningService
 from tinyCode.tasking.store import TaskPlanStore
+from tinyCode.tasking.models import TaskNode, TaskPlan, TaskPlanStatus
 from tinyCode.goals import GoalService, GoalStore
 from tinyCode.verification import DeliveryVerdict
 from tinyCode.tui.app import TinyCodeTUI, _StreamingMarkdownRenderer
@@ -1800,7 +1801,7 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(["/cancel"], app.command_candidates)
 
-    async def test_fullscreen_slash_command_result_is_a_visible_message(self):
+    async def test_fullscreen_slash_command_is_a_visible_user_and_result_turn(self):
         tui = FullscreenTinyCodeTUI(
             agent_loop=FakeAgentLoop(),
             history=FakeHistory(),
@@ -1818,13 +1819,67 @@ class TuiNotesTests(unittest.IsolatedAsyncioTestCase):
 
             views = list(app.query(_TurnView))
             self.assertEqual(1, len(views))
+            self.assertEqual("/help", views[0].turn.user_text)
             self.assertTrue(views[0].turn.answer)
-            self.assertFalse(views[0].turn.user_text)
             self.assertFalse(views[0].turn.answer_is_markdown)
             self.assertEqual("command", views[0].turn.answer_kind)
             self.assertFalse(views[0].answer.display)
             self.assertTrue(views[0].plain_answer.display)
             self.assertIn("\n", views[0].turn.answer)
+
+    async def test_fullscreen_plan_command_shows_progress_while_draft_is_generated(self):
+        class BlockingPlanService:
+            def __init__(self) -> None:
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def create_draft(self, objective, mode):
+                del mode
+                self.entered.set()
+                await self.release.wait()
+                plan = TaskPlan.create(
+                    objective,
+                    [
+                        TaskNode("scope", "确认范围", "读取现状"),
+                        TaskNode("execute", "执行改动", "完成目标", depends_on=["scope"]),
+                    ],
+                    mode="modify", source="test",
+                )
+                plan.status = TaskPlanStatus.DRAFT
+                return SimpleNamespace(plan=plan, error="")
+
+        service = BlockingPlanService()
+        tui = FullscreenTinyCodeTUI(
+            agent_loop=FakeAgentLoop(),
+            history=FakeHistory(),
+            compressor=FakeCompressor(),
+            session_store=FakeSessionStore(),
+            note_manager=None,
+            provider_name="fake",
+            model="fake",
+            task_planning_service=service,
+        )
+        app = _TinyCodeFullscreenApp(tui)
+
+        async with app.run_test(size=(100, 36)) as pilot:
+            submitted = asyncio.create_task(
+                tui._submit_input("/plan 为服务增加重试机制")
+            )
+            await service.entered.wait()
+            await pilot.pause()
+
+            view = app.query_one(_TurnView)
+            self.assertEqual("/plan 为服务增加重试机制", view.turn.user_text)
+            self.assertTrue(view.turn.activity_active)
+            self.assertTrue(view.process.display)
+            self.assertIn("正在生成计划草案", view.process_text.render().plain)
+
+            service.release.set()
+            await submitted
+            await pilot.pause()
+
+            self.assertFalse(view.turn.activity_active)
+            self.assertIn("已创建计划草案", view.turn.answer)
 
     async def test_fullscreen_classifies_warning_error_and_approval_cards(self):
         tui = FullscreenTinyCodeTUI(

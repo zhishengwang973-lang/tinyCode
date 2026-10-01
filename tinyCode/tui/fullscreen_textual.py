@@ -193,7 +193,7 @@ class _TurnView(Vertical):
         self._sync_process_spinner()
         self.process.title = f"执行过程 · {len(turn.process_lines)} 个事件"
         self.process.collapsed = turn.process_collapsed
-        self.process.display = bool(turn.process_lines)
+        self.process.display = bool(turn.process_lines or turn.activity_active)
         self.agent_label.display = bool(turn.answer)
         final_markdown = bool(
             turn.answer and turn.answer_is_markdown and turn.finished
@@ -273,11 +273,16 @@ class _TurnView(Vertical):
         lines = list(self.turn.process_lines)
         if self.turn.activity_active and self.turn.activity_text:
             expected = "· " + self.turn.activity_text
+            rendered = False
             for index in range(len(lines) - 1, -1, -1):
                 if lines[index] == expected:
                     frame = self._SPINNER_FRAMES[self._spinner_index]
                     lines[index] = f"· {frame} {self.turn.activity_text}"
+                    rendered = True
                     break
+            if not rendered:
+                frame = self._SPINNER_FRAMES[self._spinner_index]
+                lines.append(f"· {frame} {self.turn.activity_text}")
         self.process_text.update("\n\n".join(lines))
 
     async def _render_final_markdown(self, source: str) -> None:
@@ -973,6 +978,7 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._task_plan_process_index: int | None = None
         self._task_plan_id = ""
         self._shutting_down = False
+        self._command_turn: _ConversationTurn | None = None
         self._hydrate_saved_history()
 
     def request_exit(self) -> None:
@@ -1084,8 +1090,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._refresh_chrome()
 
     def _print_info(self, text: str) -> None:
-        if self._command_active and not self._runtime.active:
-            self._append_system_answer(text, kind="command")
+        if self._command_active and self._command_turn is not None:
+            self._append_command_answer(text, kind="command")
             return
         if text.startswith("安全确认："):
             self._add_notice("approval", "安全确认结果", text.removeprefix("安全确认："))
@@ -1121,8 +1127,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._task_plan_id = plan_id
 
     def _print_warning(self, text: str) -> None:
-        if self._command_active and not self._runtime.active:
-            self._append_system_answer("⚠ " + text, kind="warning")
+        if self._command_active and self._command_turn is not None:
+            self._append_command_answer("⚠ " + text, kind="warning")
             return
         self._add_notice("warning", "提示", text)
 
@@ -1131,8 +1137,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
 
     def _print_error(self, text: str) -> None:
         self._set_turn_activity(None)
-        if self._command_active and not self._runtime.active:
-            self._append_system_answer("错误：" + text, kind="error")
+        if self._command_active and self._command_turn is not None:
+            self._append_command_answer("错误：" + text, kind="error")
             return
         self._add_notice("error", "错误", text)
         self._set_process_collapsed(True)
@@ -1230,7 +1236,8 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
     def _start_progress(self, text: str) -> None:
         self._progress_text = text
         self._status_text = f"运行中 · {text}"
-        activity_changed = self._set_turn_activity(text, sync=False)
+        target = self._command_turn if self._command_active else None
+        activity_changed = self._set_turn_activity(text, sync=False, turn=target)
         if (
             not (self._command_active and not self._runtime.active)
             and text != self._last_process_progress
@@ -1243,26 +1250,29 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
 
     def _stop_progress(self) -> None:
         self._progress_text = None
-        self._set_turn_activity(None)
+        target = self._command_turn if self._command_active else None
+        self._set_turn_activity(None, turn=target)
         if self._command_active and not self._runtime.active:
             self._status_text = "就绪 · 可输入任务"
         self._refresh_chrome()
 
     def _set_turn_activity(
         self, text: str | None, *, sync: bool = True,
+        turn: _ConversationTurn | None = None,
     ) -> bool:
-        if self._active_turn is None:
+        target = turn or self._active_turn
+        if target is None:
             return False
         normalized = (text or "").strip()
         active = bool(normalized)
         changed = (
-            self._active_turn.activity_text != normalized
-            or self._active_turn.activity_active != active
+            target.activity_text != normalized
+            or target.activity_active != active
         )
-        self._active_turn.activity_text = normalized
-        self._active_turn.activity_active = active
+        target.activity_text = normalized
+        target.activity_active = active
         if changed and sync:
-            self._sync_active_view()
+            self._sync_turn_view(target)
         return changed
 
     async def request_tool_input(self, question: str, options: list[str]) -> str | None:
@@ -1312,6 +1322,33 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
             self._app.exit()
         self._invalidate_input_prompt()
 
+    async def _handle_command(self, text: str) -> None:
+        """Render an idle slash command as one normal chat turn.
+
+        Commands used to bypass ``_print_user`` entirely in fullscreen mode.
+        That made a potentially slow /plan request look like an empty screen
+        and rendered its result as an orphaned system turn.  Keep a stable
+        reference because /plan approve may start the next agent turn before
+        its command result has been rendered.
+        """
+        if self._command_turn is None:
+            self._print_user(text)
+            self._command_turn = self._active_turn
+            if self._command_turn is not None:
+                self._command_turn.answer_is_markdown = False
+                self._command_turn.answer_kind = "command"
+                self._sync_turn_view(self._command_turn)
+        try:
+            await super()._handle_command(text)
+        finally:
+            turn = self._command_turn
+            if turn is not None:
+                turn.activity_active = False
+                turn.activity_text = ""
+                turn.finished = True
+                self._sync_turn_view(turn)
+            self._command_turn = None
+
     def _textual_ready(self, app: _TinyCodeFullscreenApp) -> None:
         self._app = app
         for turn in self._turns:
@@ -1336,10 +1373,22 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._app.scroll_to_latest()
 
     def _sync_active_view(self) -> None:
-        if self._active_view is not None and self._active_view.is_mounted:
-            self._active_view.sync()
+        if self._active_turn is not None:
+            self._sync_turn_view(self._active_turn)
         if self._app is not None and self._app.is_running:
             self._app.scroll_to_latest()
+
+    def _sync_turn_view(self, turn: _ConversationTurn) -> None:
+        if self._active_view is not None and self._active_view.turn is turn:
+            if self._active_view.is_mounted:
+                self._active_view.sync()
+            return
+        if self._app is None or not self._app.is_running:
+            return
+        for view in self._app.query(_TurnView):
+            if view.turn is turn and view.is_mounted:
+                view.sync()
+                break
 
     def _append_assistant_text(self, text: str) -> None:
         self._assistant_draft += text
@@ -1366,6 +1415,17 @@ class FullscreenTinyCodeTUI(TinyCodeTUI):
         self._workspace_summary = ""
         if self._app is not None:
             self._app.call_later(self._mount_turn, turn)
+
+    def _append_command_answer(self, text: str, *, kind: str) -> None:
+        """Attach a command result to the command's own user message."""
+        turn = self._command_turn
+        if turn is None:
+            self._append_system_answer(text, kind=kind)
+            return
+        turn.answer = text
+        turn.answer_is_markdown = False
+        turn.answer_kind = kind
+        self._sync_turn_view(turn)
 
     def _add_notice(self, kind: str, title: str, text: str) -> _SystemNotice:
         if self._active_turn is None:
