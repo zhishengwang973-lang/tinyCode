@@ -92,6 +92,16 @@ class BaseTool(ABC):
         del params
         return self.category is not ToolCategory.READ
 
+    def workspace_lock_paths(self, params: dict[str, Any]) -> tuple[str, ...] | None:
+        """Return project-relative paths needing a write lease for this call.
+
+        An empty tuple means the tool has no workspace-file side effect. ``None``
+        requests an exclusive whole-workspace lease, used for opaque commands
+        whose write set cannot be determined safely.
+        """
+        del params
+        return ()
+
     def security_parameters(self, params: dict[str, Any]) -> dict[str, Any]:
         """Return arguments used to scope security rules for this call."""
         return dict(params)

@@ -117,6 +117,11 @@ class RunCommandTool(BaseTool):
             ToolParameter("command", "string", "要执行的 shell 命令。"),
         ]
 
+    def workspace_lock_paths(self, params: dict) -> tuple[str, ...] | None:
+        # Arbitrary shell commands may write any number of project paths.
+        del params
+        return None
+
     async def execute(self, command: str) -> ToolResult:
         try:
             command = require_string(command, "command")

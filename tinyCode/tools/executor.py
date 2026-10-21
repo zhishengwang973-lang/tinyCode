@@ -2,6 +2,12 @@
 
 import asyncio
 from tinyCode.tools.base import BaseTool, ToolResult
+from tinyCode.tools.context import get_workspace_root
+from tinyCode.tools.workspace_lease import (
+    DEFAULT_LEASE_TIMEOUT_SECONDS,
+    WorkspaceLeaseError,
+    WorkspaceWriteLease,
+)
 
 
 class ToolExecutor:
@@ -34,7 +40,21 @@ class ToolExecutor:
             else self._default_timeout
         )
         try:
-            execution = tool.execute(**params)
+            async def _run() -> ToolResult:
+                if not tool.may_modify(params):
+                    return await tool.execute(**params)
+                paths = tool.workspace_lock_paths(params)
+                if paths == ():
+                    return await tool.execute(**params)
+                lease_timeout = DEFAULT_LEASE_TIMEOUT_SECONDS
+                if effective_timeout is not None:
+                    lease_timeout = max(0.01, effective_timeout - 0.1)
+                async with WorkspaceWriteLease(
+                    get_workspace_root(), paths, timeout_seconds=lease_timeout,
+                ):
+                    return await tool.execute(**params)
+
+            execution = _run()
             result = (
                 await execution
                 if effective_timeout is None
@@ -69,6 +89,8 @@ class ToolExecutor:
                 content="",
                 error=f"工具 '{tool.name}' 执行超时（{effective_timeout}s）",
             )
+        except WorkspaceLeaseError as exc:
+            return ToolResult(success=False, content="", error=str(exc))
         except Exception as exc:
             return ToolResult(
                 success=False,

@@ -77,6 +77,10 @@ class ApplyPatchTool(BaseTool):
     def parameters(self) -> list[ToolParameter]:
         return [ToolParameter("patch", "string", "完整的 apply_patch 文本。")]
 
+    def workspace_lock_paths(self, params: dict) -> tuple[str, ...] | None:
+        paths = extract_patch_paths(params.get("patch"))
+        return tuple(paths) if paths else None
+
     async def execute(self, patch: str) -> ToolResult:
         try:
             patch = require_string(patch, "patch")

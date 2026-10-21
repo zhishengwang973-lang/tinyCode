@@ -1,5 +1,6 @@
 """Delete file tool — remove a single project-local regular file."""
 
+import os
 from pathlib import Path
 
 from tinyCode.tools.base import BaseTool, ToolParameter, ToolResult
@@ -28,6 +29,10 @@ class DeleteFileTool(BaseTool):
             ToolParameter("path", "string", "要删除的文件路径，相对于工作目录。"),
         ]
 
+    def workspace_lock_paths(self, params: dict) -> tuple[str, ...] | None:
+        path = params.get("path")
+        return (path,) if isinstance(path, str) else None
+
     async def execute(self, path: str) -> ToolResult:
         try:
             candidate = self._resolve(path)
@@ -41,13 +46,38 @@ class DeleteFileTool(BaseTool):
                 error="拒绝删除包含模型凭据的本地配置文件",
             )
 
-        if not candidate.exists():
+        try:
+            original_stat = candidate.stat()
+            if candidate.is_symlink() or not candidate.is_file():
+                return ToolResult(success=False, content="", error=f"路径不是普通文件: {path}")
+        except FileNotFoundError:
             return ToolResult(success=False, content="", error=f"文件不存在: {path}")
-        if candidate.is_symlink() or not candidate.is_file():
-            return ToolResult(success=False, content="", error=f"路径不是普通文件: {path}")
+        except OSError as exc:
+            return ToolResult(success=False, content="", error=f"读取文件状态失败: {path}: {exc}")
 
         try:
+            current_stat = candidate.stat()
+            if (
+                current_stat.st_ino != original_stat.st_ino
+                or current_stat.st_size != original_stat.st_size
+                or current_stat.st_mtime_ns != original_stat.st_mtime_ns
+            ):
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="文件在删除期间已被其他进程修改，已拒绝删除",
+                )
             candidate.unlink()
+            try:
+                directory_fd = os.open(candidate.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # Directory fsync is a durability enhancement and not
+                # available on every platform/filesystem.
+                pass
         except Exception as e:
             return ToolResult(
                 success=False,

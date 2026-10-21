@@ -12,6 +12,7 @@
 - **模型分离评测集**：隔离 Fixture 中运行真实 AgentLoop，以另一模型独立评分，并保留断言、Trace、Token 与工具指标
 - **内置斜杠命令**：`/help` `/clear` `/compress` `/plan` `/mode` `/status` `/config` `/prompt` `/trace` `/cancel` `/exit` `/review` `/skill` `/team` 等，Skill 还可自动注册专属命令
 - **纵深安全防御**：黑名单拦截、路径沙箱、人在回路确认、三档权限模式
+- **工作区写入协调**：同一路径写入跨进程互斥；补丁锁定全部目标文件，Shell 命令独占工作区，冲突时要求重新读取而不静默覆盖
 - **MCP 协议**：支持 Stdio 和 HTTP 传输，连接外部工具服务器
 - **YAML+MD Skill 系统**：可编程 SOP 指令，三级优先级覆盖
 - **事件 Hook 引擎**：12 种生命周期事件 + 条件匹配 + 4 种动作

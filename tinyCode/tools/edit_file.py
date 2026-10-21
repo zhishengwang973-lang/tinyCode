@@ -35,6 +35,10 @@ class EditFileTool(BaseTool):
             ToolParameter("new_string", "string", "替换后的新文本。"),
         ]
 
+    def workspace_lock_paths(self, params: dict) -> tuple[str, ...] | None:
+        path = params.get("path")
+        return (path,) if isinstance(path, str) else None
+
     async def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
         try:
             resolved = self._resolve(path)

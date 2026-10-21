@@ -31,6 +31,10 @@ class WriteFileTool(BaseTool):
             ToolParameter("content", "string", "要写入的完整文本内容。"),
         ]
 
+    def workspace_lock_paths(self, params: dict) -> tuple[str, ...] | None:
+        path = params.get("path")
+        return (path,) if isinstance(path, str) else None
+
     async def execute(self, path: str, content: str) -> ToolResult:
         try:
             resolved = self._resolve(path)
